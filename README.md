@@ -15,7 +15,7 @@ Goal Formalizer（自然语言 -> 正式 Lean 声明）
 
 项目只使用 Python 标准库和 Windows 自带的 `curl.exe`，不依赖 Archon，也不复制 Archon 的实现。
 
-## 设计差异
+## 设计
 
 - 核心状态使用 JSON，不通过 Markdown 正则决定工作流状态。
 - Python 根据 Lean 退出码决定成功，模型不能自行宣布完成。
@@ -64,6 +64,42 @@ python -m lean_loop doctor --project D:\my_math_project
 ```
 
 用户需要配置自己的模型 API。API Key、任务数据库、Mathlib 索引和证明运行记录都保存在用户自己的 Lean 项目中，不包含在本仓库里。
+
+## 协作开发
+
+仓库维护者可以在 GitHub 的 `Settings -> Collaborators` 中邀请可信开发者。建议所有人都通过独立分支和 Pull Request 开发，不直接向 `main` 推送。
+
+首次克隆并创建开发分支：
+
+```powershell
+git clone https://github.com/zzw-zzw-zzw/windows-lean-loop.git D:\projects\windows-lean-loop
+cd D:\projects\windows-lean-loop
+git switch -c feature/my-change
+```
+
+完成修改并运行测试：
+
+```powershell
+python -m unittest discover -s tests
+git add .
+git commit -m "Describe the change"
+git push -u origin feature/my-change
+```
+
+然后在 GitHub 创建 Pull Request。其他人的修改合并到 `main` 后，本地使用以下命令更新：
+
+```powershell
+git switch main
+git status
+git pull --ff-only origin main
+```
+
+如果 `git status` 显示存在未提交修改，应先提交到自己的分支或使用 `git stash`，再更新 `main`。正在开发的分支可以用以下命令同步最新主分支：
+
+```powershell
+git fetch origin
+git rebase origin/main
+```
 
 ## 环境配置
 
