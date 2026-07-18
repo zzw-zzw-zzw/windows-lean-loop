@@ -57,7 +57,7 @@ D:\my_math_project      Lean/Mathlib 项目
 需要 Windows 10/11、Python 3.11 或更高版本、Elan/Lean 4，以及一个可以由 Lake 编译的 Lean/Mathlib 项目。
 
 ```powershell
-git clone https://github.com/<你的账号>/windows-lean-loop.git D:\lean_agent_cli
+git clone https://github.com/zzw-zzw-zzw/windows-lean-loop.git D:\lean_agent_cli
 cd D:\lean_agent_cli
 python -m pip install -e .
 python -m lean_loop doctor --project D:\my_math_project
