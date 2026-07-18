@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "windows-lean-loop"
+version = "0.14.1"
+description = "A Windows-first structured Lean plan, prove, and review workflow."
+requires-python = ">=3.11"
+
+[project.scripts]
+lean-loop = "lean_loop.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["lean_loop*"]
+
+[tool.setuptools.package-data]
+lean_loop = ["dashboard_assets/*"]
