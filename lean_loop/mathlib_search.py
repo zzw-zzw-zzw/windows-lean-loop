@@ -32,6 +32,7 @@ _MISSING_MODULE_RE = re.compile(
 _IDENTIFIER_RE = re.compile(r"\b[A-Za-z_][A-Za-z0-9_']*(?:\.[A-Za-z_][A-Za-z0-9_']*)*\b")
 _TASK_IDENTIFIER_RE = re.compile(r"`([^`]+)`|\b[A-Za-z_][A-Za-z0-9_']*(?:\.[A-Za-z_][A-Za-z0-9_']*)*\b")
 _IMPORT_LINE_RE = re.compile(r"^\s*import\s+([A-Za-z0-9_.]+)\s*$")
+_PRELUDE_LINE_RE = re.compile(r"^\s*prelude\s*$")
 
 _LEAN_NOISE = {
     "abbrev", "axiom", "by", "class", "constant", "def", "deriving", "else",
@@ -298,6 +299,43 @@ def source_search_terms(
     return ordered[:max_terms]
 
 
+def _newline_style(source: str) -> str:
+    if "\r\n" in source:
+        return "\r\n"
+    if "\n" in source:
+        return "\n"
+    if "\r" in source:
+        return "\r"
+    return "\n"
+
+
+def ensure_broad_mathlib_import(source: str) -> str:
+    """Add one standalone ``import Mathlib`` to the existing Lean header."""
+    if has_broad_import(source):
+        return source
+
+    lines = source.splitlines(keepends=True)
+    import_indexes = [
+        index for index, line in enumerate(lines) if _IMPORT_LINE_RE.match(line)
+    ]
+    if import_indexes:
+        insertion_index = import_indexes[-1] + 1
+    else:
+        prelude_indexes = [
+            index for index, line in enumerate(lines) if _PRELUDE_LINE_RE.match(line)
+        ]
+        insertion_index = prelude_indexes[0] + 1 if prelude_indexes else 0
+
+    newline = _newline_style(source)
+    if insertion_index > 0 and not lines[insertion_index - 1].endswith(("\n", "\r")):
+        lines[insertion_index - 1] += newline
+    has_following_source = insertion_index < len(lines)
+    preserve_trailing_newline = source.endswith(("\n", "\r"))
+    ending = newline if has_following_source or preserve_trailing_newline else ""
+    lines.insert(insertion_index, f"import Mathlib{ending}")
+    return "".join(lines)
+
+
 def optimize_broad_imports(
     source: str,
     retrieval: dict[str, object],
@@ -310,16 +348,8 @@ def optimize_broad_imports(
     keep the original source when the probe fails. Low-confidence or Init
     modules are intentionally ignored because they are poor replacement roots.
     """
-    lines = source.splitlines(keepends=True)
-    broad_indexes = [
-        index for index, line in enumerate(lines)
-        if _IMPORT_LINE_RE.match(line) and line.strip() == "import Mathlib"
-    ]
-    if not broad_indexes:
-        return source, {"changed": False, "reason": "no_broad_import"}
-
     suggestions = retrieval.get("import_suggestions", [])
-    modules: list[str] = []
+    selected_modules: list[str] = []
     if isinstance(suggestions, list):
         for row in suggestions:
             if not isinstance(row, dict):
@@ -330,31 +360,76 @@ def optimize_broad_imports(
                 or module == "Mathlib"
                 or module.startswith("Mathlib.Init")
                 or str(row.get("confidence", "")) != "high"
-                or module in modules
+                or module in selected_modules
             ):
                 continue
-            modules.append(module)
-            if len(modules) >= max_imports:
+            selected_modules.append(module)
+            if len(selected_modules) >= max_imports:
                 break
-    if not modules:
+
+    lines = source.splitlines(keepends=True)
+    broad_indexes = [
+        index for index, line in enumerate(lines)
+        if _IMPORT_LINE_RE.match(line) and line.strip() == "import Mathlib"
+    ]
+    existing_modules = {
+        match.group(1)
+        for line in lines
+        if (match := _IMPORT_LINE_RE.match(line))
+        and match.group(1) != "Mathlib"
+    }
+    added_modules = [
+        module for module in selected_modules if module not in existing_modules
+    ]
+    if not broad_indexes:
+        return source, {
+            "changed": False,
+            "reason": "no_broad_import",
+            "selected_modules": selected_modules,
+            "added_modules": added_modules,
+        }
+    if not selected_modules:
         return source, {
             "changed": False,
             "reason": "no_high_confidence_imports",
             "broad_import_count": len(broad_indexes),
+            "selected_modules": [],
+            "added_modules": [],
         }
 
-    replacement = "".join(f"import {module}\n" for module in modules)
     first = broad_indexes[0]
-    lines[first] = replacement
-    # Remove duplicate broad imports if a malformed file had more than one.
-    for index in reversed(broad_indexes[1:]):
-        del lines[index]
-    optimized = "".join(lines)
+    broad_line = lines[first]
+    if broad_line.endswith("\r\n"):
+        broad_ending = "\r\n"
+    elif broad_line.endswith(("\n", "\r")):
+        broad_ending = broad_line[-1]
+    else:
+        broad_ending = ""
+    replacement_lines: list[str] = []
+    for index, module in enumerate(added_modules):
+        ending = broad_ending
+        if not ending and index < len(added_modules) - 1:
+            ending = _newline_style(source)
+        replacement_lines.append(f"import {module}{ending}")
+    broad_index_set = set(broad_indexes)
+    optimized_lines: list[str] = []
+    for index, line in enumerate(lines):
+        if index == first:
+            optimized_lines.extend(replacement_lines)
+        if index not in broad_index_set:
+            optimized_lines.append(line)
+    optimized = "".join(optimized_lines)
     return optimized, {
         "changed": optimized != source,
-        "reason": "high_confidence_index_evidence",
+        "reason": (
+            "high_confidence_index_evidence"
+            if added_modules
+            else "high_confidence_remove_only"
+        ),
         "replaced": "import Mathlib",
-        "modules": modules,
+        "modules": selected_modules,
+        "selected_modules": selected_modules,
+        "added_modules": added_modules,
         "broad_import_count": len(broad_indexes),
     }
 
