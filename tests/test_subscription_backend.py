@@ -326,6 +326,19 @@ class SubscriptionBackendTests(unittest.TestCase):
                 backend.last_metadata["tool_execution_policy"],
                 "TOOL_ENABLED_AGENT_SANDBOX",
             )
+            expected_risk = {
+                "filesystem_read_scope": "WINDOWS_BROAD_READ",
+                "filesystem_write_scope": "REPO_EXTERNAL_EPHEMERAL_WORKSPACE",
+                "read_isolation_status": (
+                    "NOT_ENFORCED_BY_LEGACY_WINDOWS_SANDBOX"
+                ),
+                "network_policy": "DISABLED",
+            }
+            for field, value in expected_risk.items():
+                self.assertEqual(backend.last_metadata[field], value)
+                self.assertEqual(
+                    backend.last_metadata["sandbox_profile"][field], value
+                )
 
     def test_codex_archives_tool_events_and_allows_sandbox_internal_changes(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -355,7 +368,16 @@ class SubscriptionBackendTests(unittest.TestCase):
             )
             self.assertEqual(command["command_summary"], "echo sandbox-only > artifact.txt")
             manifest = backend.last_metadata["sandbox_manifest"]
-            self.assertEqual(manifest["network_policy"], "disabled")
+            self.assertEqual(manifest["filesystem_read_scope"], "WINDOWS_BROAD_READ")
+            self.assertEqual(
+                manifest["filesystem_write_scope"],
+                "REPO_EXTERNAL_EPHEMERAL_WORKSPACE",
+            )
+            self.assertEqual(
+                manifest["read_isolation_status"],
+                "NOT_ENFORCED_BY_LEGACY_WINDOWS_SANDBOX",
+            )
+            self.assertEqual(manifest["network_policy"], "DISABLED")
             self.assertEqual(manifest["protected_state_unchanged"], True)
             self.assertEqual(
                 manifest["file_changes"],
@@ -625,8 +647,31 @@ class SubscriptionBackendTests(unittest.TestCase):
             self.assertEqual(codex_report["status"], "ready")
             self.assertEqual(codex_report["cli_version"], "fake-cli 1.2.3")
             self.assertEqual(codex_report["authentication_type"], "chatgpt")
+            self.assertEqual(
+                codex_report["filesystem_read_scope"], "WINDOWS_BROAD_READ"
+            )
+            self.assertEqual(
+                codex_report["filesystem_write_scope"],
+                "REPO_EXTERNAL_EPHEMERAL_WORKSPACE",
+            )
+            self.assertEqual(
+                codex_report["read_isolation_status"],
+                "NOT_ENFORCED_BY_LEGACY_WINDOWS_SANDBOX",
+            )
+            self.assertEqual(codex_report["network_policy"], "DISABLED")
             self.assertEqual(claude_report["status"], "ready")
             self.assertEqual(claude_report["authentication_type"], "claude.ai")
+
+    def test_readme_discloses_legacy_windows_broad_read_risk(self) -> None:
+        readme = (Path(__file__).parents[1] / "README.md").read_text(encoding="utf-8")
+
+        self.assertIn("filesystem_read_scope=WINDOWS_BROAD_READ", readme)
+        self.assertIn(
+            "read_isolation_status=NOT_ENFORCED_BY_LEGACY_WINDOWS_SANDBOX",
+            readme,
+        )
+        self.assertIn("本项目不保证用户目录或认证目录在操作系统层面不可读", readme)
+        self.assertNotIn("两者均不读取、复制或转换本地认证文件", readme)
 
     def test_unsupported_reasoning_is_rejected_before_model_call(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

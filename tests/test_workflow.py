@@ -169,7 +169,25 @@ class StructuredWorkflowTests(unittest.TestCase):
                     "requested_reasoning_effort": reasoning_effort,
                     "effective_reasoning_effort": reasoning_effort,
                     "tool_execution_policy": "TOOL_ENABLED_AGENT_SANDBOX",
-                    "sandbox_profile": {"filesystem": "workspace-write"},
+                    "filesystem_read_scope": "WINDOWS_BROAD_READ",
+                    "filesystem_write_scope": (
+                        "REPO_EXTERNAL_EPHEMERAL_WORKSPACE"
+                    ),
+                    "read_isolation_status": (
+                        "NOT_ENFORCED_BY_LEGACY_WINDOWS_SANDBOX"
+                    ),
+                    "network_policy": "DISABLED",
+                    "sandbox_profile": {
+                        "filesystem": "workspace-write",
+                        "filesystem_read_scope": "WINDOWS_BROAD_READ",
+                        "filesystem_write_scope": (
+                            "REPO_EXTERNAL_EPHEMERAL_WORKSPACE"
+                        ),
+                        "read_isolation_status": (
+                            "NOT_ENFORCED_BY_LEGACY_WINDOWS_SANDBOX"
+                        ),
+                        "network_policy": "DISABLED",
+                    },
                 }
 
             def invoke(self, request, config, temp_dir):
@@ -241,6 +259,16 @@ class StructuredWorkflowTests(unittest.TestCase):
             self.assertEqual(
                 identity["tool_execution_policy"], "TOOL_ENABLED_AGENT_SANDBOX"
             )
+            self.assertEqual(identity["filesystem_read_scope"], "WINDOWS_BROAD_READ")
+            self.assertEqual(
+                identity["filesystem_write_scope"],
+                "REPO_EXTERNAL_EPHEMERAL_WORKSPACE",
+            )
+            self.assertEqual(
+                identity["read_isolation_status"],
+                "NOT_ENFORCED_BY_LEGACY_WINDOWS_SANDBOX",
+            )
+            self.assertEqual(identity["network_policy"], "DISABLED")
             for role in ("plan", "prove", "review"):
                 request_identity = identity["requests"][role]
                 self.assertEqual(request_identity["requested_model"], "gpt-5.6-sol")

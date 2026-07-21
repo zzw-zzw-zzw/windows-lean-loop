@@ -117,7 +117,25 @@ class QueueStoreTests(unittest.TestCase):
                     "cli_version": "codex-cli 0.144.4",
                     "authentication_type": "chatgpt",
                     "tool_execution_policy": "TOOL_ENABLED_AGENT_SANDBOX",
-                    "sandbox_profile": {"filesystem": "workspace-write"},
+                    "filesystem_read_scope": "WINDOWS_BROAD_READ",
+                    "filesystem_write_scope": (
+                        "REPO_EXTERNAL_EPHEMERAL_WORKSPACE"
+                    ),
+                    "read_isolation_status": (
+                        "NOT_ENFORCED_BY_LEGACY_WINDOWS_SANDBOX"
+                    ),
+                    "network_policy": "DISABLED",
+                    "sandbox_profile": {
+                        "filesystem": "workspace-write",
+                        "filesystem_read_scope": "WINDOWS_BROAD_READ",
+                        "filesystem_write_scope": (
+                            "REPO_EXTERNAL_EPHEMERAL_WORKSPACE"
+                        ),
+                        "read_isolation_status": (
+                            "NOT_ENFORCED_BY_LEGACY_WINDOWS_SANDBOX"
+                        ),
+                        "network_policy": "DISABLED",
+                    },
                     "requests": {
                         "plan": {
                             "requested_model": "gpt-5.6-sol",
@@ -153,6 +171,16 @@ class QueueStoreTests(unittest.TestCase):
             })
             saved = store.get_task(task["id"])["settings"]["backend_identity"]
             self.assertEqual(saved["cli_version"], "codex-cli 0.144.4")
+            self.assertEqual(saved["filesystem_read_scope"], "WINDOWS_BROAD_READ")
+            self.assertEqual(
+                saved["filesystem_write_scope"],
+                "REPO_EXTERNAL_EPHEMERAL_WORKSPACE",
+            )
+            self.assertEqual(
+                saved["read_isolation_status"],
+                "NOT_ENFORCED_BY_LEGACY_WINDOWS_SANDBOX",
+            )
+            self.assertEqual(saved["network_policy"], "DISABLED")
             self.assertIsNone(saved["requests"]["plan"]["actual_model"])
 
     def test_persists_tasks_and_claims_dependencies_in_order(self) -> None:

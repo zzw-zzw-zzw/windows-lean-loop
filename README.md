@@ -457,10 +457,16 @@ python -m lean_loop queue add `
 触发重新规划。订阅后端在 repo 外一次性临时目录启动无会话继承的官方非交互客户端。Codex 使用
 tool-enabled `workspace-write` 沙箱；Shell、`apply_patch`、MCP、Web Search 等实际暴露工具属于 Agent
 系统的一部分，沙箱内部文件变化允许存在并会在销毁前归档脱敏的工具事件、命令摘要、文件变化、
-退出状态和 sandbox manifest。权威仓库、正式 worktree、受保护 target、用户私有目录和认证材料均不
-得成为可写对象；工具越出隔离根目录或 protected-state 发生变化时 fail-closed。Claude 仍使用
+退出状态和 sandbox manifest。Windows legacy `workspace-write` 可能具有广泛的只读文件访问能力；
+本项目不保证用户目录或认证目录在操作系统层面不可读，这是使用本地 tool-enabled Agent 时必须接受的
+已披露风险。metadata 会明确记录 `filesystem_read_scope=WINDOWS_BROAD_READ`、
+`filesystem_write_scope=REPO_EXTERNAL_EPHEMERAL_WORKSPACE`、
+`read_isolation_status=NOT_ENFORCED_BY_LEGACY_WINDOWS_SANDBOX` 和 `network_policy=DISABLED`。
+写入仅限 repo 外的一次性临时 workspace；权威仓库、正式 worktree 和受保护 target 不得改变，工具越出
+隔离根目录或 protected-state 发生变化时 fail-closed。Claude 仍使用
 `dontAsk`、空工具集和 `safe-mode`，且仅加载隔离目录的 local settings，避免 `plan` 模式触发额外模型。
-两者均不读取、复制或转换本地认证文件、token、cookie 或 API key；stdout/stderr 会限长和脱敏；
+实现不会主动读取、请求、输出、复制、转换或归档本地认证文件、token、cookie 或 API key；敏感环境变量
+会在启动子进程前剔除，网络保持禁用，stdout/stderr 会限长和脱敏；
 超时、取消、未登录、额度不可用、模型不可用、客户端协议不兼容或最终结果不唯一时均 fail-closed，
 并终止完整进程树。run manifest、queue task 与 response metadata 会保存 backend、CLI、认证、requested/
 actual model 状态、reasoning、tool policy 和 sandbox profile。订阅方案及可用模型、额度由对应官方

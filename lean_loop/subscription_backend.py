@@ -46,14 +46,26 @@ _REDACTIONS = (
 )
 _CLAUDE_MODEL = re.compile(r"^[a-z0-9][a-z0-9._-]{0,127}$")
 CODEX_TOOL_EXECUTION_POLICY = "TOOL_ENABLED_AGENT_SANDBOX"
+_SANDBOX_SCOPE_METADATA_FIELDS = (
+    "filesystem_read_scope",
+    "filesystem_write_scope",
+    "read_isolation_status",
+    "network_policy",
+)
+CODEX_SANDBOX_SCOPE = {
+    "filesystem_read_scope": "WINDOWS_BROAD_READ",
+    "filesystem_write_scope": "REPO_EXTERNAL_EPHEMERAL_WORKSPACE",
+    "read_isolation_status": "NOT_ENFORCED_BY_LEGACY_WINDOWS_SANDBOX",
+    "network_policy": "DISABLED",
+}
 CODEX_SANDBOX_PROFILE = {
     "approval_policy": "never",
     "filesystem": "workspace-write",
     "isolation": "repo-external-ephemeral",
-    "network_policy": "disabled",
     "temp_environment_write_access": "disabled",
     "protected_state_policy": "snapshot-fail-closed",
     "session_policy": "ephemeral",
+    **CODEX_SANDBOX_SCOPE,
 }
 CLAUDE_TOOL_EXECUTION_POLICY = "TOOLS_DISABLED_BY_CLIENT_FLAGS"
 CLAUDE_SANDBOX_PROFILE = {
@@ -525,6 +537,11 @@ class _SubscriptionBackend:
             "tool_execution_policy": report["tool_execution_policy"],
             "sandbox_profile": dict(report["sandbox_profile"]),
         }
+        metadata.update({
+            field: report[field]
+            for field in _SANDBOX_SCOPE_METADATA_FIELDS
+            if field in report
+        })
         self.last_metadata = dict(metadata)
         before_project = _project_snapshot(self.protected_root, self.protected_target)
         with tempfile.TemporaryDirectory(prefix="windows-lean-loop-agent-") as raw:
@@ -550,7 +567,7 @@ class _SubscriptionBackend:
                     set(after_sandbox["boundary_violations"])
                     | set(tool_boundary_violations)
                 )
-                return {
+                manifest = {
                     "canary_unchanged": canary_unchanged,
                     "file_changes": _sandbox_file_changes(
                         before_sandbox["files"], after_sandbox["files"]
@@ -563,6 +580,12 @@ class _SubscriptionBackend:
                     "sandbox_boundary_violations": boundary_violations,
                     "scan_errors": list(after_sandbox["scan_errors"]),
                 }
+                manifest.update({
+                    field: report[field]
+                    for field in _SANDBOX_SCOPE_METADATA_FIELDS
+                    if field in report
+                })
+                return manifest
 
             def safety_violation(manifest: Mapping[str, Any]) -> str | None:
                 if not manifest.get("protected_state_unchanged"):
@@ -817,6 +840,7 @@ class CodexSubscriptionBackend(_SubscriptionBackend):
             "supported_reasoning_efforts": sorted(efforts),
             "tool_execution_policy": CODEX_TOOL_EXECUTION_POLICY,
             "sandbox_profile": dict(CODEX_SANDBOX_PROFILE),
+            **CODEX_SANDBOX_SCOPE,
         }
 
     def _arguments(
@@ -1115,6 +1139,11 @@ def build_subscription_identity_summary(
             reasoning_effort=str(config.reasoning_effort or ""),
         )
         candidate_common = {field: report[field] for field in common_fields}
+        candidate_common.update({
+            field: report[field]
+            for field in _SANDBOX_SCOPE_METADATA_FIELDS
+            if field in report
+        })
         if common is None:
             common = candidate_common
         elif common != candidate_common:
