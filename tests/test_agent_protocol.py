@@ -69,6 +69,7 @@ class AgentProtocolTests(unittest.TestCase):
             self.assertEqual(request["protocol_version"], 1)
             self.assertEqual(request["role"], "planner")
             self.assertEqual(response["status"], "ok")
+            self.assertEqual(response["metadata"]["backend_id"], "direct")
             self.assertNotIn("must-not-be-persisted", json.dumps(request) + json.dumps(response))
 
             resumed = AgentRuntime(workflow_root=root, run_id="run-1", backend=backend)
@@ -84,6 +85,94 @@ class AgentProtocolTests(unittest.TestCase):
             names = sorted(path.name for path in (root / "agent-calls").iterdir())
             self.assertTrue(names[0].startswith("0001-"))
             self.assertTrue(names[1].startswith("0002-"))
+
+    def test_runtime_persists_backend_metadata_on_success_and_error(self) -> None:
+        class ClassifiedError(RuntimeError):
+            kind = "subscription_unavailable"
+
+        class Backend:
+            backend_id = "codex-subscription"
+            last_metadata = {
+                "backend_id": backend_id,
+                "cli_version": "codex-cli 1.2.3",
+                "requested_model": "model-a",
+                "requested_model_catalog_status": "VALIDATED",
+                "actual_model": None,
+                "actual_model_status": "NOT_REPORTED_BY_CLIENT",
+                "model_identity_source": "REQUESTED_MODEL_AND_OFFICIAL_CATALOG_ONLY",
+                "requested_reasoning_effort": "medium",
+                "effective_reasoning_effort": "medium",
+                "tool_execution_policy": "TOOL_ENABLED_AGENT_SANDBOX",
+                "filesystem_read_scope": "WINDOWS_BROAD_READ",
+                "filesystem_write_scope": "REPO_EXTERNAL_EPHEMERAL_WORKSPACE",
+                "read_isolation_status": (
+                    "NOT_ENFORCED_BY_LEGACY_WINDOWS_SANDBOX"
+                ),
+                "network_policy": "DISABLED",
+                "sandbox_profile": {
+                    "filesystem": "workspace-write",
+                    "filesystem_read_scope": "WINDOWS_BROAD_READ",
+                    "filesystem_write_scope": (
+                        "REPO_EXTERNAL_EPHEMERAL_WORKSPACE"
+                    ),
+                    "read_isolation_status": (
+                        "NOT_ENFORCED_BY_LEGACY_WINDOWS_SANDBOX"
+                    ),
+                    "network_policy": "DISABLED",
+                },
+                "tool_events": [{"event_type": "command_execution", "exit_code": 0}],
+                "sandbox_manifest": {"protected_state_unchanged": True},
+            }
+
+            def invoke(self, request, config, temp_dir):
+                if request.phase == "error":
+                    raise ClassifiedError("failed")
+                return {"ok": True}
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime = AgentRuntime(workflow_root=root, run_id="run-1", backend=Backend())
+            runtime.invoke(
+                role="planner", phase="ok", output_type="json", config=_config(),
+                system_prompt="system", user_prompt="user", temp_dir=root / "tmp",
+            )
+            with self.assertRaises(ClassifiedError):
+                runtime.invoke(
+                    role="planner", phase="error", output_type="json", config=_config(),
+                    system_prompt="system", user_prompt="user", temp_dir=root / "tmp",
+                )
+            responses = [
+                json.loads((path / "response.json").read_text(encoding="utf-8"))
+                for path in sorted((root / "agent-calls").iterdir())
+            ]
+            for response in responses:
+                self.assertEqual(response["metadata"]["backend_id"], "codex-subscription")
+                self.assertIsNone(response["metadata"]["actual_model"])
+                self.assertEqual(
+                    response["metadata"]["actual_model_status"],
+                    "NOT_REPORTED_BY_CLIENT",
+                )
+                self.assertEqual(
+                    response["metadata"]["filesystem_read_scope"],
+                    "WINDOWS_BROAD_READ",
+                )
+                self.assertEqual(
+                    response["metadata"]["filesystem_write_scope"],
+                    "REPO_EXTERNAL_EPHEMERAL_WORKSPACE",
+                )
+                self.assertEqual(
+                    response["metadata"]["read_isolation_status"],
+                    "NOT_ENFORCED_BY_LEGACY_WINDOWS_SANDBOX",
+                )
+                self.assertEqual(response["metadata"]["network_policy"], "DISABLED")
+            self.assertEqual(
+                responses[1]["metadata"]["error_classification"],
+                "subscription_unavailable",
+            )
+            self.assertEqual(responses[1]["error"]["kind"], "subscription_unavailable")
+            for call in sorted((root / "agent-calls").iterdir()):
+                self.assertTrue((call / "tool-events.json").is_file())
+                self.assertTrue((call / "sandbox-manifest.json").is_file())
 
     def test_capabilities_are_versioned(self) -> None:
         value = protocol_capabilities()

@@ -174,3 +174,71 @@ class ApiConfig:
             provider_kind=provider_kind,
             provider_id=provider_id,
         )
+
+    @classmethod
+    def for_backend(
+        cls,
+        project: Path | None,
+        backend_id: str = "direct",
+        *,
+        provider_id: str = "default",
+        model: str = "",
+        reasoning_effort: str | None = None,
+    ) -> "ApiConfig":
+        if backend_id == "direct":
+            config = cls.from_environment(project, provider_id)
+            return cls(
+                **{
+                    **config.__dict__,
+                    "model": model.strip() or config.model,
+                    "reasoning_effort": (
+                        reasoning_effort
+                        if reasoning_effort is not None
+                        else config.reasoning_effort
+                    ),
+                }
+            )
+        if backend_id not in {"codex-subscription", "claude-subscription"}:
+            raise ConfigError(f"Unsupported Agent backend: {backend_id}")
+        if provider_id != "default":
+            raise ConfigError("Subscription backends do not accept API provider profiles")
+        values = load_project_config(project) if project is not None else {}
+        selected_model = str(
+            model or values.get("model") or os.environ.get("LEAN_AGENT_MODEL", "")
+        ).strip()
+        if not selected_model:
+            raise ConfigError("Subscription backends require an explicit model")
+        try:
+            timeout_seconds = int(
+                values.get(
+                    "timeout_seconds",
+                    os.environ.get("LEAN_AGENT_TIMEOUT_SECONDS", "180"),
+                )
+            )
+        except ValueError as exc:
+            raise ConfigError("LEAN_AGENT_TIMEOUT_SECONDS must be an integer") from exc
+        if timeout_seconds < 1:
+            raise ConfigError("LEAN_AGENT_TIMEOUT_SECONDS must be positive")
+        selected_reasoning = (
+            reasoning_effort
+            if reasoning_effort is not None
+            else str(
+                values.get("reasoning_effort")
+                or os.environ.get("LEAN_AGENT_REASONING_EFFORT", "")
+            ).strip()
+            or None
+        )
+        return cls(
+            api_base="",
+            api_key="",
+            model=selected_model,
+            mode="subscription",
+            timeout_seconds=timeout_seconds,
+            curl_executable="",
+            reasoning_effort=selected_reasoning,
+            empty_response_retries=0,
+            api_timeout_retries=0,
+            stream_responses=True,
+            provider_kind=backend_id,
+            provider_id="subscription",
+        )

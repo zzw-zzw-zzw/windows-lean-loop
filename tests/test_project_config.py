@@ -4,7 +4,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from lean_loop.config import ApiConfig
+from lean_loop.config import ApiConfig, ConfigError
 from lean_loop.project_config import (
     load_provider_api_key,
     load_project_api_key,
@@ -18,6 +18,24 @@ from lean_loop.project_config import (
 
 @unittest.skipUnless(os.name == "nt", "Windows DPAPI test")
 class ProjectConfigTests(unittest.TestCase):
+    def test_subscription_config_requires_model_but_not_api_credentials(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory)
+            config = ApiConfig.for_backend(
+                project,
+                "codex-subscription",
+                model="gpt-5.6-sol",
+                reasoning_effort="low",
+            )
+            self.assertEqual(config.mode, "subscription")
+            self.assertEqual(config.api_key, "")
+            self.assertEqual(config.model, "gpt-5.6-sol")
+
+    def test_subscription_config_rejects_missing_explicit_model(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.dict(os.environ, {}, clear=True):
+                with self.assertRaisesRegex(ConfigError, "explicit model"):
+                    ApiConfig.for_backend(Path(directory), "claude-subscription")
     def test_persists_settings_and_dpapi_encrypted_key(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             project = Path(directory)

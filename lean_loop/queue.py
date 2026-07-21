@@ -488,22 +488,39 @@ def run_queue_task(
 ) -> WorkflowResult | None:
     task_id = task_row["id"]
     settings = task_row["settings"]
+    agent_backend_id = str(settings.get("agent_backend") or "direct")
+    if agent_backend_id != "direct" and settings.get("explain"):
+        raise QueueError(
+            "Subscription queue tasks cannot silently use a direct API for explanation"
+        )
     race_settings = settings.get("race") if isinstance(settings.get("race"), dict) else None
+    if agent_backend_id != "direct" and race_settings:
+        raise QueueError("Subscription backends do not support provider races")
     if race_settings and len(race_settings.get("lanes") or []) >= 2:
         return _run_queue_race(store=store, task_row=task_row, race_settings=race_settings)
 
     controller = QueueProcessController(store, task_id)
     target = resolve_target(store.project, task_row["target_file"])
     provider_id = str(settings.get("provider") or "default")
-    if base_config is None or provider_id != "default":
-        base_config = ApiConfig.from_environment(store.project, provider_id)
+    selected_model = str(settings.get("model") or "").strip()
+    if agent_backend_id == "direct":
+        if base_config is None or provider_id != "default":
+            base_config = ApiConfig.for_backend(
+                store.project, "direct", provider_id=provider_id, model=selected_model
+            )
+    else:
+        base_config = ApiConfig.for_backend(
+            store.project,
+            agent_backend_id,
+            provider_id=provider_id,
+            model=selected_model,
+        )
     api_timeout = settings.get("api_timeout")
     if api_timeout is not None:
         base_config = replace(base_config, timeout_seconds=int(api_timeout))
     api_retries = settings.get("api_retries")
     if api_retries is not None:
         base_config = replace(base_config, api_timeout_retries=int(api_retries))
-    selected_model = str(settings.get("model") or "").strip()
     if selected_model:
         base_config = replace(base_config, model=selected_model)
     plan_config = replace(base_config, reasoning_effort=settings["plan_effort"])
@@ -524,6 +541,10 @@ def run_queue_task(
         return check_lean(
             project, target, timeout, lake, process_control=controller
         )
+
+    def persist_backend_identity(identity: dict[str, Any]) -> None:
+        settings["backend_identity"] = dict(identity)
+        store.update_settings(task_id, settings)
 
     try:
         controller.raise_if_cancelled()
@@ -557,7 +578,9 @@ def run_queue_task(
             lean_checker=lean_checker,
             phase_callback=controller.enter_phase,
             workflow_created_callback=lambda run_id: store.attach_workflow(task_id, run_id),
+            backend_identity_callback=persist_backend_identity,
             process_control=controller,
+            agent_backend_id=agent_backend_id,
         )
         controller.raise_if_cancelled()
         if result.ok and settings.get("explain"):
