@@ -117,6 +117,8 @@ def _safe_environment(source: Mapping[str, str] | None = None) -> dict[str, str]
         upper = name.upper()
         if any(part in upper for part in _SECRET_ENV_PARTS):
             environment.pop(name, None)
+        elif upper == "TOKEN" or upper.endswith("_TOKEN"):
+            environment.pop(name, None)
         elif any(part in upper for part in _EXTERNAL_OVERRIDE_ENV_PARTS):
             environment.pop(name, None)
         elif any(upper.startswith(prefix) for prefix in _SENSITIVE_ENV_PREFIXES):

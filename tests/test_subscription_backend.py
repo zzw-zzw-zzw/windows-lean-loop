@@ -160,6 +160,9 @@ payload = {
             "MODEL_ENDPOINT",
         )
     ),
+    "generic_tokens_present": any(
+        os.environ.get(name) for name in ("TUSHARE_TOKEN", "GH_TOKEN", "TOKEN")
+    ),
 }
 result = json.dumps(payload, separators=(",", ":"))
 requested_model = args[args.index("--model") + 1] if "--model" in args else ""
@@ -278,6 +281,9 @@ class SubscriptionBackendTests(unittest.TestCase):
                 "CLAUDE_CODE_OAUTH_TOKEN": "must-be-removed",
                 "CUSTOM_GATEWAY": "https://gateway.invalid",
                 "MODEL_ENDPOINT": "https://endpoint.invalid",
+                "TUSHARE_TOKEN": "fixture-secret",
+                "GH_TOKEN": "fixture-secret",
+                "TOKEN": "fixture-secret",
             },
             **kwargs,
         }
@@ -292,6 +298,9 @@ class SubscriptionBackendTests(unittest.TestCase):
             backend = self._backend("codex", root)
             self.assertNotIn("OPENAI_API_KEY", backend.base_environment)
             self.assertNotIn("ANTHROPIC_API_KEY", backend.base_environment)
+            self.assertNotIn("TUSHARE_TOKEN", backend.base_environment)
+            self.assertNotIn("GH_TOKEN", backend.base_environment)
+            self.assertNotIn("TOKEN", backend.base_environment)
             backend.base_environment["FAKE_MODE"] = "nonfatal-event"
             output = backend.invoke(
                 _request(), _config("gpt-test-pinned"), root / "ignored"
@@ -300,6 +309,7 @@ class SubscriptionBackendTests(unittest.TestCase):
             self.assertEqual(output["api_keys_present"], False)
             self.assertEqual(output["project_environment_present"], False)
             self.assertEqual(output["external_overrides_present"], False)
+            self.assertEqual(output["generic_tokens_present"], False)
             self.assertIn("--ephemeral", output["argv"])
             self.assertIn("workspace-write", output["argv"])
             self.assertIn(
@@ -434,6 +444,7 @@ class SubscriptionBackendTests(unittest.TestCase):
             )
 
             self.assertEqual(output["api_keys_present"], False)
+            self.assertEqual(output["generic_tokens_present"], False)
             self.assertIn("--no-session-persistence", output["argv"])
             self.assertIn("--safe-mode", output["argv"])
             self.assertIn("--tools=", output["argv"])
