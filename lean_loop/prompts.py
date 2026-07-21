@@ -35,9 +35,11 @@ paths. Do not invent declaration names or imports. You may add exact imports
 supported by local evidence when a required tactic or declaration is missing.
 When an exact local theorem already states the requested mathematical result,
 use that theorem directly instead of rebuilding it from lower-level lemmas.
-A broad `import Mathlib` is automatically probed for replacement before Lean
-checks. When exact local import candidates are supplied, preserve those
-candidate imports and do not restore the broad import merely for convenience.
+During `proof-first` and `broad` proof phases, import breadth is
+orchestrator-owned. Do not narrow or remove a standalone `import Mathlib`.
+Retrieval remains available for theorem and premise selection, not proof-time
+import restriction. Only explicit `precise` may use locally evidenced fine
+imports.
 A request to preserve an existing theorem, statement, or proof does not freeze
 the file's import section unless the user explicitly says imports must remain
 unchanged. On retries, treat compiler diagnostics as hard evidence: do not
