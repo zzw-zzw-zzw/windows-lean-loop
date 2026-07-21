@@ -247,7 +247,11 @@ else:
             os.environ.get("FAKE_ACTUAL_MODEL", requested_model): {
                 "inputTokens": 1,
                 "outputTokens": 1,
-            }
+            },
+            "claude-haiku-auxiliary-fixture": {
+                "inputTokens": 1,
+                "outputTokens": 1,
+            },
         },
         "permission_denials": [],
     }))

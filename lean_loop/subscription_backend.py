@@ -1090,7 +1090,7 @@ class ClaudeSubscriptionBackend(_SubscriptionBackend):
                 raw_output=stdout,
             )
         usage = value.get("modelUsage")
-        if not isinstance(usage, dict) or set(usage) != {requested_model}:
+        if not isinstance(usage, dict) or requested_model not in usage:
             raise SubscriptionBackendError(
                 "model_identity_required",
                 "Claude did not verify the requested model in modelUsage",
