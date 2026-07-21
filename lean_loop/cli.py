@@ -10,7 +10,7 @@ from dataclasses import replace
 from pathlib import Path
 
 from lean_loop.agent_protocol import AgentRequest, protocol_capabilities
-from lean_loop.api import ApiError, call_model
+from lean_loop.api import ApiError, call_model, effective_api_transport
 from lean_loop.config import ApiConfig, ConfigError
 from lean_loop.dashboard import _resolve_or_create_target, serve_dashboard
 from lean_loop.explanation import generate_workflow_explanation
@@ -50,7 +50,7 @@ def _configure_console_encoding() -> None:
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="lean-loop",
-        description="Repair one Lean file using curl and an OpenAI-compatible API.",
+        description="Repair Lean files using a selectable API transport and local verification.",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -78,6 +78,9 @@ def _parser() -> argparse.ArgumentParser:
     api_check.add_argument("--provider", default="default")
     api_check.add_argument("--agent-backend", choices=AGENT_BACKEND_CHOICES, default="direct")
     api_check.add_argument("--api-retries", type=int, default=None)
+    api_check.add_argument(
+        "--transport", choices=("auto", "python", "curl"), default=None
+    )
     api_check.add_argument(
         "--model", default="", help="Override LEAN_AGENT_MODEL for this check"
     )
@@ -530,6 +533,7 @@ def main(argv: list[str] | None = None) -> None:
                 base_config,
                 timeout_seconds=args.timeout,
                 reasoning_effort=args.reasoning_effort,
+                api_transport=args.transport or base_config.api_transport,
             )
             if args.agent_backend == "direct":
                 content = call_model(
@@ -538,6 +542,7 @@ def main(argv: list[str] | None = None) -> None:
                     args.temp_dir.resolve(),
                 )
                 print(f"API endpoint: {config.endpoint}")
+                print(f"API transport: {effective_api_transport(config)}")
                 print(f"API result: {content.strip()}")
             else:
                 protected_root = api_project or Path.cwd().resolve()
