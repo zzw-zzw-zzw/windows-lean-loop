@@ -5,10 +5,11 @@ import json
 import os
 import sys
 import time
+import uuid
 from dataclasses import replace
 from pathlib import Path
 
-from lean_loop.agent_protocol import protocol_capabilities
+from lean_loop.agent_protocol import AgentRequest, protocol_capabilities
 from lean_loop.api import ApiError, call_model
 from lean_loop.config import ApiConfig, ConfigError
 from lean_loop.dashboard import _resolve_or_create_target, serve_dashboard
@@ -27,7 +28,16 @@ from lean_loop.queue import QueueError, QueueStore, work_queue
 from lean_loop.retrieval_cache import RetrievalCache, clear_retrieval_cache
 from lean_loop.runner import run_repair_loop
 from lean_loop.state import WorkflowStore, list_workflows
+from lean_loop.subscription_backend import (
+    SUBSCRIPTION_BACKENDS,
+    SubscriptionBackendError,
+    create_subscription_backend,
+    inspect_subscription_backend,
+)
 from lean_loop.workflow import run_structured_workflow
+
+
+AGENT_BACKEND_CHOICES = ("direct", "codex-subscription", "claude-subscription")
 
 
 def _configure_console_encoding() -> None:
@@ -50,6 +60,9 @@ def _parser() -> argparse.ArgumentParser:
 
     doctor = subparsers.add_parser("doctor", help="Check Windows tooling and project layout")
     doctor.add_argument("--project", type=Path, required=True)
+    doctor.add_argument("--agent-backend", choices=AGENT_BACKEND_CHOICES, default="direct")
+    doctor.add_argument("--model", default="")
+    doctor.add_argument("--reasoning-effort", default="low")
 
     dashboard = subparsers.add_parser(
         "dashboard", help="Start the local workflow and queue dashboard"
@@ -63,6 +76,7 @@ def _parser() -> argparse.ArgumentParser:
     api_check.add_argument("--timeout", type=int, default=60)
     api_check.add_argument("--project", type=Path, default=None)
     api_check.add_argument("--provider", default="default")
+    api_check.add_argument("--agent-backend", choices=AGENT_BACKEND_CHOICES, default="direct")
     api_check.add_argument("--api-retries", type=int, default=None)
     api_check.add_argument(
         "--model", default="", help="Override LEAN_AGENT_MODEL for this check"
@@ -123,6 +137,7 @@ def _parser() -> argparse.ArgumentParser:
     workflow_run.add_argument("--project", type=Path, required=True)
     workflow_run.add_argument("--file", required=True)
     workflow_run.add_argument("--task", required=True)
+    workflow_run.add_argument("--agent-backend", choices=AGENT_BACKEND_CHOICES, default="direct")
     workflow_run.add_argument(
         "--model", default="", help="Override LEAN_AGENT_MODEL for this workflow"
     )
@@ -202,6 +217,7 @@ def _parser() -> argparse.ArgumentParser:
     )
     workflow_resume.add_argument("--project", type=Path, required=True)
     workflow_resume.add_argument("--run-id", required=True)
+    workflow_resume.add_argument("--agent-backend", choices=AGENT_BACKEND_CHOICES, default=None)
     workflow_resume.add_argument("--max-attempts", type=int, default=None)
     workflow_resume.add_argument("--max-attempts-per-step", type=int, default=None)
     workflow_resume.add_argument("--api-timeout", type=int, default=None)
@@ -230,6 +246,7 @@ def _parser() -> argparse.ArgumentParser:
         "--file", default="", help="Target .lean file; omit to create GeneratedProof_*.lean"
     )
     queue_add.add_argument("--task", required=True)
+    queue_add.add_argument("--agent-backend", choices=AGENT_BACKEND_CHOICES, default="direct")
     queue_add.add_argument(
         "--model", default="", help="Override LEAN_AGENT_MODEL for this task"
     )
@@ -324,7 +341,13 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _doctor(project_arg: Path) -> int:
+def _doctor(
+    project_arg: Path,
+    *,
+    agent_backend: str = "direct",
+    model: str = "",
+    reasoning_effort: str = "low",
+) -> int:
     project = resolve_project(project_arg)
     report = {
         "project": str(project),
@@ -341,8 +364,37 @@ def _doctor(project_arg: Path) -> int:
             "LEAN_AGENT_MODEL": bool(_environment_value("LEAN_AGENT_MODEL")),
         },
     }
+    if agent_backend in SUBSCRIPTION_BACKENDS:
+        try:
+            config = ApiConfig.for_backend(
+                project,
+                agent_backend,
+                model=model,
+                reasoning_effort=reasoning_effort,
+            )
+            backend = create_subscription_backend(
+                agent_backend,
+                protected_root=project,
+                protected_target=project / "__doctor_no_target__",
+            )
+            report["agent_backend"] = inspect_subscription_backend(
+                backend,
+                model=config.model,
+                reasoning_effort=str(config.reasoning_effort or ""),
+            )
+        except (ConfigError, SubscriptionBackendError) as exc:
+            report["agent_backend"] = {
+                "status": "blocked",
+                "backend_id": agent_backend,
+                "error_kind": getattr(exc, "kind", "configuration_error"),
+                "message": str(exc),
+            }
+    else:
+        report["agent_backend"] = {"status": "ready", "backend_id": "direct"}
     print(json.dumps(report, indent=2, ensure_ascii=False))
-    return 0 if all(report["programs"].values()) else 1
+    programs_ready = all(report["programs"].values())
+    backend_ready = report["agent_backend"].get("status") == "ready"
+    return 0 if programs_ready and backend_ready else 1
 
 
 def _environment_value(name: str) -> str:
@@ -396,6 +448,7 @@ def _print_queue_list(store: QueueStore, as_json: bool) -> int:
 
 def _queue_settings(args: argparse.Namespace) -> dict[str, object]:
     return {
+        "agent_backend": args.agent_backend,
         "provider": args.provider,
         "model": args.model,
         "max_attempts": args.max_attempts,
@@ -444,7 +497,14 @@ def main(argv: list[str] | None = None) -> None:
             raise SystemExit(0)
 
         if args.command == "doctor":
-            raise SystemExit(_doctor(args.project))
+            raise SystemExit(
+                _doctor(
+                    args.project,
+                    agent_backend=args.agent_backend,
+                    model=args.model,
+                    reasoning_effort=args.reasoning_effort,
+                )
+            )
 
         if args.command == "dashboard":
             project = resolve_project(args.project)
@@ -453,9 +513,13 @@ def main(argv: list[str] | None = None) -> None:
 
         if args.command == "api-check":
             api_project = resolve_project(args.project) if args.project else None
-            base_config = ApiConfig.from_environment(api_project, args.provider)
-            if args.model:
-                base_config = replace(base_config, model=args.model)
+            base_config = ApiConfig.for_backend(
+                api_project,
+                args.agent_backend,
+                provider_id=args.provider,
+                model=args.model,
+                reasoning_effort=args.reasoning_effort,
+            )
             if args.api_retries is not None:
                 if args.api_retries < 0:
                     raise ConfigError("--api-retries cannot be negative")
@@ -467,13 +531,40 @@ def main(argv: list[str] | None = None) -> None:
                 timeout_seconds=args.timeout,
                 reasoning_effort=args.reasoning_effort,
             )
-            content = call_model(
-                config,
-                'Connectivity test. Return exactly {"content":"API_OK"}.',
-                args.temp_dir.resolve(),
-            )
-            print(f"API endpoint: {config.endpoint}")
-            print(f"API result: {content.strip()}")
+            if args.agent_backend == "direct":
+                content = call_model(
+                    config,
+                    'Connectivity test. Return exactly {"content":"API_OK"}.',
+                    args.temp_dir.resolve(),
+                )
+                print(f"API endpoint: {config.endpoint}")
+                print(f"API result: {content.strip()}")
+            else:
+                protected_root = api_project or Path.cwd().resolve()
+                backend = create_subscription_backend(
+                    args.agent_backend,
+                    protected_root=protected_root,
+                    protected_target=protected_root / "__api_check_no_target__",
+                )
+                request = AgentRequest(
+                    request_id=uuid.uuid4().hex,
+                    sequence=1,
+                    role="planner",
+                    run_id="api-check",
+                    phase="connectivity",
+                    output_type="json",
+                    model=config.model,
+                    reasoning_effort=config.reasoning_effort,
+                    system_prompt="Connectivity test only; do not use tools or mutate files.",
+                    user_prompt='Return exactly {"content":"API_OK"}.',
+                )
+                content = backend.invoke(request, config, args.temp_dir.resolve())
+                print(f"Agent backend: {args.agent_backend}")
+                print(f"Agent result: {json.dumps(content, ensure_ascii=False)}")
+                print(
+                    "Agent metadata: "
+                    + json.dumps(backend.last_metadata, ensure_ascii=False, sort_keys=True)
+                )
             raise SystemExit(0)
 
         if args.command == "mathlib-index":
@@ -696,16 +787,25 @@ def main(argv: list[str] | None = None) -> None:
             )
             if max_attempts < 1 or max_attempts_per_step < 1:
                 raise ConfigError("Resume candidate budgets must be positive")
+            backend_id = str(
+                args.agent_backend or settings.get("agent_backend") or "direct"
+            )
+            saved_models = dict(settings.get("models") or {})
+            saved_efforts = dict(settings.get("reasoning_effort") or {})
+            common_model = args.model or ""
+            initial_model = common_model or str(saved_models.get("plan") or "")
             base_config = _config_with_timeout(
-                ApiConfig.from_environment(project), args.api_timeout
+                ApiConfig.for_backend(
+                    project,
+                    backend_id,
+                    model=initial_model,
+                ),
+                args.api_timeout,
             )
             if args.api_retries is not None:
                 if args.api_retries < 0:
                     raise ConfigError("--api-retries cannot be negative")
                 base_config = replace(base_config, api_timeout_retries=args.api_retries)
-            saved_models = dict(settings.get("models") or {})
-            saved_efforts = dict(settings.get("reasoning_effort") or {})
-            common_model = args.model or ""
             plan_config = replace(
                 base_config,
                 model=common_model or str(saved_models.get("plan") or base_config.model),
@@ -751,6 +851,7 @@ def main(argv: list[str] | None = None) -> None:
                 ),
                 protected_declarations=list(settings.get("protected_declarations") or []),
                 resume_run_id=args.run_id,
+                agent_backend_id=backend_id,
             )
             print(f"{'SUCCESS' if result.ok else 'FAILED'} after {result.attempts} total candidate(s).")
             print(f"Run ID: {result.run_id}")
@@ -764,11 +865,18 @@ def main(argv: list[str] | None = None) -> None:
                 raise ConfigError("--max-attempts must be positive")
             if args.max_attempts_per_step < 1:
                 raise ConfigError("--max-attempts-per-step must be positive")
+            if args.agent_backend != "direct" and args.explain:
+                raise ConfigError(
+                    "Subscription workflow explanation requires a separate explicit direct API call"
+                )
             base_config = _config_with_timeout(
-                ApiConfig.from_environment(project), args.api_timeout
+                ApiConfig.for_backend(
+                    project,
+                    args.agent_backend,
+                    model=args.model,
+                ),
+                args.api_timeout,
             )
-            if args.model:
-                base_config = replace(base_config, model=args.model)
             if args.api_retries is not None:
                 if args.api_retries < 0:
                     raise ConfigError("--api-retries cannot be negative")
@@ -797,6 +905,7 @@ def main(argv: list[str] | None = None) -> None:
                 formalize_goal=args.formalize_goal,
                 import_policy=args.import_policy,
                 protected_declarations=list(args.protect_declaration),
+                agent_backend_id=args.agent_backend,
             )
             label = "SUCCESS" if result.ok else "FAILED"
             print(f"{label} after {result.attempts} attempt(s).")

@@ -108,6 +108,8 @@ class AgentBackend(Protocol):
 
 
 class DirectModelBackend:
+    backend_id = "direct"
+
     def __init__(
         self,
         *,
@@ -116,6 +118,7 @@ class DirectModelBackend:
     ) -> None:
         self.json_model_call = json_model_call
         self.file_model_call = file_model_call
+        self.last_metadata: dict[str, Any] = {"backend_id": self.backend_id}
 
     def invoke(
         self,
@@ -123,6 +126,13 @@ class DirectModelBackend:
         config: ApiConfig,
         temp_dir: Path,
     ) -> dict[str, Any] | str:
+        self.last_metadata = {
+            "backend_id": self.backend_id,
+            "requested_model": config.model,
+            "actual_model": config.model,
+            "requested_reasoning_effort": config.reasoning_effort,
+            "effective_reasoning_effort": config.reasoning_effort,
+        }
         if request.output_type == "json":
             if self.json_model_call is None:
                 raise AgentProtocolError("Backend does not support JSON Agent output")
@@ -157,6 +167,12 @@ class AgentRuntime:
             ),
             default=0,
         )
+
+    def _backend_metadata(self) -> dict[str, Any]:
+        value = getattr(self.backend, "last_metadata", None)
+        if isinstance(value, dict):
+            return dict(value)
+        return {"backend_id": str(getattr(self.backend, "backend_id", "unknown"))}
 
     def invoke(
         self,
@@ -202,6 +218,7 @@ class AgentRuntime:
                 raise AgentProtocolError("Lean-file Agent response must be text")
         except Exception as exc:
             raw_output = getattr(exc, "raw_output", None)
+            error_kind = getattr(exc, "kind", None)
             if isinstance(raw_output, str) and raw_output:
                 atomic_write_text(call_dir / "raw-output.txt", raw_output[: 1024 * 1024])
             response = AgentResponse(
@@ -213,10 +230,20 @@ class AgentRuntime:
                 started_at=started_at,
                 completed_at=utc_now(),
                 duration_seconds=round(time.perf_counter() - started, 6),
-                error={"type": type(exc).__name__, "message": str(exc)},
+                error={
+                    "type": type(exc).__name__,
+                    "message": str(exc),
+                    **({"kind": error_kind} if isinstance(error_kind, str) else {}),
+                },
                 metadata={
                     "model": config.model,
                     "raw_output_saved": bool(isinstance(raw_output, str) and raw_output),
+                    **self._backend_metadata(),
+                    **(
+                        {"error_classification": error_kind}
+                        if isinstance(error_kind, str)
+                        else {}
+                    ),
                 },
             )
             atomic_write_json(call_dir / "response.json", response.to_dict())
@@ -233,6 +260,7 @@ class AgentRuntime:
             metadata={
                 "model": config.model,
                 "reasoning_effort": config.reasoning_effort,
+                **self._backend_metadata(),
             },
         )
         atomic_write_json(call_dir / "response.json", response.to_dict())

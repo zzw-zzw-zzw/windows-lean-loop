@@ -57,6 +57,7 @@ def _default_queue_settings(project: Path) -> dict[str, Any]:
     configured = project_config_view(project)
     effort = str(configured.get("reasoning_effort") or "high")
     return {
+        "agent_backend": "direct",
         "model": "",
         "provider": "default",
         "max_attempts": 3,
@@ -107,10 +108,14 @@ def _queue_settings(value: object, project: Path) -> dict[str, Any]:
         if settings[key] not in efforts:
             raise ValueError(f"Unsupported {key}: {settings[key]}")
     for key in (
-        "model", "provider", "review_model", "lake", "explain_language", "explain_model",
+        "agent_backend", "model", "provider", "review_model", "lake", "explain_language", "explain_model",
         "import_policy",
     ):
         settings[key] = str(settings[key]).strip()
+    if settings["agent_backend"] not in {
+        "direct", "codex-subscription", "claude-subscription"
+    }:
+        raise ValueError(f"Unsupported agent_backend: {settings['agent_backend']}")
     if settings["import_policy"] not in {"auto", "proof-first", "precise", "broad"}:
         raise ValueError(f"Unsupported import_policy: {settings['import_policy']}")
     protected = settings.get("protected_declarations", [])

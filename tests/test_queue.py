@@ -14,6 +14,7 @@ from lean_loop.workflow import WorkflowResult
 
 def _settings() -> dict[str, object]:
     return {
+        "agent_backend": "direct",
         "model": "",
         "max_attempts": 2,
         "max_attempts_per_step": 2,
@@ -91,6 +92,45 @@ class QueueStoreTests(unittest.TestCase):
                 },
             )
             self.assertEqual(store.get_task(task["id"])["state"], "succeeded")
+
+    def test_subscription_task_preserves_backend_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory)
+            (project / "Main.lean").write_text(
+                "example : True := by trivial\n", encoding="utf-8"
+            )
+            settings = _settings()
+            settings["agent_backend"] = "codex-subscription"
+            settings["model"] = "gpt-5.6-sol"
+            store = QueueStore(project)
+            task = store.add_task(
+                target_file="Main.lean", task_text="prove", settings=settings
+            )
+            claimed = store.claim_next(os.getpid())
+            captured: dict[str, object] = {}
+
+            def fake_workflow(**kwargs):
+                captured["backend"] = kwargs["agent_backend_id"]
+                captured["model"] = kwargs["plan_config"].model
+                kwargs["workflow_created_callback"]("20260714T000000000000Z")
+                kwargs["phase_callback"]("proving", 1)
+                kwargs["phase_callback"]("lean_checking", 1)
+                kwargs["phase_callback"]("reviewing", 1)
+                return WorkflowResult(
+                    True, "20260714T000000000000Z", 1, project,
+                    LeanCheck(True, 0, "", ("lake",)), False,
+                )
+
+            with patch(
+                "lean_loop.queue.run_structured_workflow", side_effect=fake_workflow
+            ):
+                result = run_queue_task(store=store, task_row=claimed)
+
+            self.assertTrue(result.ok)
+            self.assertEqual(captured, {
+                "backend": "codex-subscription",
+                "model": "gpt-5.6-sol",
+            })
 
     def test_persists_tasks_and_claims_dependencies_in_order(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

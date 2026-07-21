@@ -8,7 +8,11 @@ from lean_loop.config import ApiConfig
 from lean_loop.lean import LeanCheck
 from lean_loop.mathlib_index import build_mathlib_index
 from lean_loop.process_control import ProcessCancelled
-from lean_loop.workflow import run_structured_workflow, validate_formal_goal
+from lean_loop.workflow import (
+    _resume_replan_reason,
+    run_structured_workflow,
+    validate_formal_goal,
+)
 
 
 def _config() -> ApiConfig:
@@ -24,6 +28,13 @@ def _config() -> ApiConfig:
 
 
 class StructuredWorkflowTests(unittest.TestCase):
+    def test_backend_change_is_a_visible_resume_replan_reason(self) -> None:
+        previous = {"settings": {"agent_backend": "codex-subscription"}}
+        current = {"agent_backend": "claude-subscription"}
+        self.assertEqual(
+            _resume_replan_reason(None, previous, current),  # type: ignore[arg-type]
+            "backend_changed",
+        )
     def _project(self, root: Path, source: str) -> tuple[Path, Path]:
         (root / "lean-toolchain").write_text("fake\n", encoding="utf-8")
         (root / "lakefile.toml").write_text('name = "demo"\n', encoding="utf-8")
@@ -96,6 +107,7 @@ class StructuredWorkflowTests(unittest.TestCase):
             self.assertEqual(target.read_text(encoding="utf-8"), "example : True := by trivial\n")
             manifest = json.loads((result.state_dir / "run.json").read_text(encoding="utf-8"))
             self.assertEqual(manifest["status"], "succeeded")
+            self.assertEqual(manifest["settings"]["agent_backend"], "direct")
             self.assertTrue((result.state_dir / "plan.json").is_file())
             self.assertTrue((result.state_dir / "attempts" / "001" / "candidate.lean").is_file())
             self.assertTrue((result.state_dir / "reviews" / "001.json").is_file())

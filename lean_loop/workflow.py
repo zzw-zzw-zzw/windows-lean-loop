@@ -359,6 +359,9 @@ def _resume_replan_reason(
     current_settings: dict[str, Any],
 ) -> str | None:
     old_settings = dict(previous.get("settings") or {})
+    old_backend = str(old_settings.get("agent_backend") or "direct")
+    if old_backend != str(current_settings.get("agent_backend") or "direct"):
+        return "backend_changed"
     old_models = old_settings.get("models")
     if old_models and old_models != current_settings.get("models"):
         return "model_changed"
@@ -514,6 +517,7 @@ def run_structured_workflow(
     workflow_created_callback: WorkflowCreatedCallback | None = None,
     process_control: ProcessControl | None = None,
     agent_backend: AgentBackend | None = None,
+    agent_backend_id: str = "direct",
 ) -> WorkflowResult:
     if max_attempts < 1:
         raise ValueError("max_attempts must be positive")
@@ -522,10 +526,17 @@ def run_structured_workflow(
     if max_attempts_per_step < 1:
         raise ValueError("max_attempts_per_step must be positive")
     protected_declarations = list(protected_declarations or [])
+    if agent_backend_id not in {
+        "direct",
+        "codex-subscription",
+        "claude-subscription",
+    }:
+        raise ValueError(f"Unsupported Agent backend: {agent_backend_id}")
     relative = target.relative_to(project)
     original_for_policy = target.read_text(encoding="utf-8")
     effective_import_policy = _effective_import_policy(import_policy, original_for_policy)
     settings = {
+        "agent_backend": agent_backend_id,
         "max_attempts": max_attempts,
         "max_attempts_total": max_attempts,
         "max_attempts_per_step": max_attempts_per_step,
@@ -544,19 +555,22 @@ def run_structured_workflow(
         },
         "provider_signatures": {
             "plan": {
+                "backend": agent_backend_id,
                 "model": plan_config.model,
                 "mode": plan_config.mode,
-                "endpoint": plan_config.endpoint,
+                "endpoint": plan_config.endpoint if agent_backend_id == "direct" else None,
             },
             "prove": {
+                "backend": agent_backend_id,
                 "model": prove_config.model,
                 "mode": prove_config.mode,
-                "endpoint": prove_config.endpoint,
+                "endpoint": prove_config.endpoint if agent_backend_id == "direct" else None,
             },
             "review": {
+                "backend": agent_backend_id,
                 "model": review_config.model,
                 "mode": review_config.mode,
-                "endpoint": review_config.endpoint,
+                "endpoint": review_config.endpoint if agent_backend_id == "direct" else None,
             },
         },
         "reasoning_effort": {
@@ -602,10 +616,20 @@ def run_structured_workflow(
         )
         atomic_write_text(store.paths.original, original_source)
     timings = TimingRecorder(store.paths.timings, resume=resuming)
+    selected_backend = agent_backend
+    if selected_backend is None and agent_backend_id != "direct":
+        from lean_loop.subscription_backend import create_subscription_backend
+
+        selected_backend = create_subscription_backend(
+            agent_backend_id,
+            protected_root=project,
+            protected_target=target,
+            process_control=process_control,
+        )
     agent_runtime = AgentRuntime(
         workflow_root=store.paths.root,
         run_id=store.paths.run_id,
-        backend=agent_backend
+        backend=selected_backend
         or DirectModelBackend(
             json_model_call=json_model_call,
             file_model_call=file_model_call,

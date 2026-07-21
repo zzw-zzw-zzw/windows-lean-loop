@@ -7,7 +7,7 @@ import queue
 import threading
 import time
 from pathlib import Path
-from typing import Callable, Protocol, Sequence
+from typing import Callable, Mapping, Protocol, Sequence
 
 
 class ProcessCancelled(RuntimeError):
@@ -55,6 +55,7 @@ def run_controlled_process(
     kind: str,
     control: ProcessControl | None = None,
     stdout_line_callback: Callable[[str], None] | None = None,
+    env: Mapping[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     creationflags = subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
     process = subprocess.Popen(
@@ -68,6 +69,7 @@ def run_controlled_process(
         errors="replace",
         creationflags=creationflags,
         start_new_session=os.name != "nt",
+        env=dict(env) if env is not None else None,
     )
     if control is not None:
         try:
@@ -116,6 +118,8 @@ def run_controlled_process(
         terminate_process_tree(process)
         raise
     finally:
+        if process.poll() is None:
+            terminate_process_tree(process)
         if control is not None:
             control.process_finished(process.pid)
 
