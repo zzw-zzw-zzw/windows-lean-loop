@@ -174,6 +174,15 @@ class AgentRuntime:
             return dict(value)
         return {"backend_id": str(getattr(self.backend, "backend_id", "unknown"))}
 
+    @staticmethod
+    def _persist_backend_evidence(call_dir: Path, metadata: dict[str, Any]) -> None:
+        tool_events = metadata.get("tool_events")
+        if isinstance(tool_events, list):
+            atomic_write_json(call_dir / "tool-events.json", {"events": tool_events})
+        sandbox_manifest = metadata.get("sandbox_manifest")
+        if isinstance(sandbox_manifest, dict):
+            atomic_write_json(call_dir / "sandbox-manifest.json", sandbox_manifest)
+
     def invoke(
         self,
         *,
@@ -219,6 +228,8 @@ class AgentRuntime:
         except Exception as exc:
             raw_output = getattr(exc, "raw_output", None)
             error_kind = getattr(exc, "kind", None)
+            backend_metadata = self._backend_metadata()
+            self._persist_backend_evidence(call_dir, backend_metadata)
             if isinstance(raw_output, str) and raw_output:
                 atomic_write_text(call_dir / "raw-output.txt", raw_output[: 1024 * 1024])
             response = AgentResponse(
@@ -238,7 +249,7 @@ class AgentRuntime:
                 metadata={
                     "model": config.model,
                     "raw_output_saved": bool(isinstance(raw_output, str) and raw_output),
-                    **self._backend_metadata(),
+                    **backend_metadata,
                     **(
                         {"error_classification": error_kind}
                         if isinstance(error_kind, str)
@@ -248,6 +259,8 @@ class AgentRuntime:
             )
             atomic_write_json(call_dir / "response.json", response.to_dict())
             raise
+        backend_metadata = self._backend_metadata()
+        self._persist_backend_evidence(call_dir, backend_metadata)
         response = AgentResponse(
             request_id=request_id,
             role=role,
@@ -260,7 +273,7 @@ class AgentRuntime:
             metadata={
                 "model": config.model,
                 "reasoning_effort": config.reasoning_effort,
-                **self._backend_metadata(),
+                **backend_metadata,
             },
         )
         atomic_write_json(call_dir / "response.json", response.to_dict())

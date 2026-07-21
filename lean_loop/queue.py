@@ -542,6 +542,10 @@ def run_queue_task(
             project, target, timeout, lake, process_control=controller
         )
 
+    def persist_backend_identity(identity: dict[str, Any]) -> None:
+        settings["backend_identity"] = dict(identity)
+        store.update_settings(task_id, settings)
+
     try:
         controller.raise_if_cancelled()
         result = run_structured_workflow(
@@ -574,6 +578,7 @@ def run_queue_task(
             lean_checker=lean_checker,
             phase_callback=controller.enter_phase,
             workflow_created_callback=lambda run_id: store.attach_workflow(task_id, run_id),
+            backend_identity_callback=persist_backend_identity,
             process_control=controller,
             agent_backend_id=agent_backend_id,
         )

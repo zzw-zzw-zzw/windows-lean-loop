@@ -96,9 +96,16 @@ class AgentProtocolTests(unittest.TestCase):
                 "backend_id": backend_id,
                 "cli_version": "codex-cli 1.2.3",
                 "requested_model": "model-a",
-                "actual_model": "model-a",
+                "requested_model_catalog_status": "VALIDATED",
+                "actual_model": None,
+                "actual_model_status": "NOT_REPORTED_BY_CLIENT",
+                "model_identity_source": "REQUESTED_MODEL_AND_OFFICIAL_CATALOG_ONLY",
                 "requested_reasoning_effort": "medium",
                 "effective_reasoning_effort": "medium",
+                "tool_execution_policy": "TOOL_ENABLED_AGENT_SANDBOX",
+                "sandbox_profile": {"filesystem": "workspace-write"},
+                "tool_events": [{"event_type": "command_execution", "exit_code": 0}],
+                "sandbox_manifest": {"protected_state_unchanged": True},
             }
 
             def invoke(self, request, config, temp_dir):
@@ -124,12 +131,19 @@ class AgentProtocolTests(unittest.TestCase):
             ]
             for response in responses:
                 self.assertEqual(response["metadata"]["backend_id"], "codex-subscription")
-                self.assertEqual(response["metadata"]["actual_model"], "model-a")
+                self.assertIsNone(response["metadata"]["actual_model"])
+                self.assertEqual(
+                    response["metadata"]["actual_model_status"],
+                    "NOT_REPORTED_BY_CLIENT",
+                )
             self.assertEqual(
                 responses[1]["metadata"]["error_classification"],
                 "subscription_unavailable",
             )
             self.assertEqual(responses[1]["error"]["kind"], "subscription_unavailable")
+            for call in sorted((root / "agent-calls").iterdir()):
+                self.assertTrue((call / "tool-events.json").is_file())
+                self.assertTrue((call / "sandbox-manifest.json").is_file())
 
     def test_capabilities_are_versioned(self) -> None:
         value = protocol_capabilities()

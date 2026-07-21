@@ -428,7 +428,9 @@ claude
 claude auth status
 ```
 
-模型名必须显式给出；工具不会选择默认模型、切换模型或回退到另一个 provider。先做只读连接检查：
+模型名必须显式给出；工具不会选择默认模型、切换模型或回退到另一个 provider。Codex 会用官方
+catalog 校验 requested model，但当前客户端事件不报告 actual model，因此 metadata 会明确记录
+`actual_model=null` 和 `actual_model_status=NOT_REPORTED_BY_CLIENT`。先做 readiness 与隔离连接检查：
 
 ```powershell
 python -m lean_loop doctor --project D:\my_math_project `
@@ -452,15 +454,21 @@ python -m lean_loop queue add `
 ```
 
 `workflow resume` 默认继承 manifest 中的后端；显式传入不同的 `--agent-backend` 会记录配置变化并
-触发重新规划。订阅后端在 repo 外临时目录启动无会话继承的官方非交互客户端，禁用工具和项目写入；
-Claude 使用 `dontAsk` 权限模式并仅加载隔离目录的 local settings，避免 `plan` 模式触发额外模型，
-不读取、复制或转换本地认证文件、token、cookie 或 API key。stdout/stderr 会限长和脱敏；超时、取消、
-未登录、额度不可用、模型不可用、客户端协议不兼容或最终结果不唯一时均 fail-closed，并终止完整进程树。
-订阅方案及可用模型、额度由对应官方客户端和订阅计划决定，不代表 API key，也不保证无限用量。
+触发重新规划。订阅后端在 repo 外一次性临时目录启动无会话继承的官方非交互客户端。Codex 使用
+tool-enabled `workspace-write` 沙箱；Shell、`apply_patch`、MCP、Web Search 等实际暴露工具属于 Agent
+系统的一部分，沙箱内部文件变化允许存在并会在销毁前归档脱敏的工具事件、命令摘要、文件变化、
+退出状态和 sandbox manifest。权威仓库、正式 worktree、受保护 target、用户私有目录和认证材料均不
+得成为可写对象；工具越出隔离根目录或 protected-state 发生变化时 fail-closed。Claude 仍使用
+`dontAsk`、空工具集和 `safe-mode`，且仅加载隔离目录的 local settings，避免 `plan` 模式触发额外模型。
+两者均不读取、复制或转换本地认证文件、token、cookie 或 API key；stdout/stderr 会限长和脱敏；
+超时、取消、未登录、额度不可用、模型不可用、客户端协议不兼容或最终结果不唯一时均 fail-closed，
+并终止完整进程树。run manifest、queue task 与 response metadata 会保存 backend、CLI、认证、requested/
+actual model 状态、reasoning、tool policy 和 sandbox profile。订阅方案及可用模型、额度由对应官方
+客户端和订阅计划决定，不代表 API key，也不保证无限用量。
 
 当前订阅 workflow 不允许 `--explain`，避免成功后静默改用 `direct` API；可在成功后另行显式运行
 `workflow explain`。诊断时使用 `doctor` 区分安装、登录、模型/推理设置和客户端协议问题，再用
-`api-check` 验证一次真实的最终结果与实际模型身份。
+`api-check` 验证一次真实最终结果；若客户端没有报告 actual model，检查结果会保持 UNKNOWN。
 
 ## 自然语言证明
 

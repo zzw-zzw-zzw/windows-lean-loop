@@ -555,7 +555,11 @@ def main(argv: list[str] | None = None) -> None:
                     output_type="json",
                     model=config.model,
                     reasoning_effort=config.reasoning_effort,
-                    system_prompt="Connectivity test only; do not use tools or mutate files.",
+                    system_prompt=(
+                        "Connectivity test in an ephemeral repo-external sandbox. "
+                        "Tools may operate only inside that sandbox; protected state "
+                        "must remain unchanged."
+                    ),
                     user_prompt='Return exactly {"content":"API_OK"}.',
                 )
                 content = backend.invoke(request, config, args.temp_dir.resolve())

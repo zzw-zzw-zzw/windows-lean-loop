@@ -35,6 +35,28 @@ class StructuredWorkflowTests(unittest.TestCase):
             _resume_replan_reason(None, previous, current),  # type: ignore[arg-type]
             "backend_changed",
         )
+
+    def test_backend_identity_change_is_a_visible_resume_replan_reason(self) -> None:
+        previous = {
+            "settings": {
+                "agent_backend": "codex-subscription",
+                "backend_identity": {
+                    "cli_version": "codex-cli 0.144.4",
+                    "tool_execution_policy": "TOOL_ENABLED_AGENT_SANDBOX",
+                },
+            }
+        }
+        current = {
+            "agent_backend": "codex-subscription",
+            "backend_identity": {
+                "cli_version": "codex-cli 0.145.0",
+                "tool_execution_policy": "TOOL_ENABLED_AGENT_SANDBOX",
+            },
+        }
+        self.assertEqual(
+            _resume_replan_reason(None, previous, current),  # type: ignore[arg-type]
+            "backend_identity_changed",
+        )
     def _project(self, root: Path, source: str) -> tuple[Path, Path]:
         (root / "lean-toolchain").write_text("fake\n", encoding="utf-8")
         (root / "lakefile.toml").write_text('name = "demo"\n', encoding="utf-8")
@@ -127,6 +149,111 @@ class StructuredWorkflowTests(unittest.TestCase):
             self.assertEqual(timings["phase_counts"]["plan_api"], 1)
             self.assertEqual(timings["phase_counts"]["prove_api"], 1)
             self.assertEqual(timings["phase_counts"]["lean_check"], 1)
+
+    def test_subscription_identity_is_persisted_at_run_level(self) -> None:
+        class Backend:
+            backend_id = "codex-subscription"
+            last_metadata: dict[str, object] = {"backend_id": backend_id}
+
+            def inspect(self, *, model: str, reasoning_effort: str):
+                return {
+                    "status": "ready",
+                    "backend_id": self.backend_id,
+                    "cli_version": "codex-cli 0.144.4",
+                    "authentication_type": "chatgpt",
+                    "requested_model": model,
+                    "requested_model_catalog_status": "VALIDATED",
+                    "actual_model": None,
+                    "actual_model_status": "NOT_REPORTED_BY_CLIENT",
+                    "model_identity_source": "REQUESTED_MODEL_AND_OFFICIAL_CATALOG_ONLY",
+                    "requested_reasoning_effort": reasoning_effort,
+                    "effective_reasoning_effort": reasoning_effort,
+                    "tool_execution_policy": "TOOL_ENABLED_AGENT_SANDBOX",
+                    "sandbox_profile": {"filesystem": "workspace-write"},
+                }
+
+            def invoke(self, request, config, temp_dir):
+                self.last_metadata = self.inspect(
+                    model=config.model,
+                    reasoning_effort=config.reasoning_effort,
+                )
+                if request.output_type == "lean_file":
+                    return "example : True := by trivial\n"
+                if request.role == "planner":
+                    return {
+                        "summary": "repair",
+                        "steps": [{
+                            "id": "step-1",
+                            "goal": "prove True",
+                            "success_criteria": "Lean passes",
+                            "search_terms": [],
+                        }],
+                        "preserve": [],
+                        "risks": [],
+                    }
+                return {
+                    "verdict": "accept",
+                    "summary": "accepted",
+                    "failure_analysis": [],
+                    "next_actions": [],
+                    "search_terms": [],
+                }
+
+        with tempfile.TemporaryDirectory() as directory:
+            project, target = self._project(
+                Path(directory), "example : True := by exact missing\n"
+            )
+
+            def checker(project: Path, target: Path, timeout: int, lake: str) -> LeanCheck:
+                ok = "by trivial" in target.read_text(encoding="utf-8")
+                return LeanCheck(ok, 0 if ok else 1, "" if ok else "missing", ())
+
+            config = ApiConfig(
+                api_base="",
+                api_key="",
+                model="gpt-5.6-sol",
+                mode="subscription",
+                timeout_seconds=10,
+                curl_executable="",
+                reasoning_effort="low",
+            )
+            result = run_structured_workflow(
+                project=project,
+                target=target,
+                task="fix proof",
+                plan_config=config,
+                prove_config=config,
+                review_config=config,
+                max_attempts=2,
+                lean_timeout_seconds=10,
+                lake_executable="lake",
+                lean_checker=checker,
+                agent_backend=Backend(),
+                agent_backend_id="codex-subscription",
+            )
+
+            self.assertTrue(result.ok)
+            manifest = json.loads((result.state_dir / "run.json").read_text(encoding="utf-8"))
+            identity = manifest["settings"]["backend_identity"]
+            self.assertEqual(identity["backend_id"], "codex-subscription")
+            self.assertEqual(identity["cli_version"], "codex-cli 0.144.4")
+            self.assertEqual(identity["authentication_type"], "chatgpt")
+            self.assertEqual(
+                identity["tool_execution_policy"], "TOOL_ENABLED_AGENT_SANDBOX"
+            )
+            for role in ("plan", "prove", "review"):
+                request_identity = identity["requests"][role]
+                self.assertEqual(request_identity["requested_model"], "gpt-5.6-sol")
+                self.assertEqual(
+                    request_identity["requested_model_catalog_status"], "VALIDATED"
+                )
+                self.assertIsNone(request_identity["actual_model"])
+                self.assertEqual(
+                    request_identity["actual_model_status"],
+                    "NOT_REPORTED_BY_CLIENT",
+                )
+                self.assertEqual(request_identity["requested_reasoning_effort"], "low")
+                self.assertEqual(request_identity["effective_reasoning_effort"], "low")
 
     def test_broad_mathlib_import_is_probed_before_lean_check(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

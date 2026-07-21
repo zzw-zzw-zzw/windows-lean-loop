@@ -53,6 +53,7 @@ FileModelCall = Callable[[ApiConfig, str, Path], str]
 LeanChecker = Callable[[Path, Path, int, str], LeanCheck]
 PhaseCallback = Callable[[str, int | None], None]
 WorkflowCreatedCallback = Callable[[str], None]
+BackendIdentityCallback = Callable[[dict[str, Any]], None]
 
 IMPORT_POLICIES = {"auto", "proof-first", "precise", "broad"}
 _TOP_LEVEL_DECLARATION_RE = re.compile(
@@ -362,6 +363,12 @@ def _resume_replan_reason(
     old_backend = str(old_settings.get("agent_backend") or "direct")
     if old_backend != str(current_settings.get("agent_backend") or "direct"):
         return "backend_changed"
+    old_backend_identity = old_settings.get("backend_identity")
+    if (
+        old_backend_identity is not None
+        and old_backend_identity != current_settings.get("backend_identity")
+    ):
+        return "backend_identity_changed"
     old_models = old_settings.get("models")
     if old_models and old_models != current_settings.get("models"):
         return "model_changed"
@@ -515,6 +522,7 @@ def run_structured_workflow(
     lean_checker: LeanChecker = check_lean,
     phase_callback: PhaseCallback | None = None,
     workflow_created_callback: WorkflowCreatedCallback | None = None,
+    backend_identity_callback: BackendIdentityCallback | None = None,
     process_control: ProcessControl | None = None,
     agent_backend: AgentBackend | None = None,
     agent_backend_id: str = "direct",
@@ -535,6 +543,29 @@ def run_structured_workflow(
     relative = target.relative_to(project)
     original_for_policy = target.read_text(encoding="utf-8")
     effective_import_policy = _effective_import_policy(import_policy, original_for_policy)
+    selected_backend = agent_backend
+    backend_identity: dict[str, Any] | None = None
+    if agent_backend_id != "direct":
+        from lean_loop.subscription_backend import (
+            build_subscription_identity_summary,
+            create_subscription_backend,
+        )
+
+        if selected_backend is None:
+            selected_backend = create_subscription_backend(
+                agent_backend_id,
+                protected_root=project,
+                protected_target=target,
+                process_control=process_control,
+            )
+        backend_identity = build_subscription_identity_summary(
+            selected_backend,  # type: ignore[arg-type]
+            {
+                "plan": plan_config,
+                "prove": prove_config,
+                "review": review_config,
+            },
+        )
     settings = {
         "agent_backend": agent_backend_id,
         "max_attempts": max_attempts,
@@ -579,6 +610,8 @@ def run_structured_workflow(
             "review": review_config.reasoning_effort,
         },
     }
+    if backend_identity is not None:
+        settings["backend_identity"] = backend_identity
     resuming = resume_run_id is not None
     resume_safe_state: tuple[str, LeanCheck, str, str | None] | None = None
     resume_replan_reason: str | None = None
@@ -616,16 +649,6 @@ def run_structured_workflow(
         )
         atomic_write_text(store.paths.original, original_source)
     timings = TimingRecorder(store.paths.timings, resume=resuming)
-    selected_backend = agent_backend
-    if selected_backend is None and agent_backend_id != "direct":
-        from lean_loop.subscription_backend import create_subscription_backend
-
-        selected_backend = create_subscription_backend(
-            agent_backend_id,
-            protected_root=project,
-            protected_target=target,
-            process_control=process_control,
-        )
     agent_runtime = AgentRuntime(
         workflow_root=store.paths.root,
         run_id=store.paths.run_id,
@@ -639,6 +662,8 @@ def run_structured_workflow(
     target_changed = False
     transaction_touched = False
     try:
+        if backend_identity is not None and backend_identity_callback is not None:
+            backend_identity_callback(dict(backend_identity))
         if workflow_created_callback is not None:
             workflow_created_callback(store.paths.run_id)
         if phase_callback is not None:

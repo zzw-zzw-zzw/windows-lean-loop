@@ -6,6 +6,7 @@ import os
 import re
 import subprocess
 import tempfile
+from collections import Counter
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -44,6 +45,31 @@ _REDACTIONS = (
     ),
 )
 _CLAUDE_MODEL = re.compile(r"^[a-z0-9][a-z0-9._-]{0,127}$")
+CODEX_TOOL_EXECUTION_POLICY = "TOOL_ENABLED_AGENT_SANDBOX"
+CODEX_SANDBOX_PROFILE = {
+    "approval_policy": "never",
+    "filesystem": "workspace-write",
+    "isolation": "repo-external-ephemeral",
+    "network_policy": "disabled",
+    "temp_environment_write_access": "disabled",
+    "protected_state_policy": "snapshot-fail-closed",
+    "session_policy": "ephemeral",
+}
+CLAUDE_TOOL_EXECUTION_POLICY = "TOOLS_DISABLED_BY_CLIENT_FLAGS"
+CLAUDE_SANDBOX_PROFILE = {
+    "filesystem": "safe-mode",
+    "isolation": "repo-external-ephemeral",
+    "network_policy": "client-managed",
+    "protected_state_policy": "snapshot-fail-closed",
+    "session_policy": "no-session-persistence",
+}
+_CODEX_TOOL_EVENT_TYPES = {
+    "apply_patch",
+    "command_execution",
+    "file_change",
+    "mcp_tool_call",
+    "web_search",
+}
 
 
 class SubscriptionBackendError(ApiError):
@@ -93,7 +119,158 @@ def _safe_environment(source: Mapping[str, str] | None = None) -> dict[str, str]
 
 
 def _sha256(path: Path) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest()
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _sandbox_snapshot(root: Path) -> dict[str, Any]:
+    files: dict[str, dict[str, Any]] = {}
+    boundary_violations: list[str] = []
+    scan_errors: list[str] = []
+    for path in sorted(root.rglob("*"), key=lambda value: value.as_posix()):
+        relative = path.relative_to(root).as_posix()
+        try:
+            resolved = path.resolve(strict=False)
+            if path.is_symlink() or not resolved.is_relative_to(root):
+                boundary_violations.append(relative)
+                continue
+            if path.is_file():
+                stat = path.stat()
+                files[relative] = {
+                    "sha256": _sha256(path),
+                    "size_bytes": stat.st_size,
+                }
+        except OSError:
+            scan_errors.append(relative)
+    return {
+        "files": files,
+        "boundary_violations": sorted(set(boundary_violations)),
+        "scan_errors": sorted(set(scan_errors)),
+    }
+
+
+def _sandbox_file_changes(
+    before: Mapping[str, Mapping[str, Any]],
+    after: Mapping[str, Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    changes: list[dict[str, Any]] = []
+    before_paths = set(before)
+    after_paths = set(after)
+    for path in sorted(after_paths - before_paths):
+        changes.append({"change": "created", "path": path, **dict(after[path])})
+    for path in sorted(before_paths & after_paths):
+        if dict(before[path]) != dict(after[path]):
+            changes.append({"change": "modified", "path": path, **dict(after[path])})
+    for path in sorted(before_paths - after_paths):
+        changes.append({"change": "deleted", "path": path})
+    return changes
+
+
+def _summary(value: Any, *, path_redactions: Sequence[tuple[str, str]] = ()) -> str:
+    text = _sanitize(str(value))
+    for raw, replacement in path_redactions:
+        if raw:
+            text = text.replace(raw, replacement)
+            text = text.replace(raw.replace("\\", "/"), replacement)
+    return text[:512]
+
+
+def _tool_path(
+    value: Any,
+    *,
+    sandbox_root: Path,
+) -> tuple[str, bool]:
+    raw = str(value or "").strip()
+    if not raw:
+        return "", False
+    candidate = Path(raw)
+    resolved = (candidate if candidate.is_absolute() else sandbox_root / candidate).resolve(
+        strict=False
+    )
+    if not resolved.is_relative_to(sandbox_root):
+        return "<outside-sandbox>", True
+    return resolved.relative_to(sandbox_root).as_posix(), False
+
+
+def _codex_tool_evidence(
+    events: Sequence[Mapping[str, Any]],
+    *,
+    sandbox_root: Path,
+    protected_root: Path | None,
+) -> dict[str, Any]:
+    archived: list[dict[str, Any]] = []
+    boundary_violations: list[str] = []
+    path_redactions = [
+        (str(sandbox_root), "<sandbox-root>"),
+        (str(Path.home()), "<user-home>"),
+    ]
+    if protected_root is not None:
+        path_redactions.append((str(protected_root), "<protected-root>"))
+    for event in events:
+        protocol_type = str(event.get("type") or "")
+        item = event.get("item")
+        if not isinstance(item, Mapping):
+            continue
+        event_type = str(item.get("type") or "")
+        if event_type not in _CODEX_TOOL_EVENT_TYPES:
+            continue
+        row: dict[str, Any] = {
+            "event_type": event_type,
+            "protocol_event_type": protocol_type,
+            "status": str(item.get("status") or "unknown"),
+        }
+        if isinstance(item.get("exit_code"), int):
+            row["exit_code"] = item["exit_code"]
+        if event_type == "command_execution":
+            row["command_summary"] = _summary(
+                item.get("command") or "", path_redactions=path_redactions
+            )
+            if item.get("cwd"):
+                cwd, outside = _tool_path(item["cwd"], sandbox_root=sandbox_root)
+                row["cwd"] = cwd
+                if outside:
+                    boundary_violations.append("command_execution.cwd")
+        elif event_type == "mcp_tool_call":
+            row["tool_summary"] = _summary(
+                f"{item.get('server') or 'unknown'}/{item.get('tool') or 'unknown'}",
+                path_redactions=path_redactions,
+            )
+        elif event_type == "web_search":
+            row["query_summary"] = _summary(
+                item.get("query") or "", path_redactions=path_redactions
+            )
+        elif event_type in {"apply_patch", "file_change"}:
+            archived_changes: list[dict[str, str]] = []
+            raw_changes = item.get("changes")
+            if isinstance(raw_changes, Mapping):
+                raw_changes = [
+                    {"path": path, "kind": kind}
+                    for path, kind in raw_changes.items()
+                ]
+            if not isinstance(raw_changes, list):
+                raw_changes = []
+            for change in raw_changes:
+                if not isinstance(change, Mapping):
+                    continue
+                path, outside = _tool_path(
+                    change.get("path"), sandbox_root=sandbox_root
+                )
+                archived_changes.append(
+                    {"kind": str(change.get("kind") or "unknown"), "path": path}
+                )
+                if outside:
+                    boundary_violations.append(f"{event_type}.path")
+            row["file_changes"] = archived_changes
+        archived.append(row)
+    counts = Counter(str(row["event_type"]) for row in archived)
+    return {
+        "tool_events": archived,
+        "tool_event_counts": dict(sorted(counts.items())),
+        "_sandbox_boundary_violations": sorted(set(boundary_violations)),
+    }
 
 
 def _project_snapshot(root: Path | None, target: Path | None) -> dict[str, Any]:
@@ -282,8 +459,22 @@ class _SubscriptionBackend:
         stdout: str,
         *,
         requested_model: str,
+        sandbox_root: Path,
     ) -> tuple[str, dict[str, Any]]:
         raise NotImplementedError
+
+    def _execution_evidence(
+        self,
+        stdout: str,
+        *,
+        sandbox_root: Path,
+    ) -> dict[str, Any]:
+        del stdout, sandbox_root
+        return {
+            "tool_events": [],
+            "tool_event_counts": {},
+            "_sandbox_boundary_violations": [],
+        }
 
     def inspect(self, *, model: str, reasoning_effort: str) -> dict[str, Any]:
         if not model:
@@ -323,8 +514,16 @@ class _SubscriptionBackend:
             "cli_version": report["cli_version"],
             "authentication_type": report["authentication_type"],
             "requested_model": config.model,
+            "requested_model_catalog_status": report[
+                "requested_model_catalog_status"
+            ],
+            "actual_model": report["actual_model"],
+            "actual_model_status": report["actual_model_status"],
+            "model_identity_source": report["model_identity_source"],
             "requested_reasoning_effort": reasoning,
-            "effective_reasoning_effort": reasoning,
+            "effective_reasoning_effort": report["effective_reasoning_effort"],
+            "tool_execution_policy": report["tool_execution_policy"],
+            "sandbox_profile": dict(report["sandbox_profile"]),
         }
         self.last_metadata = dict(metadata)
         before_project = _project_snapshot(self.protected_root, self.protected_target)
@@ -335,16 +534,44 @@ class _SubscriptionBackend:
             canary_sha = _sha256(canary)
             mcp_config = cwd / "empty-mcp.json"
             mcp_config.write_text('{"mcpServers": {}}\n', encoding="utf-8")
-            expected_entries = sorted(path.name for path in cwd.iterdir())
+            before_sandbox = _sandbox_snapshot(cwd)
 
-            def side_effect_free() -> bool:
-                return (
-                    before_project
-                    == _project_snapshot(self.protected_root, self.protected_target)
-                    and canary.is_file()
-                    and _sha256(canary) == canary_sha
-                    and sorted(path.name for path in cwd.iterdir()) == expected_entries
+            def sandbox_manifest(
+                tool_boundary_violations: Sequence[str] = (),
+            ) -> dict[str, Any]:
+                after_sandbox = _sandbox_snapshot(cwd)
+                protected_state_unchanged = before_project == _project_snapshot(
+                    self.protected_root, self.protected_target
                 )
+                canary_unchanged = (
+                    canary.is_file() and _sha256(canary) == canary_sha
+                )
+                boundary_violations = sorted(
+                    set(after_sandbox["boundary_violations"])
+                    | set(tool_boundary_violations)
+                )
+                return {
+                    "canary_unchanged": canary_unchanged,
+                    "file_changes": _sandbox_file_changes(
+                        before_sandbox["files"], after_sandbox["files"]
+                    ),
+                    "isolation": "repo-external-ephemeral",
+                    "network_policy": str(
+                        report["sandbox_profile"].get("network_policy") or "unknown"
+                    ),
+                    "protected_state_unchanged": protected_state_unchanged,
+                    "sandbox_boundary_violations": boundary_violations,
+                    "scan_errors": list(after_sandbox["scan_errors"]),
+                }
+
+            def safety_violation(manifest: Mapping[str, Any]) -> str | None:
+                if not manifest.get("protected_state_unchanged"):
+                    return "side_effect_detected"
+                if manifest.get("sandbox_boundary_violations"):
+                    return "sandbox_boundary_violation"
+                if manifest.get("scan_errors") or not manifest.get("canary_unchanged"):
+                    return "sandbox_integrity_violation"
+                return None
 
             arguments = self._arguments(
                 model=config.model,
@@ -361,36 +588,55 @@ class _SubscriptionBackend:
                     kind=self.backend_id,
                 )
             except ProcessCancelled:
-                terminal = "cancelled" if side_effect_free() else "side_effect_detected"
-                self.last_metadata = {**metadata, "terminal_state": terminal}
-                if terminal == "side_effect_detected":
+                manifest = sandbox_manifest()
+                terminal = safety_violation(manifest) or "cancelled"
+                self.last_metadata = {
+                    **metadata,
+                    "sandbox_manifest": manifest,
+                    "terminal_state": terminal,
+                }
+                if terminal != "cancelled":
                     raise SubscriptionBackendError(
                         terminal,
-                        f"{self.backend_id} modified protected state while cancelling",
+                        f"{self.backend_id} violated sandbox safety while cancelling",
                         metadata=self.last_metadata,
                     )
                 raise
-            except SubscriptionBackendError:
-                if not side_effect_free():
+            except SubscriptionBackendError as exc:
+                manifest = sandbox_manifest()
+                terminal = safety_violation(manifest)
+                if terminal is not None:
                     self.last_metadata = {
                         **metadata,
-                        "terminal_state": "side_effect_detected",
+                        "sandbox_manifest": manifest,
+                        "terminal_state": terminal,
                     }
                     raise SubscriptionBackendError(
-                        "side_effect_detected",
-                        f"{self.backend_id} modified protected state while failing",
+                        terminal,
+                        f"{self.backend_id} violated sandbox safety while failing",
                         metadata=self.last_metadata,
-                    )
+                    ) from exc
+                exc.metadata.update(metadata)
+                exc.metadata["sandbox_manifest"] = manifest
+                self.last_metadata = dict(exc.metadata)
                 raise
+            execution_evidence = self._execution_evidence(
+                completed.stdout,
+                sandbox_root=cwd,
+            )
+            tool_boundary_violations = list(
+                execution_evidence.pop("_sandbox_boundary_violations", [])
+            )
             if (
                 len(completed.stdout) > MAX_DIAGNOSTIC_CHARS
                 or len(completed.stderr) > MAX_DIAGNOSTIC_CHARS
             ):
-                terminal = (
-                    "output_too_large" if side_effect_free() else "side_effect_detected"
-                )
+                manifest = sandbox_manifest(tool_boundary_violations)
+                terminal = safety_violation(manifest) or "output_too_large"
                 self.last_metadata = {
                     **metadata,
+                    **execution_evidence,
+                    "sandbox_manifest": manifest,
                     "terminal_state": terminal,
                     "exit_code": completed.returncode,
                 }
@@ -402,14 +648,15 @@ class _SubscriptionBackend:
                 )
             if completed.returncode != 0:
                 kind = _classify_failure(completed.stderr, completed.stdout)
+                manifest = sandbox_manifest(tool_boundary_violations)
+                kind = safety_violation(manifest) or kind
                 self.last_metadata = {
                     **metadata,
+                    **execution_evidence,
+                    "sandbox_manifest": manifest,
                     "terminal_state": kind,
                     "exit_code": completed.returncode,
                 }
-                if not side_effect_free():
-                    kind = "side_effect_detected"
-                    self.last_metadata["terminal_state"] = kind
                 raise SubscriptionBackendError(
                     kind,
                     f"{self.backend_id} exited with code {completed.returncode}",
@@ -420,37 +667,49 @@ class _SubscriptionBackend:
                 final_text, parsed_metadata = self._parse(
                     completed.stdout,
                     requested_model=config.model,
+                    sandbox_root=cwd,
                 )
             except SubscriptionBackendError as exc:
                 exc.metadata.update(metadata)
+                exc.metadata.update(execution_evidence)
                 exc.metadata["exit_code"] = completed.returncode
+                manifest = sandbox_manifest(tool_boundary_violations)
+                exc.metadata["sandbox_manifest"] = manifest
                 self.last_metadata = dict(exc.metadata)
-                if not side_effect_free():
-                    self.last_metadata["terminal_state"] = "side_effect_detected"
+                terminal = safety_violation(manifest)
+                if terminal is not None:
+                    self.last_metadata["terminal_state"] = terminal
                     raise SubscriptionBackendError(
-                        "side_effect_detected",
-                        f"{self.backend_id} modified protected state while parsing output",
+                        terminal,
+                        f"{self.backend_id} violated sandbox safety while parsing output",
                         metadata=self.last_metadata,
                     ) from exc
                 raise
-            if not side_effect_free():
+            manifest = sandbox_manifest(tool_boundary_violations)
+            terminal = safety_violation(manifest)
+            if terminal is not None:
                 self.last_metadata = {
                     **metadata,
+                    **execution_evidence,
+                    **parsed_metadata,
                     "exit_code": completed.returncode,
-                    "terminal_state": "side_effect_detected",
+                    "sandbox_manifest": manifest,
+                    "terminal_state": terminal,
                 }
                 raise SubscriptionBackendError(
-                    "side_effect_detected",
-                    f"{self.backend_id} modified protected state",
+                    terminal,
+                    f"{self.backend_id} violated sandbox safety",
                     raw_output=f"{completed.stdout}\n{completed.stderr}",
                     metadata=self.last_metadata,
                 )
             self.last_metadata = {
                 **metadata,
+                **execution_evidence,
                 **parsed_metadata,
                 "exit_code": completed.returncode,
                 "output_type": request.output_type,
                 "error_classification": None,
+                "sandbox_manifest": manifest,
                 "side_effect_free": True,
                 "process_tree_cleaned": True,
                 "terminal_state": "completed",
@@ -463,6 +722,26 @@ class _SubscriptionBackend:
 class CodexSubscriptionBackend(_SubscriptionBackend):
     backend_id = "codex-subscription"
     executable = "codex"
+
+    def _execution_evidence(
+        self,
+        stdout: str,
+        *,
+        sandbox_root: Path,
+    ) -> dict[str, Any]:
+        events: list[dict[str, Any]] = []
+        for line in stdout.splitlines():
+            try:
+                value = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(value, dict):
+                events.append(value)
+        return _codex_tool_evidence(
+            events,
+            sandbox_root=sandbox_root,
+            protected_root=self.protected_root,
+        )
 
     def _inspect(self, model: str, reasoning_effort: str, cwd: Path) -> dict[str, Any]:
         version = self._probe(("--version",), cwd=cwd).stdout.strip()
@@ -528,7 +807,16 @@ class CodexSubscriptionBackend(_SubscriptionBackend):
             "cli_version": version,
             "authentication_type": "chatgpt",
             "model": model,
+            "requested_model": model,
+            "requested_model_catalog_status": "VALIDATED",
+            "actual_model": None,
+            "actual_model_status": "NOT_REPORTED_BY_CLIENT",
+            "model_identity_source": "REQUESTED_MODEL_AND_OFFICIAL_CATALOG_ONLY",
+            "requested_reasoning_effort": reasoning_effort,
+            "effective_reasoning_effort": reasoning_effort,
             "supported_reasoning_efforts": sorted(efforts),
+            "tool_execution_policy": CODEX_TOOL_EXECUTION_POLICY,
+            "sandbox_profile": dict(CODEX_SANDBOX_PROFILE),
         }
 
     def _arguments(
@@ -550,11 +838,17 @@ class CodexSubscriptionBackend(_SubscriptionBackend):
             "--ignore-rules",
             "--skip-git-repo-check",
             "--sandbox",
-            "read-only",
+            "workspace-write",
             "--model",
             model,
             "-c",
             f'model_reasoning_effort="{reasoning_effort}"',
+            "-c",
+            "sandbox_workspace_write.network_access=false",
+            "-c",
+            "sandbox_workspace_write.exclude_tmpdir_env_var=true",
+            "-c",
+            "sandbox_workspace_write.exclude_slash_tmp=true",
             "-C",
             str(cwd),
             "-",
@@ -565,6 +859,7 @@ class CodexSubscriptionBackend(_SubscriptionBackend):
         stdout: str,
         *,
         requested_model: str,
+        sandbox_root: Path,
     ) -> tuple[str, dict[str, Any]]:
         events: list[dict[str, Any]] = []
         for line in stdout.splitlines():
@@ -613,11 +908,17 @@ class CodexSubscriptionBackend(_SubscriptionBackend):
             )
             for event in events
         )
+        del sandbox_root
         return final_messages[0], {
-            "actual_model": requested_model,
-            "model_identity_source": "explicit_official_catalog_no_fallback",
+            "requested_model": requested_model,
+            "requested_model_catalog_status": "VALIDATED",
+            "actual_model": None,
+            "actual_model_status": "NOT_REPORTED_BY_CLIENT",
+            "model_identity_source": "REQUESTED_MODEL_AND_OFFICIAL_CATALOG_ONLY",
             "final_result_event": "turn.completed",
             "nonfatal_event_count": nonfatal,
+            "tool_execution_policy": CODEX_TOOL_EXECUTION_POLICY,
+            "sandbox_profile": dict(CODEX_SANDBOX_PROFILE),
         }
 
 
@@ -684,7 +985,16 @@ class ClaudeSubscriptionBackend(_SubscriptionBackend):
             "cli_version": version,
             "authentication_type": authentication_type,
             "model": model,
+            "requested_model": model,
+            "requested_model_catalog_status": "NOT_AVAILABLE_FROM_CLIENT",
+            "actual_model": None,
+            "actual_model_status": "NOT_REPORTED_BY_READINESS_PROBE",
+            "model_identity_source": "REQUESTED_MODEL_SYNTAX_ONLY",
+            "requested_reasoning_effort": reasoning_effort,
+            "effective_reasoning_effort": reasoning_effort,
             "supported_reasoning_efforts": ["low", "medium", "high", "xhigh", "max"],
+            "tool_execution_policy": CLAUDE_TOOL_EXECUTION_POLICY,
+            "sandbox_profile": dict(CLAUDE_SANDBOX_PROFILE),
         }
 
     def _arguments(
@@ -725,7 +1035,9 @@ class ClaudeSubscriptionBackend(_SubscriptionBackend):
         stdout: str,
         *,
         requested_model: str,
+        sandbox_root: Path,
     ) -> tuple[str, dict[str, Any]]:
+        del sandbox_root
         try:
             value = json.loads(stdout)
         except json.JSONDecodeError as exc:
@@ -761,11 +1073,57 @@ class ClaudeSubscriptionBackend(_SubscriptionBackend):
                 raw_output=stdout,
             )
         return result, {
+            "requested_model": requested_model,
+            "requested_model_catalog_status": "NOT_AVAILABLE_FROM_CLIENT",
             "actual_model": requested_model,
-            "model_identity_source": "result.modelUsage",
+            "actual_model_status": "REPORTED_BY_CLIENT",
+            "model_identity_source": "CLIENT_RESULT_MODEL_USAGE",
             "final_result_event": "result:success:completed",
             "nonfatal_event_count": 0,
+            "tool_event_counts": {},
+            "tool_events": [],
+            "tool_execution_policy": CLAUDE_TOOL_EXECUTION_POLICY,
+            "sandbox_profile": dict(CLAUDE_SANDBOX_PROFILE),
         }
+
+
+def build_subscription_identity_summary(
+    backend: _SubscriptionBackend,
+    configurations: Mapping[str, ApiConfig],
+) -> dict[str, Any]:
+    requests: dict[str, dict[str, Any]] = {}
+    common: dict[str, Any] | None = None
+    common_fields = (
+        "backend_id",
+        "cli_version",
+        "authentication_type",
+        "tool_execution_policy",
+        "sandbox_profile",
+    )
+    request_fields = (
+        "requested_model",
+        "requested_model_catalog_status",
+        "actual_model",
+        "actual_model_status",
+        "model_identity_source",
+        "requested_reasoning_effort",
+        "effective_reasoning_effort",
+    )
+    for role, config in configurations.items():
+        report = backend.inspect(
+            model=config.model,
+            reasoning_effort=str(config.reasoning_effort or ""),
+        )
+        candidate_common = {field: report[field] for field in common_fields}
+        if common is None:
+            common = candidate_common
+        elif common != candidate_common:
+            raise SubscriptionBackendError(
+                "backend_identity_inconsistent",
+                "Subscription backend readiness identity changed across workflow roles",
+            )
+        requests[role] = {field: report[field] for field in request_fields}
+    return {**dict(common or {}), "requests": requests}
 
 
 def inspect_subscription_backend(

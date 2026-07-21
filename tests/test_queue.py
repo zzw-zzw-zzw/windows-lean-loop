@@ -112,6 +112,26 @@ class QueueStoreTests(unittest.TestCase):
             def fake_workflow(**kwargs):
                 captured["backend"] = kwargs["agent_backend_id"]
                 captured["model"] = kwargs["plan_config"].model
+                kwargs["backend_identity_callback"]({
+                    "backend_id": "codex-subscription",
+                    "cli_version": "codex-cli 0.144.4",
+                    "authentication_type": "chatgpt",
+                    "tool_execution_policy": "TOOL_ENABLED_AGENT_SANDBOX",
+                    "sandbox_profile": {"filesystem": "workspace-write"},
+                    "requests": {
+                        "plan": {
+                            "requested_model": "gpt-5.6-sol",
+                            "requested_model_catalog_status": "VALIDATED",
+                            "actual_model": None,
+                            "actual_model_status": "NOT_REPORTED_BY_CLIENT",
+                            "model_identity_source": (
+                                "REQUESTED_MODEL_AND_OFFICIAL_CATALOG_ONLY"
+                            ),
+                            "requested_reasoning_effort": "low",
+                            "effective_reasoning_effort": "low",
+                        }
+                    },
+                })
                 kwargs["workflow_created_callback"]("20260714T000000000000Z")
                 kwargs["phase_callback"]("proving", 1)
                 kwargs["phase_callback"]("lean_checking", 1)
@@ -131,6 +151,9 @@ class QueueStoreTests(unittest.TestCase):
                 "backend": "codex-subscription",
                 "model": "gpt-5.6-sol",
             })
+            saved = store.get_task(task["id"])["settings"]["backend_identity"]
+            self.assertEqual(saved["cli_version"], "codex-cli 0.144.4")
+            self.assertIsNone(saved["requests"]["plan"]["actual_model"])
 
     def test_persists_tasks_and_claims_dependencies_in_order(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

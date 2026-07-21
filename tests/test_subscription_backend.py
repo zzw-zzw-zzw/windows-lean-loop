@@ -123,6 +123,20 @@ if mode == "nonzero":
     print("unexpected client failure", file=sys.stderr)
     raise SystemExit(9)
 
+if mode == "tool-events-nonzero" and provider == "codex":
+    print(json.dumps({
+        "type": "item.completed",
+        "item": {
+            "id": "command",
+            "type": "command_execution",
+            "command": "echo failed",
+            "status": "failed",
+            "exit_code": 9,
+        },
+    }))
+    print("tool execution failed", file=sys.stderr)
+    raise SystemExit(9)
+
 if mode == "malformed":
     print("not-json")
     raise SystemExit(0)
@@ -157,6 +171,8 @@ if os.environ.get("FAKE_OUTPUT_TYPE") == "lean_file":
     result = "import Mathlib\n\nexample : True := by\n  trivial\n"
 if os.environ.get("FAKE_MUTATE_PATH"):
     pathlib.Path(os.environ["FAKE_MUTATE_PATH"]).write_text("modified", encoding="utf-8")
+if mode == "tool-events":
+    pathlib.Path("artifact.txt").write_text("sandbox-only", encoding="utf-8")
 
 if provider == "codex":
     if mode == "nonfatal-event":
@@ -164,6 +180,55 @@ if provider == "codex":
         print(json.dumps({
             "type": "item.completed",
             "item": {"id": "e", "type": "error", "message": "transport fallback"},
+        }))
+    if mode == "tool-events":
+        print(json.dumps({
+            "type": "item.completed",
+            "item": {
+                "id": "command",
+                "type": "command_execution",
+                "command": "echo sandbox-only > artifact.txt",
+                "status": "completed",
+                "exit_code": 0,
+            },
+        }))
+        print(json.dumps({
+            "type": "item.completed",
+            "item": {
+                "id": "mcp",
+                "type": "mcp_tool_call",
+                "server": "fixture",
+                "tool": "lookup",
+                "status": "completed",
+            },
+        }))
+        print(json.dumps({
+            "type": "item.completed",
+            "item": {
+                "id": "web",
+                "type": "web_search",
+                "query": "Lean documentation",
+                "status": "completed",
+            },
+        }))
+        print(json.dumps({
+            "type": "item.completed",
+            "item": {
+                "id": "file",
+                "type": "file_change",
+                "changes": [{"path": "artifact.txt", "kind": "add"}],
+                "status": "completed",
+            },
+        }))
+    if mode == "sandbox-boundary":
+        print(json.dumps({
+            "type": "item.completed",
+            "item": {
+                "id": "file",
+                "type": "file_change",
+                "changes": [{"path": "../outside.txt", "kind": "add"}],
+                "status": "completed",
+            },
         }))
     print(json.dumps({"type": "thread.started", "thread_id": "thread"}))
     print(json.dumps({
@@ -232,10 +297,107 @@ class SubscriptionBackendTests(unittest.TestCase):
             self.assertEqual(output["project_environment_present"], False)
             self.assertEqual(output["external_overrides_present"], False)
             self.assertIn("--ephemeral", output["argv"])
-            self.assertIn("read-only", output["argv"])
-            self.assertEqual(backend.last_metadata["actual_model"], "gpt-test-pinned")
+            self.assertIn("workspace-write", output["argv"])
+            self.assertIn(
+                "sandbox_workspace_write.network_access=false", output["argv"]
+            )
+            self.assertIn(
+                "sandbox_workspace_write.exclude_tmpdir_env_var=true", output["argv"]
+            )
+            self.assertIn(
+                "sandbox_workspace_write.exclude_slash_tmp=true", output["argv"]
+            )
+            self.assertEqual(backend.last_metadata["requested_model"], "gpt-test-pinned")
+            self.assertEqual(
+                backend.last_metadata["requested_model_catalog_status"], "VALIDATED"
+            )
+            self.assertIsNone(backend.last_metadata["actual_model"])
+            self.assertEqual(
+                backend.last_metadata["actual_model_status"],
+                "NOT_REPORTED_BY_CLIENT",
+            )
+            self.assertEqual(
+                backend.last_metadata["model_identity_source"],
+                "REQUESTED_MODEL_AND_OFFICIAL_CATALOG_ONLY",
+            )
             self.assertEqual(backend.last_metadata["authentication_type"], "chatgpt")
             self.assertEqual(backend.last_metadata["nonfatal_event_count"], 2)
+            self.assertEqual(
+                backend.last_metadata["tool_execution_policy"],
+                "TOOL_ENABLED_AGENT_SANDBOX",
+            )
+
+    def test_codex_archives_tool_events_and_allows_sandbox_internal_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            backend = self._backend("codex", root)
+            backend.base_environment["FAKE_MODE"] = "tool-events"
+
+            output = backend.invoke(
+                _request(), _config("gpt-test-pinned"), root / "ignored"
+            )
+
+            self.assertEqual(output["api_keys_present"], False)
+            self.assertEqual(
+                backend.last_metadata["tool_event_counts"],
+                {
+                    "command_execution": 1,
+                    "file_change": 1,
+                    "mcp_tool_call": 1,
+                    "web_search": 1,
+                },
+            )
+            self.assertEqual(len(backend.last_metadata["tool_events"]), 4)
+            command = next(
+                event
+                for event in backend.last_metadata["tool_events"]
+                if event["event_type"] == "command_execution"
+            )
+            self.assertEqual(command["command_summary"], "echo sandbox-only > artifact.txt")
+            manifest = backend.last_metadata["sandbox_manifest"]
+            self.assertEqual(manifest["network_policy"], "disabled")
+            self.assertEqual(manifest["protected_state_unchanged"], True)
+            self.assertEqual(
+                manifest["file_changes"],
+                [{
+                    "change": "created",
+                    "path": "artifact.txt",
+                    "sha256": "e4a050cf6646accf34674fd578f0919574845a633d4477b9757aded17608adf5",
+                    "size_bytes": 12,
+                }],
+            )
+
+    def test_codex_rejects_tool_event_that_escapes_sandbox_root(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            backend = self._backend("codex", root)
+            backend.base_environment["FAKE_MODE"] = "sandbox-boundary"
+
+            with self.assertRaises(SubscriptionBackendError) as raised:
+                backend.invoke(_request(), _config("gpt-test-pinned"), root / "ignored")
+
+            self.assertEqual(raised.exception.kind, "sandbox_boundary_violation")
+            self.assertEqual(
+                backend.last_metadata["terminal_state"], "sandbox_boundary_violation"
+            )
+
+    def test_codex_archives_tool_events_when_client_exits_nonzero(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            backend = self._backend("codex", root)
+            backend.base_environment["FAKE_MODE"] = "tool-events-nonzero"
+
+            with self.assertRaises(SubscriptionBackendError) as raised:
+                backend.invoke(_request(), _config("gpt-test-pinned"), root / "ignored")
+
+            self.assertEqual(raised.exception.kind, "nonzero_exit")
+            self.assertEqual(
+                backend.last_metadata["tool_event_counts"], {"command_execution": 1}
+            )
+            self.assertEqual(
+                backend.last_metadata["tool_events"][0]["status"], "failed"
+            )
+            self.assertEqual(backend.last_metadata["exit_code"], 9)
 
     def test_claude_reports_actual_model_and_disables_tools(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
