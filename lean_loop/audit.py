@@ -10,6 +10,10 @@ _DECLARATION_RE = re.compile(
     r"(?P<kind>theorem|lemma|def|abbrev|axiom|constant|opaque)\s+"
     r"(?P<name>[A-Za-z_][A-Za-z0-9_'.]*)"
 )
+_STRUCTURE_RE = re.compile(
+    r"(?m)^[ \t]*(?P<command>namespace|section|end)\b"
+    r"(?:[ \t]+(?P<name>[A-Za-z_][A-Za-z0-9_'.]*))?"
+)
 _FORBIDDEN_PROOF_RE = re.compile(r"\b(sorryAx|sorry|admit)\b")
 
 
@@ -76,9 +80,41 @@ def _normalize(value: str) -> str:
     return " ".join(value.split())
 
 
+def _qualified_names(masked: str, matches: list[re.Match[str]]) -> list[str]:
+    structures = list(_STRUCTURE_RE.finditer(masked))
+    structure_index = 0
+    scopes: list[tuple[str, str | None]] = []
+    names: list[str] = []
+    for declaration in matches:
+        while (
+            structure_index < len(structures)
+            and structures[structure_index].start() < declaration.start()
+        ):
+            structure = structures[structure_index]
+            command = structure.group("command")
+            if command in {"namespace", "section"}:
+                scopes.append((command, structure.group("name")))
+            elif scopes:
+                scopes.pop()
+            structure_index += 1
+
+        name = declaration.group("name")
+        if name.startswith("_root_."):
+            names.append(name.removeprefix("_root_."))
+            continue
+        namespaces = [
+            scope_name
+            for scope_kind, scope_name in scopes
+            if scope_kind == "namespace" and scope_name
+        ]
+        names.append(".".join([*namespaces, name]))
+    return names
+
+
 def declarations(source: str) -> list[Declaration]:
     masked = _mask_comments_and_strings(source)
     matches = list(_DECLARATION_RE.finditer(masked))
+    qualified_names = _qualified_names(masked, matches)
     rows: list[Declaration] = []
     for position, match in enumerate(matches):
         start = match.start()
@@ -88,12 +124,25 @@ def declarations(source: str) -> list[Declaration]:
         rows.append(
             Declaration(
                 kind=match.group("kind"),
-                name=match.group("name"),
+                name=qualified_names[position],
                 signature=_normalize(source[start:signature_end]),
                 block=source[start:end].strip(),
             )
         )
     return rows
+
+
+def _find_declaration(rows: list[Declaration], name: str) -> Declaration | None:
+    if "." in name:
+        matches = [row for row in rows if row.name == name]
+    else:
+        matches = [row for row in rows if row.name.rsplit(".", 1)[-1] == name]
+    return matches[0] if len(matches) == 1 else None
+
+
+def _find_exact_declaration(rows: list[Declaration], name: str) -> Declaration | None:
+    matches = [row for row in rows if row.name == name]
+    return matches[0] if len(matches) == 1 else None
 
 
 def audit_source(
@@ -108,23 +157,21 @@ def audit_source(
 ) -> dict[str, Any]:
     baseline_rows = declarations(baseline)
     candidate_rows = declarations(candidate)
-    baseline_by_name = {row.name: row for row in baseline_rows}
-    candidate_by_name = {row.name: row for row in candidate_rows}
     violations: list[str] = []
 
     if protect_existing_statements:
         for row in baseline_rows:
             if row.kind not in {"theorem", "lemma"}:
                 continue
-            current = candidate_by_name.get(row.name)
+            current = _find_exact_declaration(candidate_rows, row.name)
             if current is None:
                 violations.append(f"Protected declaration was removed: {row.name}")
             elif current.kind != row.kind or current.signature != row.signature:
                 violations.append(f"Protected declaration statement changed: {row.name}")
 
     for name in protected_declarations or []:
-        original = baseline_by_name.get(name)
-        current = candidate_by_name.get(name)
+        original = _find_declaration(baseline_rows, name)
+        current = _find_declaration(candidate_rows, name)
         if original is None:
             violations.append(f"Explicitly protected declaration not found in baseline: {name}")
         elif current is None or current.block != original.block:
@@ -138,7 +185,7 @@ def audit_source(
         else:
             required = required_rows[0]
             required_name = required.name
-            current = candidate_by_name.get(required.name)
+            current = _find_declaration(candidate_rows, required.name)
             if current is None:
                 violations.append(f"Formal goal declaration is missing: {required.name}")
             elif current.kind != required.kind or current.signature != required.signature:
@@ -146,7 +193,7 @@ def audit_source(
 
     required_names = list(dict.fromkeys(required_declaration_names or []))
     for name in required_names:
-        if name not in candidate_by_name:
+        if _find_declaration(candidate_rows, name) is None:
             violations.append(f"Required Plan declaration is missing: {name}")
 
     baseline_unsafe = {

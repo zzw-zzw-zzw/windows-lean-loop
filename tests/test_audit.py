@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-from lean_loop.audit import audit_source
+from lean_loop.audit import audit_source, declarations
 
 
 class SourceAuditTests(unittest.TestCase):
@@ -61,6 +61,102 @@ class SourceAuditTests(unittest.TestCase):
         self.assertFalse(missing["ok"])
         self.assertIn("Required Plan declaration is missing: helper", missing["violations"])
         self.assertTrue(accepted["ok"])
+
+    def test_declarations_qualify_single_and_nested_namespaces(self) -> None:
+        source = (
+            "namespace Outer\n"
+            "theorem first : True := by trivial\n"
+            "namespace Inner\n"
+            "lemma second : True := by trivial\n"
+            "end Inner\n"
+            "end Outer\n"
+        )
+        self.assertEqual(
+            [row.name for row in declarations(source)],
+            ["Outer.first", "Outer.Inner.second"],
+        )
+
+    def test_namespace_scan_ignores_comments_and_strings(self) -> None:
+        source = (
+            "-- namespace LineComment\n"
+            "/- namespace BlockComment\n"
+            "end BlockComment -/\n"
+            'def message : String := "namespace StringValue\\nend StringValue"\n'
+            "namespace Real\n"
+            "theorem goal : True := by trivial\n"
+            "end Real\n"
+        )
+        self.assertEqual(
+            [row.name for row in declarations(source)],
+            ["message", "Real.goal"],
+        )
+
+    def test_qualified_required_name_rejects_wrong_namespace(self) -> None:
+        accepted = audit_source(
+            "-- empty\n",
+            "namespace Expected\ntheorem goal : True := by trivial\nend Expected\n",
+            required_declaration_names=["Expected.goal"],
+        )
+        rejected = audit_source(
+            "-- empty\n",
+            "namespace Other\ntheorem goal : True := by trivial\nend Other\n",
+            required_declaration_names=["Expected.goal"],
+        )
+        self.assertTrue(accepted["ok"])
+        self.assertFalse(rejected["ok"])
+        self.assertIn(
+            "Required Plan declaration is missing: Expected.goal",
+            rejected["violations"],
+        )
+
+    def test_unqualified_required_name_requires_unique_local_name(self) -> None:
+        duplicated_local_name = (
+            "namespace One\nlemma helper : True := by trivial\nend One\n"
+            "namespace Two\nlemma helper : True := by trivial\nend Two\n"
+        )
+        unique = audit_source(
+            "-- empty\n",
+            "namespace Only\nlemma helper : True := by trivial\nend Only\n",
+            required_declaration_names=["helper"],
+        )
+        ambiguous = audit_source(
+            "-- empty\n",
+            duplicated_local_name,
+            required_declaration_names=["helper"],
+        )
+        qualified = audit_source(
+            "-- empty\n",
+            duplicated_local_name,
+            required_declaration_names=["Two.helper"],
+        )
+        root = audit_source(
+            "-- empty\n",
+            "lemma helper : True := by trivial\n",
+            required_declaration_names=["helper"],
+        )
+        self.assertTrue(unique["ok"])
+        self.assertFalse(ambiguous["ok"])
+        self.assertTrue(qualified["ok"])
+        self.assertTrue(root["ok"])
+
+    def test_issue_5_namespace_qualified_required_declaration(self) -> None:
+        required = ["Stage0Calibration.mathd_algebra_109"]
+        accepted = audit_source(
+            "-- empty\n",
+            "namespace Stage0Calibration\n"
+            "theorem mathd_algebra_109 : True := by trivial\n"
+            "end Stage0Calibration\n",
+            required_declaration_names=required,
+        )
+        wrong_namespace = audit_source(
+            "-- empty\n",
+            "namespace Decoy\n"
+            "theorem mathd_algebra_109 : True := by trivial\n"
+            "end Decoy\n",
+            required_declaration_names=required,
+        )
+        self.assertTrue(accepted["ok"])
+        self.assertFalse(wrong_namespace["ok"])
 
 
 if __name__ == "__main__":
