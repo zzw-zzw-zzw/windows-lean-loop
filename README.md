@@ -55,6 +55,7 @@ D:\my_math_project      Lean/Mathlib 项目
 ## 安装
 
 需要 Windows 10/11、Python 3.11 或更高版本、Elan/Lean 4，以及一个可以由 Lake 编译的 Lean/Mathlib 项目。
+使用 `auto`、`proof-first` 或 `broad` 前，目标项目必须能直接编译 `import Mathlib`；下游 Mathlib 项目推荐先在项目根目录运行官方 `lake exe cache get` 获取预编译缓存。
 
 ```powershell
 git clone https://github.com/zzw-zzw-zzw/windows-lean-loop.git D:\lean_agent_cli
