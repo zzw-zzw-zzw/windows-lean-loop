@@ -180,12 +180,7 @@ def _checkpoint_state(
     original_source: str,
     fallback_check: LeanCheck,
 ) -> tuple[str, LeanCheck, str, str | None]:
-    for step in reversed(list(manifest.get("steps") or [])):
-        if not isinstance(step, dict):
-            continue
-        checkpoint_value = step.get("checkpoint")
-        if step.get("status") != "succeeded" or not checkpoint_value:
-            continue
+    def load_checkpoint(checkpoint_value: Any) -> tuple[str, LeanCheck, str, str]:
         checkpoint = Path(str(checkpoint_value))
         source_path = checkpoint / "source.lean"
         check_path = checkpoint / "check.json"
@@ -198,6 +193,17 @@ def _checkpoint_state(
         if source_sha != metadata.get("candidate_sha256"):
             raise ValueError(f"Resume checkpoint hash mismatch: {checkpoint}")
         return source, _check_from_json(read_json(check_path)), source_sha, str(checkpoint)
+
+    for step in reversed(list(manifest.get("steps") or [])):
+        if not isinstance(step, dict):
+            continue
+        checkpoint_value = step.get("checkpoint")
+        if step.get("status") != "succeeded" or not checkpoint_value:
+            continue
+        return load_checkpoint(checkpoint_value)
+    restored_checkpoint = manifest.get("restored_to_checkpoint")
+    if restored_checkpoint:
+        return load_checkpoint(restored_checkpoint)
     return original_source, fallback_check, sha256_text(original_source), None
 
 

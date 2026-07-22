@@ -1890,6 +1890,30 @@ class StructuredWorkflowTests(unittest.TestCase):
                 curl_executable="curl.exe",
                 reasoning_effort="low",
             )
+            with patch(
+                "lean_loop.workflow._persist_step_checkpoint",
+                side_effect=OSError("simulated replacement checkpoint crash"),
+            ):
+                with self.assertRaisesRegex(
+                    OSError, "simulated replacement checkpoint crash"
+                ):
+                    run_structured_workflow(
+                        project=project,
+                        target=target,
+                        task="prove across plans",
+                        plan_config=changed,
+                        prove_config=changed,
+                        review_config=changed,
+                        max_attempts=2,
+                        max_attempts_per_step=1,
+                        lean_timeout_seconds=10,
+                        lake_executable="lake",
+                        resume_run_id=first.run_id,
+                        json_model_call=json_model,
+                        file_model_call=file_model,
+                        lean_checker=checker,
+                    )
+
             resumed = run_structured_workflow(
                 project=project,
                 target=target,
@@ -1908,6 +1932,7 @@ class StructuredWorkflowTests(unittest.TestCase):
             )
 
             self.assertTrue(resumed.ok)
+            self.assertEqual(prover_calls, 2)
             checkpoint_names = sorted(
                 path.name
                 for path in (resumed.state_dir / "checkpoints").iterdir()
@@ -1915,7 +1940,7 @@ class StructuredWorkflowTests(unittest.TestCase):
             )
             self.assertEqual(len(checkpoint_names), 2)
             self.assertTrue(checkpoint_names[0].startswith("g000-s001-step-1-a001"))
-            self.assertTrue(checkpoint_names[1].startswith("g001-s001-step-1-a002"))
+            self.assertTrue(checkpoint_names[1].startswith("g002-s001-step-1-a002"))
 
     def test_resume_recovers_accepted_attempt_after_checkpoint_crash(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
