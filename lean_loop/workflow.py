@@ -180,12 +180,7 @@ def _checkpoint_state(
     original_source: str,
     fallback_check: LeanCheck,
 ) -> tuple[str, LeanCheck, str, str | None]:
-    for step in reversed(list(manifest.get("steps") or [])):
-        if not isinstance(step, dict):
-            continue
-        checkpoint_value = step.get("checkpoint")
-        if step.get("status") != "succeeded" or not checkpoint_value:
-            continue
+    def load_checkpoint(checkpoint_value: Any) -> tuple[str, LeanCheck, str, str]:
         checkpoint = Path(str(checkpoint_value))
         source_path = checkpoint / "source.lean"
         check_path = checkpoint / "check.json"
@@ -198,7 +193,105 @@ def _checkpoint_state(
         if source_sha != metadata.get("candidate_sha256"):
             raise ValueError(f"Resume checkpoint hash mismatch: {checkpoint}")
         return source, _check_from_json(read_json(check_path)), source_sha, str(checkpoint)
+
+    for step in reversed(list(manifest.get("steps") or [])):
+        if not isinstance(step, dict):
+            continue
+        checkpoint_value = step.get("checkpoint")
+        if step.get("status") != "succeeded" or not checkpoint_value:
+            continue
+        return load_checkpoint(checkpoint_value)
+    restored_checkpoint = manifest.get("restored_to_checkpoint")
+    if restored_checkpoint:
+        return load_checkpoint(restored_checkpoint)
     return original_source, fallback_check, sha256_text(original_source), None
+
+
+def _archived_candidate_source(
+    store: WorkflowStore,
+    attempt_rows: list[dict[str, Any]],
+    attempt: int,
+) -> tuple[str, str]:
+    row = next(
+        (
+            candidate_row
+            for candidate_row in attempt_rows
+            if int(candidate_row.get("attempt") or 0) == attempt
+        ),
+        None,
+    )
+    if row is None:
+        raise ValueError(f"Resume attempt is missing from the workflow manifest: {attempt}")
+    candidate_path = store.paths.attempt_dir(attempt) / "candidate.lean"
+    if not candidate_path.is_file():
+        raise ValueError(f"Resume candidate is missing: {candidate_path}")
+    source = candidate_path.read_text(encoding="utf-8")
+    source_sha = sha256_text(source)
+    expected_sha = str(row.get("candidate_sha256") or "")
+    if not expected_sha or source_sha != expected_sha:
+        raise ValueError(f"Resume candidate hash mismatch: {candidate_path}")
+    return source, source_sha
+
+
+def _accepted_attempt_row(
+    attempt_rows: list[dict[str, Any]],
+    step_attempts: list[int],
+) -> dict[str, Any] | None:
+    if not step_attempts:
+        return None
+    latest = int(step_attempts[-1])
+    row = next(
+        (
+            candidate_row
+            for candidate_row in reversed(attempt_rows)
+            if int(candidate_row.get("attempt") or 0) == latest
+        ),
+        None,
+    )
+    if not isinstance(row, dict):
+        return None
+    if not bool(row.get("check_ok")) or row.get("review_verdict") != "accept":
+        return None
+    return row
+
+
+def _persist_step_checkpoint(
+    *,
+    store: WorkflowStore,
+    step_index: int,
+    active_step: dict[str, Any],
+    attempt: int,
+    candidate: str,
+    candidate_sha: str,
+    check: LeanCheck,
+    review: dict[str, Any],
+    retrieval: dict[str, Any],
+) -> Path:
+    generation = int(store.read().get("resume_count") or 0)
+    checkpoint_dir = store.paths.checkpoint_dir(
+        step_index,
+        str(active_step["id"]),
+        attempt=attempt,
+        generation=generation,
+    )
+    checkpoint_dir.mkdir(parents=True, exist_ok=False)
+    atomic_write_text(checkpoint_dir / "source.lean", candidate)
+    atomic_write_json(checkpoint_dir / "check.json", _check_to_json(check))
+    atomic_write_json(checkpoint_dir / "review.json", review)
+    atomic_write_json(checkpoint_dir / "retrieval.json", retrieval)
+    atomic_write_json(
+        checkpoint_dir / "checkpoint.json",
+        {
+            "generation": generation,
+            "step_index": step_index,
+            "step_id": active_step["id"],
+            "goal": active_step["goal"],
+            "success_criteria": active_step["success_criteria"],
+            "attempt": attempt,
+            "candidate_sha256": candidate_sha,
+        },
+    )
+    return checkpoint_dir
 
 
 def _latest_attempt_check(store: WorkflowStore, attempts: list[dict[str, Any]]) -> LeanCheck | None:
@@ -1052,8 +1145,6 @@ def run_structured_workflow(
             step_row = step_rows[step_index - 1]
             if step_row.get("status") == "succeeded":
                 continue
-            if attempt >= max_attempts:
-                break
             step_row["status"] = "running"
             store.update(
                 phase="prove",
@@ -1102,10 +1193,125 @@ def run_structured_workflow(
                     for name in completed_or_active.get("required_declarations", [])
                 )
             )
+            working_source = target.read_text(encoding="utf-8")
+            working_base_attempt: int | None = None
+            archived_base_attempt: int | None = None
+            if prior_attempts:
+                archived_base_attempt = int(prior_attempts[-1])
+            if archived_base_attempt is not None:
+                working_source, working_source_sha = _archived_candidate_source(
+                    store, attempt_rows, archived_base_attempt
+                )
+                working_base_attempt = archived_base_attempt
+                store.event(
+                    "working_candidate_restored",
+                    step_index=step_index,
+                    step_id=active_step["id"],
+                    attempt=archived_base_attempt,
+                    candidate_sha256=working_source_sha,
+                )
+
+            accepted_row = _accepted_attempt_row(attempt_rows, prior_attempts)
+            if accepted_row is not None:
+                accepted_attempt = int(accepted_row["attempt"])
+                recovered_candidate, recovered_sha = _archived_candidate_source(
+                    store, attempt_rows, accepted_attempt
+                )
+                recovered_review_path = store.paths.reviews / f"{accepted_attempt:03d}.json"
+                recovered_retrieval_path = (
+                    store.paths.attempt_dir(accepted_attempt) / "retrieval.json"
+                )
+                recovered_review = read_json(recovered_review_path)
+                recovered_retrieval = read_json(recovered_retrieval_path)
+                recovered_audit = audit_source(
+                    original_source,
+                    recovered_candidate,
+                    protect_existing_statements=protect_existing_statements,
+                    protected_declarations=protected_declarations,
+                    required_declaration=step_required_declaration,
+                    required_declaration_names=step_required_names,
+                )
+                recovered_import_validation = validate_mathlib_imports(
+                    project, recovered_candidate
+                )
+                recovered_check: LeanCheck | None = None
+                if recovered_audit["ok"] and recovered_import_validation["ok"]:
+                    rollback_source = target.read_text(encoding="utf-8")
+                    atomic_write_text(target, recovered_candidate)
+                    transaction_touched = True
+                    try:
+                        with timings.measure("accepted_attempt_recovery", accepted_attempt):
+                            recovered_check = lean_checker(
+                                project,
+                                target,
+                                lean_timeout_seconds,
+                                lake_executable,
+                            )
+                    finally:
+                        atomic_write_text(target, rollback_source)
+                if recovered_check is not None and recovered_check.ok:
+                    checkpoint_dir = _persist_step_checkpoint(
+                        store=store,
+                        step_index=step_index,
+                        active_step=active_step,
+                        attempt=accepted_attempt,
+                        candidate=recovered_candidate,
+                        candidate_sha=recovered_sha,
+                        check=recovered_check,
+                        review=recovered_review,
+                        retrieval=recovered_retrieval,
+                    )
+                    atomic_write_text(target, recovered_candidate)
+                    target_changed = True
+                    step_row["status"] = "succeeded"
+                    step_row["checkpoint"] = str(checkpoint_dir)
+                    step_row["budget_exhausted"] = None
+                    safe_source = recovered_candidate
+                    safe_check = recovered_check
+                    safe_sha = recovered_sha
+                    safe_checkpoint = str(checkpoint_dir)
+                    store.update(
+                        steps=step_rows,
+                        current_sha256=recovered_sha,
+                        final_review=recovered_review,
+                    )
+                    store.event(
+                        "accepted_attempt_recovered",
+                        step_index=step_index,
+                        step_id=active_step["id"],
+                        attempt=accepted_attempt,
+                        checkpoint=str(checkpoint_dir),
+                    )
+                    store.event(
+                        "plan_step_succeeded",
+                        step_index=step_index,
+                        step_id=active_step["id"],
+                        attempt=accepted_attempt,
+                        checkpoint=str(checkpoint_dir),
+                        recovered=True,
+                    )
+                    continue
+                recovery_failure = (
+                    recovered_check.output
+                    if recovered_check is not None
+                    else "Source audit or import validation failed."
+                )
+                if recovered_check is not None:
+                    last_check = recovered_check
+                store.event(
+                    "accepted_attempt_recovery_failed",
+                    step_index=step_index,
+                    step_id=active_step["id"],
+                    attempt=accepted_attempt,
+                    source_audit_ok=recovered_audit["ok"],
+                    import_validation_ok=recovered_import_validation["ok"],
+                    diagnostics=recovery_failure,
+                )
 
             while attempt < max_attempts and step_attempt < max_attempts_per_step:
                 candidate_attempt = attempt + 1
                 candidate_step_attempt = step_attempt + 1
+                candidate_base_attempt = working_base_attempt
                 store.event(
                     "phase_started",
                     phase="prove",
@@ -1127,7 +1333,7 @@ def run_structured_workflow(
                 for term in last_review.get("search_terms", []):
                     if term not in requested_terms:
                         requested_terms.append(term)
-                for term in source_search_terms(target.read_text(encoding="utf-8"), task):
+                for term in source_search_terms(working_source, task):
                     if term not in requested_terms:
                         requested_terms.append(term)
                 with timings.measure("attempt_retrieval", candidate_attempt):
@@ -1138,7 +1344,6 @@ def run_structured_workflow(
                         process_control=process_control,
                     )
 
-                current_source = target.read_text(encoding="utf-8")
                 completed_steps = [
                     {"id": row["id"], "goal": row["goal"], "checkpoint": row["checkpoint"]}
                     for row in step_rows
@@ -1152,7 +1357,7 @@ def run_structured_workflow(
                 prover_prompt = build_user_prompt(
                     relative_file=relative.as_posix(),
                     task=task,
-                    source=current_source,
+                    source=working_source,
                     diagnostics=last_check.output,
                     attempt=candidate_attempt,
                     plan=json.dumps(plan, ensure_ascii=False, indent=2),
@@ -1181,6 +1386,7 @@ def run_structured_workflow(
                             context={
                                 "step_index": step_index,
                                 "step_attempt": candidate_step_attempt,
+                                "base_attempt": candidate_base_attempt,
                                 "target_file": relative.as_posix(),
                             },
                         )
@@ -1293,6 +1499,7 @@ def run_structured_workflow(
                 if phase_callback is not None:
                     phase_callback("lean_checking", attempt)
                 candidate_import_validation = validate_mathlib_imports(project, candidate)
+                rollback_source = target.read_text(encoding="utf-8")
                 if prover_error is not None:
                     last_check = LeanCheck(
                         False,
@@ -1323,7 +1530,7 @@ def run_structured_workflow(
                                 project, target, lean_timeout_seconds, lake_executable
                             )
                     finally:
-                        atomic_write_text(target, current_source)
+                        atomic_write_text(target, rollback_source)
 
                 if (
                     last_check.ok
@@ -1354,7 +1561,7 @@ def run_structured_workflow(
                                         project, target, lean_timeout_seconds, lake_executable
                                     )
                             finally:
-                                atomic_write_text(target, current_source)
+                                atomic_write_text(target, rollback_source)
                             precise_metadata["probe_ok"] = precise_check.ok
                             precise_metadata["probe_returncode"] = precise_check.returncode
                             precise_metadata["diagnostics"] = precise_check.output
@@ -1450,6 +1657,7 @@ def run_structured_workflow(
                 atomic_write_json(review_path, last_review)
                 attempt_row = {
                     "attempt": attempt,
+                    "base_attempt": candidate_base_attempt,
                     "step_index": step_index,
                     "step_id": active_step["id"],
                     "step_attempt": step_attempt,
@@ -1483,27 +1691,19 @@ def run_structured_workflow(
                 )
 
                 if last_check.ok and last_review["verdict"] == "accept":
+                    checkpoint_dir = _persist_step_checkpoint(
+                        store=store,
+                        step_index=step_index,
+                        active_step=active_step,
+                        attempt=attempt,
+                        candidate=candidate,
+                        candidate_sha=candidate_sha,
+                        check=last_check,
+                        review=last_review,
+                        retrieval=retrieval,
+                    )
                     atomic_write_text(target, candidate)
                     target_changed = True
-                    checkpoint_dir = store.paths.checkpoint_dir(
-                        step_index, active_step["id"]
-                    )
-                    checkpoint_dir.mkdir(parents=True, exist_ok=False)
-                    atomic_write_text(checkpoint_dir / "source.lean", candidate)
-                    atomic_write_json(
-                        checkpoint_dir / "check.json", _check_to_json(last_check)
-                    )
-                    atomic_write_json(checkpoint_dir / "review.json", last_review)
-                    atomic_write_json(checkpoint_dir / "retrieval.json", retrieval)
-                    checkpoint_meta = {
-                        "step_index": step_index,
-                        "step_id": active_step["id"],
-                        "goal": active_step["goal"],
-                        "success_criteria": active_step["success_criteria"],
-                        "attempt": attempt,
-                        "candidate_sha256": candidate_sha,
-                    }
-                    atomic_write_json(checkpoint_dir / "checkpoint.json", checkpoint_meta)
                     step_row["status"] = "succeeded"
                     step_row["checkpoint"] = str(checkpoint_dir)
                     safe_source = candidate
@@ -1520,6 +1720,17 @@ def run_structured_workflow(
                         checkpoint=str(checkpoint_dir),
                     )
                     break
+                working_source = candidate
+                working_base_attempt = attempt
+                store.event(
+                    "failed_candidate_kept_as_working_source",
+                    step_index=step_index,
+                    step_id=active_step["id"],
+                    attempt=attempt,
+                    candidate_sha256=candidate_sha,
+                    check_ok=last_check.ok,
+                    review_verdict=last_review["verdict"],
+                )
                 if last_review["verdict"] == "stop":
                     step_row["status"] = "stopped"
                     workflow_stopped = True

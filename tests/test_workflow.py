@@ -2,6 +2,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from lean_loop.api import ApiError, MalformedModelOutputError
 from lean_loop.config import ApiConfig
@@ -431,6 +432,151 @@ class StructuredWorkflowTests(unittest.TestCase):
                 [step["status"] for step in manifest["steps"]],
                 ["succeeded", "succeeded"],
             )
+
+    def test_failed_candidate_is_next_attempt_working_source(self) -> None:
+        original = "example : True := by exact original_missing\n"
+        with tempfile.TemporaryDirectory() as directory:
+            project, target = self._project(Path(directory), original)
+            prover_prompts: list[str] = []
+
+            def checker(project: Path, target: Path, timeout: int, lake: str) -> LeanCheck:
+                source = target.read_text(encoding="utf-8")
+                ok = "by trivial" in source
+                return LeanCheck(ok, 0 if ok else 1, "" if ok else "missing", ())
+
+            def json_model(config, system, user, temp):
+                if "Planner" in system:
+                    return {
+                        "summary": "repair incrementally",
+                        "steps": [{
+                            "id": "repair",
+                            "goal": "prove True",
+                            "success_criteria": "Lean passes",
+                            "search_terms": [],
+                        }],
+                        "preserve": [],
+                        "risks": [],
+                    }
+                return {
+                    "verdict": "accept" if "Lean check success: true" in user else "retry",
+                    "summary": "review",
+                    "failure_analysis": [],
+                    "next_actions": [],
+                    "search_terms": [],
+                }
+
+            def file_model(config, prompt, temp):
+                prover_prompts.append(prompt)
+                self.assertEqual(target.read_text(encoding="utf-8"), original)
+                if len(prover_prompts) == 1:
+                    return "example : True := by exact first_candidate_marker\n"
+                self.assertIn("first_candidate_marker", prompt)
+                return "example : True := by trivial\n"
+
+            result = run_structured_workflow(
+                project=project,
+                target=target,
+                task="prove the example",
+                plan_config=_config(),
+                prove_config=_config(),
+                review_config=_config(),
+                max_attempts=2,
+                max_attempts_per_step=2,
+                lean_timeout_seconds=10,
+                lake_executable="lake",
+                json_model_call=json_model,
+                file_model_call=file_model,
+                lean_checker=checker,
+            )
+
+            self.assertTrue(result.ok)
+            self.assertEqual(len(prover_prompts), 2)
+            manifest = json.loads((result.state_dir / "run.json").read_text(encoding="utf-8"))
+            self.assertIsNone(manifest["attempts"][0]["base_attempt"])
+            self.assertEqual(manifest["attempts"][1]["base_attempt"], 1)
+            events = (result.state_dir / "events.jsonl").read_text(encoding="utf-8")
+            self.assertIn('"event": "failed_candidate_kept_as_working_source"', events)
+
+    def test_resume_uses_last_failed_candidate_without_exposing_it_on_disk(self) -> None:
+        original = "example : True := by exact original_missing\n"
+        with tempfile.TemporaryDirectory() as directory:
+            project, target = self._project(Path(directory), original)
+            prover_prompts: list[str] = []
+
+            def checker(project: Path, target: Path, timeout: int, lake: str) -> LeanCheck:
+                source = target.read_text(encoding="utf-8")
+                ok = "by trivial" in source
+                return LeanCheck(ok, 0 if ok else 1, "" if ok else "missing", ())
+
+            def json_model(config, system, user, temp):
+                if "Planner" in system:
+                    return {
+                        "summary": "repair across resume",
+                        "steps": [{
+                            "id": "repair",
+                            "goal": "prove True",
+                            "success_criteria": "Lean passes",
+                            "search_terms": [],
+                        }],
+                        "preserve": [],
+                        "risks": [],
+                    }
+                return {
+                    "verdict": "accept" if "Lean check success: true" in user else "retry",
+                    "summary": "review",
+                    "failure_analysis": [],
+                    "next_actions": [],
+                    "search_terms": [],
+                }
+
+            def file_model(config, prompt, temp):
+                prover_prompts.append(prompt)
+                self.assertEqual(target.read_text(encoding="utf-8"), original)
+                if len(prover_prompts) == 1:
+                    return "example : True := by exact resume_candidate_marker\n"
+                self.assertIn("resume_candidate_marker", prompt)
+                return "example : True := by trivial\n"
+
+            first = run_structured_workflow(
+                project=project,
+                target=target,
+                task="prove the example",
+                plan_config=_config(),
+                prove_config=_config(),
+                review_config=_config(),
+                max_attempts=1,
+                max_attempts_per_step=1,
+                lean_timeout_seconds=10,
+                lake_executable="lake",
+                json_model_call=json_model,
+                file_model_call=file_model,
+                lean_checker=checker,
+            )
+            self.assertFalse(first.ok)
+            self.assertEqual(target.read_text(encoding="utf-8"), original)
+
+            resumed = run_structured_workflow(
+                project=project,
+                target=target,
+                task="prove the example",
+                plan_config=_config(),
+                prove_config=_config(),
+                review_config=_config(),
+                max_attempts=2,
+                max_attempts_per_step=2,
+                lean_timeout_seconds=10,
+                lake_executable="lake",
+                resume_run_id=first.run_id,
+                json_model_call=json_model,
+                file_model_call=file_model,
+                lean_checker=checker,
+            )
+
+            self.assertTrue(resumed.ok)
+            manifest = json.loads((resumed.state_dir / "run.json").read_text(encoding="utf-8"))
+            self.assertEqual(manifest["attempts"][1]["base_attempt"], 1)
+            events = (resumed.state_dir / "events.jsonl").read_text(encoding="utf-8")
+            self.assertIn('"event": "working_candidate_restored"', events)
 
     def test_resume_reuses_plan_attempts_and_last_checkpoint(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1582,6 +1728,7 @@ class StructuredWorkflowTests(unittest.TestCase):
             )
             planner_calls = 0
             prover_calls = 0
+            prover_prompts: list[str] = []
 
             def checker(project: Path, target: Path, timeout: int, lake: str) -> LeanCheck:
                 ok = "by trivial" in target.read_text(encoding="utf-8")
@@ -1612,8 +1759,11 @@ class StructuredWorkflowTests(unittest.TestCase):
             def file_model(config, prompt, temp):
                 nonlocal prover_calls
                 prover_calls += 1
+                prover_prompts.append(prompt)
+                if prover_calls == 2:
+                    self.assertNotIn("old_plan_candidate_marker", prompt)
                 return (
-                    "example : True := by exact missing\n"
+                    "example : True := by exact old_plan_candidate_marker\n"
                     if prover_calls == 1
                     else "example : True := by trivial\n"
                 )
@@ -1659,8 +1809,227 @@ class StructuredWorkflowTests(unittest.TestCase):
 
             self.assertTrue(resumed.ok)
             self.assertEqual(planner_calls, 2)
+            self.assertEqual(len(prover_prompts), 2)
             events = (resumed.state_dir / "events.jsonl").read_text(encoding="utf-8")
             self.assertIn('"reason": "model_changed"', events)
+
+    def test_replanned_step_uses_a_generation_scoped_checkpoint(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            project, target = self._project(Path(directory), "-- start\n")
+            planner_calls = 0
+            prover_calls = 0
+
+            def checker(project: Path, target: Path, timeout: int, lake: str) -> LeanCheck:
+                return LeanCheck(True, 0, "", ())
+
+            def json_model(config, system, user, temp):
+                nonlocal planner_calls
+                if "Planner" in system:
+                    planner_calls += 1
+                    steps = [
+                        {
+                            "id": "step-1",
+                            "goal": "first generation",
+                            "success_criteria": "Lean passes",
+                            "search_terms": [],
+                        },
+                        {
+                            "id": "step-2",
+                            "goal": "force a resume",
+                            "success_criteria": "Lean passes",
+                            "search_terms": [],
+                        },
+                    ] if planner_calls == 1 else [{
+                        "id": "step-1",
+                        "goal": "replacement generation",
+                        "success_criteria": "Lean passes",
+                        "search_terms": [],
+                    }]
+                    return {
+                        "summary": f"plan {planner_calls}",
+                        "steps": steps,
+                        "preserve": [],
+                        "risks": [],
+                    }
+                return {
+                    "verdict": "accept",
+                    "summary": "accepted",
+                    "failure_analysis": [],
+                    "next_actions": [],
+                    "search_terms": [],
+                }
+
+            def file_model(config, prompt, temp):
+                nonlocal prover_calls
+                prover_calls += 1
+                return f"example generation{prover_calls} : True := by trivial\n"
+
+            first = run_structured_workflow(
+                project=project,
+                target=target,
+                task="prove across plans",
+                plan_config=_config(),
+                prove_config=_config(),
+                review_config=_config(),
+                max_attempts=1,
+                max_attempts_per_step=1,
+                lean_timeout_seconds=10,
+                lake_executable="lake",
+                json_model_call=json_model,
+                file_model_call=file_model,
+                lean_checker=checker,
+            )
+            self.assertFalse(first.ok)
+
+            changed = ApiConfig(
+                api_base="http://example.invalid/v1",
+                api_key="not-used",
+                model="replacement-model",
+                mode="responses",
+                timeout_seconds=10,
+                curl_executable="curl.exe",
+                reasoning_effort="low",
+            )
+            with patch(
+                "lean_loop.workflow._persist_step_checkpoint",
+                side_effect=OSError("simulated replacement checkpoint crash"),
+            ):
+                with self.assertRaisesRegex(
+                    OSError, "simulated replacement checkpoint crash"
+                ):
+                    run_structured_workflow(
+                        project=project,
+                        target=target,
+                        task="prove across plans",
+                        plan_config=changed,
+                        prove_config=changed,
+                        review_config=changed,
+                        max_attempts=2,
+                        max_attempts_per_step=1,
+                        lean_timeout_seconds=10,
+                        lake_executable="lake",
+                        resume_run_id=first.run_id,
+                        json_model_call=json_model,
+                        file_model_call=file_model,
+                        lean_checker=checker,
+                    )
+
+            resumed = run_structured_workflow(
+                project=project,
+                target=target,
+                task="prove across plans",
+                plan_config=changed,
+                prove_config=changed,
+                review_config=changed,
+                max_attempts=2,
+                max_attempts_per_step=1,
+                lean_timeout_seconds=10,
+                lake_executable="lake",
+                resume_run_id=first.run_id,
+                json_model_call=json_model,
+                file_model_call=file_model,
+                lean_checker=checker,
+            )
+
+            self.assertTrue(resumed.ok)
+            self.assertEqual(prover_calls, 2)
+            checkpoint_names = sorted(
+                path.name
+                for path in (resumed.state_dir / "checkpoints").iterdir()
+                if path.is_dir()
+            )
+            self.assertEqual(len(checkpoint_names), 2)
+            self.assertTrue(checkpoint_names[0].startswith("g000-s001-step-1-a001"))
+            self.assertTrue(checkpoint_names[1].startswith("g002-s001-step-1-a002"))
+
+    def test_resume_recovers_accepted_attempt_after_checkpoint_crash(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            project, target = self._project(Path(directory), "-- start\n")
+            prover_calls = 0
+
+            def checker(project: Path, target: Path, timeout: int, lake: str) -> LeanCheck:
+                ok = "by trivial" in target.read_text(encoding="utf-8")
+                return LeanCheck(ok, 0 if ok else 1, "" if ok else "missing proof", ())
+
+            def json_model(config, system, user, temp):
+                if "Planner" in system:
+                    return {
+                        "summary": "one step",
+                        "steps": [{
+                            "id": "step-1",
+                            "goal": "prove True",
+                            "success_criteria": "Lean passes",
+                            "search_terms": [],
+                        }],
+                        "preserve": [],
+                        "risks": [],
+                    }
+                return {
+                    "verdict": "accept",
+                    "summary": "accepted",
+                    "failure_analysis": [],
+                    "next_actions": [],
+                    "search_terms": [],
+                }
+
+            def file_model(config, prompt, temp):
+                nonlocal prover_calls
+                prover_calls += 1
+                return "example recovered : True := by trivial\n"
+
+            with patch(
+                "lean_loop.workflow._persist_step_checkpoint",
+                side_effect=OSError("simulated checkpoint crash"),
+            ):
+                with self.assertRaisesRegex(OSError, "simulated checkpoint crash"):
+                    run_structured_workflow(
+                        project=project,
+                        target=target,
+                        task="recover accepted candidate",
+                        plan_config=_config(),
+                        prove_config=_config(),
+                        review_config=_config(),
+                        max_attempts=1,
+                        max_attempts_per_step=1,
+                        lean_timeout_seconds=10,
+                        lake_executable="lake",
+                        json_model_call=json_model,
+                        file_model_call=file_model,
+                        lean_checker=checker,
+                    )
+
+            workflow_dirs = list((project / ".lean-agent" / "workflows").iterdir())
+            self.assertEqual(len(workflow_dirs), 1)
+            run_id = workflow_dirs[0].name
+            resumed = run_structured_workflow(
+                project=project,
+                target=target,
+                task="recover accepted candidate",
+                plan_config=_config(),
+                prove_config=_config(),
+                review_config=_config(),
+                max_attempts=1,
+                max_attempts_per_step=1,
+                lean_timeout_seconds=10,
+                lake_executable="lake",
+                resume_run_id=run_id,
+                json_model_call=json_model,
+                file_model_call=file_model,
+                lean_checker=checker,
+            )
+
+            self.assertTrue(resumed.ok)
+            self.assertEqual(prover_calls, 1)
+            manifest = json.loads((resumed.state_dir / "run.json").read_text(encoding="utf-8"))
+            self.assertEqual(len(manifest["attempts"]), 1)
+            events = (resumed.state_dir / "events.jsonl").read_text(encoding="utf-8")
+            self.assertIn('"event": "accepted_attempt_recovered"', events)
+            checkpoint_names = [
+                path.name
+                for path in (resumed.state_dir / "checkpoints").iterdir()
+                if path.is_dir()
+            ]
+            self.assertEqual(checkpoint_names, ["g001-s001-step-1-a001"])
 
     def test_formal_goal_qualifies_ambiguous_names(self) -> None:
         goal = validate_formal_goal(
