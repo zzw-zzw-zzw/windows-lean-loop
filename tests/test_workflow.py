@@ -8,6 +8,7 @@ from lean_loop.config import ApiConfig
 from lean_loop.lean import LeanCheck
 from lean_loop.mathlib_index import build_mathlib_index
 from lean_loop.process_control import ProcessCancelled
+from lean_loop.subscription_backend import SubscriptionBackendError
 from lean_loop.workflow import (
     _resume_replan_reason,
     run_structured_workflow,
@@ -1341,6 +1342,140 @@ class StructuredWorkflowTests(unittest.TestCase):
             manifest = json.loads((result.state_dir / "run.json").read_text(encoding="utf-8"))
             self.assertEqual(len(manifest["api_failures"]), 1)
             self.assertEqual([row["attempt"] for row in manifest["attempts"]], [1])
+
+    def test_codex_protocol_failure_consumes_candidate_attempt_and_retries(self) -> None:
+        class Backend:
+            backend_id = "codex-subscription"
+
+            def __init__(self) -> None:
+                self.prover_calls = 0
+                self.last_metadata: dict[str, object] = {
+                    "backend_id": self.backend_id
+                }
+
+            def inspect(self, *, model: str, reasoning_effort: str):
+                return {
+                    "status": "ready",
+                    "backend_id": self.backend_id,
+                    "cli_version": "codex-cli 0.144.4",
+                    "authentication_type": "chatgpt",
+                    "requested_model": model,
+                    "requested_model_catalog_status": "VALIDATED",
+                    "actual_model": None,
+                    "actual_model_status": "NOT_REPORTED_BY_CLIENT",
+                    "model_identity_source": (
+                        "REQUESTED_MODEL_AND_OFFICIAL_CATALOG_ONLY"
+                    ),
+                    "requested_reasoning_effort": reasoning_effort,
+                    "effective_reasoning_effort": reasoning_effort,
+                    "tool_execution_policy": "TOOL_ENABLED_AGENT_SANDBOX",
+                    "filesystem_read_scope": "WINDOWS_BROAD_READ",
+                    "filesystem_write_scope": (
+                        "REPO_EXTERNAL_EPHEMERAL_WORKSPACE"
+                    ),
+                    "read_isolation_status": (
+                        "NOT_ENFORCED_BY_LEGACY_WINDOWS_SANDBOX"
+                    ),
+                    "network_policy": "DISABLED",
+                    "sandbox_profile": {"network_policy": "DISABLED"},
+                }
+
+            def invoke(self, request, config, temp_dir):
+                del temp_dir
+                identity = self.inspect(
+                    model=config.model,
+                    reasoning_effort=config.reasoning_effort,
+                )
+                self.last_metadata = dict(identity)
+                if request.role == "planner":
+                    return {
+                        "summary": "repair",
+                        "steps": [{
+                            "id": "step-1",
+                            "goal": "prove True",
+                            "success_criteria": "Lean passes",
+                            "search_terms": [],
+                        }],
+                        "preserve": [],
+                        "risks": [],
+                    }
+                if request.role == "prover":
+                    self.prover_calls += 1
+                    if self.prover_calls == 1:
+                        metadata = {
+                            **identity,
+                            "exit_code": 0,
+                            "terminal_state": "output_protocol_incompatible",
+                        }
+                        self.last_metadata = metadata
+                        raise SubscriptionBackendError(
+                            "output_protocol_incompatible",
+                            "Codex did not return one completed final result",
+                            raw_output=(
+                                '{"type":"turn.completed","usage":{}}\n'
+                            ),
+                            metadata=metadata,
+                        )
+                    return "example : True := by trivial\n"
+                return {
+                    "verdict": "accept",
+                    "summary": "accepted",
+                    "failure_analysis": [],
+                    "next_actions": [],
+                    "search_terms": [],
+                }
+
+        with tempfile.TemporaryDirectory() as directory:
+            project, target = self._project(
+                Path(directory), "example : True := by exact missing\n"
+            )
+
+            def checker(project: Path, target: Path, timeout: int, lake: str) -> LeanCheck:
+                ok = "by trivial" in target.read_text(encoding="utf-8")
+                return LeanCheck(ok, 0 if ok else 1, "" if ok else "missing", ())
+
+            config = ApiConfig(
+                api_base="",
+                api_key="",
+                model="gpt-5.6-sol",
+                mode="subscription",
+                timeout_seconds=10,
+                curl_executable="",
+                reasoning_effort="high",
+            )
+            backend = Backend()
+            result = run_structured_workflow(
+                project=project,
+                target=target,
+                task="fix proof",
+                plan_config=config,
+                prove_config=config,
+                review_config=config,
+                max_attempts=2,
+                max_attempts_per_step=2,
+                lean_timeout_seconds=10,
+                lake_executable="lake",
+                lean_checker=checker,
+                agent_backend=backend,
+                agent_backend_id="codex-subscription",
+            )
+
+            self.assertTrue(result.ok)
+            self.assertEqual(backend.prover_calls, 2)
+            manifest = json.loads(
+                (result.state_dir / "run.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                [row["attempt"] for row in manifest["attempts"]], [1, 2]
+            )
+            self.assertEqual(manifest["attempts"][0]["failure_stage"], "prover_output_protocol")
+            self.assertEqual(manifest["attempts"][0]["review_verdict"], "not_run")
+            self.assertEqual(manifest.get("api_failures", []), [])
+            first_attempt = result.state_dir / "attempts" / "001"
+            self.assertTrue((first_attempt / "protocol-failure.json").is_file())
+            self.assertFalse((first_attempt / "candidate.lean").exists())
+            events = (result.state_dir / "events.jsonl").read_text(encoding="utf-8")
+            self.assertIn('"event": "prover_output_rejected"', events)
 
     def test_new_formal_goal_is_required_only_on_final_plan_step(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

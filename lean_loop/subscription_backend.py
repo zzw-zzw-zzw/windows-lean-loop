@@ -374,6 +374,19 @@ def _prompt(request: AgentRequest) -> str:
     )
 
 
+def _matches_output_contract(text: str, output_type: str) -> bool:
+    if not text.strip():
+        return False
+    try:
+        if output_type == "json":
+            extract_json_object(text)
+        else:
+            extract_file_content(text)
+    except ApiError:
+        return False
+    return True
+
+
 class _SubscriptionBackend:
     backend_id = ""
     executable = ""
@@ -395,6 +408,8 @@ class _SubscriptionBackend:
         self.process_control = process_control
         self.base_environment = _safe_environment(base_environment)
         self.last_metadata: dict[str, Any] = {"backend_id": self.backend_id}
+        self.last_stdout: str | None = None
+        self.last_stderr: str | None = None
         self._ready: dict[tuple[str, str], dict[str, Any]] = {}
 
     def _command(self, *arguments: str) -> list[str]:
@@ -474,6 +489,7 @@ class _SubscriptionBackend:
         *,
         requested_model: str,
         sandbox_root: Path,
+        output_type: str,
     ) -> tuple[str, dict[str, Any]]:
         raise NotImplementedError
 
@@ -522,6 +538,8 @@ class _SubscriptionBackend:
             "requested_model": config.model,
             "requested_reasoning_effort": reasoning,
         }
+        self.last_stdout = None
+        self.last_stderr = None
         report = self.inspect(model=config.model, reasoning_effort=reasoning)
         metadata = {
             "backend_id": self.backend_id,
@@ -645,6 +663,8 @@ class _SubscriptionBackend:
                 exc.metadata["sandbox_manifest"] = manifest
                 self.last_metadata = dict(exc.metadata)
                 raise
+            self.last_stdout = _sanitize(completed.stdout)
+            self.last_stderr = _sanitize(completed.stderr)
             execution_evidence = self._execution_evidence(
                 completed.stdout,
                 sandbox_root=cwd,
@@ -693,11 +713,13 @@ class _SubscriptionBackend:
                     completed.stdout,
                     requested_model=config.model,
                     sandbox_root=cwd,
+                    output_type=request.output_type,
                 )
             except SubscriptionBackendError as exc:
                 exc.metadata.update(metadata)
                 exc.metadata.update(execution_evidence)
                 exc.metadata["exit_code"] = completed.returncode
+                exc.metadata["terminal_state"] = exc.kind
                 manifest = sandbox_manifest(tool_boundary_violations)
                 exc.metadata["sandbox_manifest"] = manifest
                 self.last_metadata = dict(exc.metadata)
@@ -886,6 +908,7 @@ class CodexSubscriptionBackend(_SubscriptionBackend):
         *,
         requested_model: str,
         sandbox_root: Path,
+        output_type: str,
     ) -> tuple[str, dict[str, Any]]:
         events: list[dict[str, Any]] = []
         for line in stdout.splitlines():
@@ -906,32 +929,38 @@ class CodexSubscriptionBackend(_SubscriptionBackend):
                     raw_output=stdout,
                 )
             events.append(value)
-        final_messages = [
+        agent_messages = [
             str(event["item"].get("text") or "")
             for event in events
             if event.get("type") == "item.completed"
             and isinstance(event.get("item"), dict)
             and event["item"].get("type") == "agent_message"
         ]
+        final_messages = [
+            message
+            for message in agent_messages
+            if _matches_output_contract(message, output_type)
+        ]
         completed = sum(event.get("type") == "turn.completed" for event in events)
-        failed = any(event.get("type") in {"turn.failed", "thread.failed"} for event in events)
+        failed = any(
+            event.get("type") in {"error", "turn.failed", "thread.failed"}
+            for event in events
+        )
         if failed or completed != 1 or len(final_messages) != 1 or not final_messages[0].strip():
             raise SubscriptionBackendError(
                 (
                     "empty_output"
-                    if not final_messages or not any(message.strip() for message in final_messages)
+                    if not agent_messages
+                    or not any(message.strip() for message in agent_messages)
                     else "output_protocol_incompatible"
                 ),
                 "Codex did not return one completed final result",
                 raw_output=stdout,
             )
         nonfatal = sum(
-            event.get("type") == "error"
-            or (
-                event.get("type") == "item.completed"
-                and isinstance(event.get("item"), dict)
-                and event["item"].get("type") == "error"
-            )
+            event.get("type") == "item.completed"
+            and isinstance(event.get("item"), dict)
+            and event["item"].get("type") == "error"
             for event in events
         )
         del sandbox_root
@@ -942,6 +971,10 @@ class CodexSubscriptionBackend(_SubscriptionBackend):
             "actual_model_status": "NOT_REPORTED_BY_CLIENT",
             "model_identity_source": "REQUESTED_MODEL_AND_OFFICIAL_CATALOG_ONLY",
             "final_result_event": "turn.completed",
+            "final_result_selection": "UNIQUE_OUTPUT_CONTRACT_MATCH",
+            "agent_message_event_count": len(agent_messages),
+            "final_result_candidate_count": len(final_messages),
+            "intermediate_agent_message_count": len(agent_messages) - 1,
             "nonfatal_event_count": nonfatal,
             "tool_execution_policy": CODEX_TOOL_EXECUTION_POLICY,
             "sandbox_profile": dict(CODEX_SANDBOX_PROFILE),
@@ -1062,8 +1095,9 @@ class ClaudeSubscriptionBackend(_SubscriptionBackend):
         *,
         requested_model: str,
         sandbox_root: Path,
+        output_type: str,
     ) -> tuple[str, dict[str, Any]]:
-        del sandbox_root
+        del sandbox_root, output_type
         try:
             value = json.loads(stdout)
         except json.JSONDecodeError as exc:

@@ -1,0 +1,7 @@
+{"type":"thread.started","thread_id":"fixture-thread"}
+{"type":"turn.started"}
+{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"I will inspect the sandbox before returning the requested object."}}
+{"type":"item.started","item":{"id":"item_1","type":"command_execution","command":"fixture-check","status":"in_progress"}}
+{"type":"item.completed","item":{"id":"item_1","type":"command_execution","command":"fixture-check","status":"completed","exit_code":0}}
+{"type":"item.completed","item":{"id":"item_2","type":"agent_message","text":"{\"content\":\"import Mathlib\\n\\nexample : True := by\\n  trivial\\n\"}"}}
+{"type":"turn.completed","usage":{"input_tokens":1,"cached_input_tokens":0,"output_tokens":1,"reasoning_output_tokens":0}}

@@ -174,6 +174,18 @@ class AgentRuntime:
             return dict(value)
         return {"backend_id": str(getattr(self.backend, "backend_id", "unknown"))}
 
+    def _persist_backend_streams(self, call_dir: Path) -> bool:
+        stdout = getattr(self.backend, "last_stdout", None)
+        stderr = getattr(self.backend, "last_stderr", None)
+        if not isinstance(stdout, str) and not isinstance(stderr, str):
+            return False
+        stdout_text = stdout if isinstance(stdout, str) else ""
+        stderr_text = stderr if isinstance(stderr, str) else ""
+        atomic_write_text(call_dir / "stdout.txt", stdout_text)
+        atomic_write_text(call_dir / "stderr.txt", stderr_text)
+        atomic_write_text(call_dir / "raw-output.txt", stdout_text or stderr_text)
+        return True
+
     @staticmethod
     def _persist_backend_evidence(call_dir: Path, metadata: dict[str, Any]) -> None:
         tool_events = metadata.get("tool_events")
@@ -230,7 +242,8 @@ class AgentRuntime:
             error_kind = getattr(exc, "kind", None)
             backend_metadata = self._backend_metadata()
             self._persist_backend_evidence(call_dir, backend_metadata)
-            if isinstance(raw_output, str) and raw_output:
+            raw_streams_saved = self._persist_backend_streams(call_dir)
+            if not raw_streams_saved and isinstance(raw_output, str) and raw_output:
                 atomic_write_text(call_dir / "raw-output.txt", raw_output[: 1024 * 1024])
             response = AgentResponse(
                 request_id=request_id,
@@ -248,7 +261,8 @@ class AgentRuntime:
                 },
                 metadata={
                     "model": config.model,
-                    "raw_output_saved": bool(isinstance(raw_output, str) and raw_output),
+                    "raw_output_saved": raw_streams_saved
+                    or bool(isinstance(raw_output, str) and raw_output),
                     **backend_metadata,
                     **(
                         {"error_classification": error_kind}
@@ -261,6 +275,7 @@ class AgentRuntime:
             raise
         backend_metadata = self._backend_metadata()
         self._persist_backend_evidence(call_dir, backend_metadata)
+        raw_streams_saved = self._persist_backend_streams(call_dir)
         response = AgentResponse(
             request_id=request_id,
             role=role,
@@ -273,6 +288,7 @@ class AgentRuntime:
             metadata={
                 "model": config.model,
                 "reasoning_effort": config.reasoning_effort,
+                "raw_output_saved": raw_streams_saved,
                 **backend_metadata,
             },
         )
