@@ -47,6 +47,41 @@ class SourceAuditTests(unittest.TestCase):
         self.assertTrue(accepted["ok"])
         self.assertFalse(changed["ok"])
 
+    def test_required_formal_goal_normalizes_namespace_spelling(self) -> None:
+        required = "theorem Stage0Calibration.goal : True"
+        accepted = audit_source(
+            "-- empty\n",
+            "namespace Stage0Calibration\n"
+            "theorem goal : True := by trivial\n"
+            "end Stage0Calibration\n",
+            required_declaration=required,
+        )
+        wrong_namespace = audit_source(
+            "-- empty\n",
+            "namespace Other\n"
+            "theorem goal : True := by trivial\n"
+            "end Other\n",
+            required_declaration=required,
+        )
+        changed_type = audit_source(
+            "-- empty\n",
+            "namespace Stage0Calibration\n"
+            "theorem goal : False := by trivial\n"
+            "end Stage0Calibration\n",
+            required_declaration=required,
+        )
+        self.assertTrue(accepted["ok"])
+        self.assertFalse(wrong_namespace["ok"])
+        self.assertIn(
+            "Formal goal declaration is missing: Stage0Calibration.goal",
+            wrong_namespace["violations"],
+        )
+        self.assertFalse(changed_type["ok"])
+        self.assertIn(
+            "Formal goal declaration changed: Stage0Calibration.goal",
+            changed_type["violations"],
+        )
+
     def test_requires_plan_step_declarations_by_name(self) -> None:
         missing = audit_source(
             "-- empty\n",
@@ -74,6 +109,35 @@ class SourceAuditTests(unittest.TestCase):
         self.assertEqual(
             [row.name for row in declarations(source)],
             ["Outer.first", "Outer.Inner.second"],
+        )
+
+    def test_sections_pair_ends_without_qualifying_declarations(self) -> None:
+        source = (
+            "namespace A.B\n"
+            "section\n"
+            "theorem dotted : True := by trivial\n"
+            "end\n"
+            "end A.B\n"
+            "namespace A\n"
+            "section S\n"
+            "namespace Inner\n"
+            "theorem nested : True := by trivial\n"
+            "end Inner\n"
+            "theorem after_section : True := by trivial\n"
+            "end S\n"
+            "theorem D.explicit : True := by trivial\n"
+            "end A\n"
+            "theorem Root.explicit : True := by trivial\n"
+        )
+        self.assertEqual(
+            [row.name for row in declarations(source)],
+            [
+                "A.B.dotted",
+                "A.Inner.nested",
+                "A.after_section",
+                "A.D.explicit",
+                "Root.explicit",
+            ],
         )
 
     def test_namespace_scan_ignores_comments_and_strings(self) -> None:

@@ -121,11 +121,15 @@ def declarations(source: str) -> list[Declaration]:
         end = matches[position + 1].start() if position + 1 < len(matches) else len(source)
         assignment = masked.find(":=", match.end(), end)
         signature_end = assignment if assignment >= 0 else end
+        signature = source[start:signature_end]
+        name_start = match.start("name") - start
+        name_end = match.end("name") - start
+        signature = signature[:name_start] + qualified_names[position] + signature[name_end:]
         rows.append(
             Declaration(
                 kind=match.group("kind"),
                 name=qualified_names[position],
-                signature=_normalize(source[start:signature_end]),
+                signature=_normalize(signature),
                 block=source[start:end].strip(),
             )
         )
