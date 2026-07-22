@@ -140,6 +140,68 @@ class SourceAuditTests(unittest.TestCase):
             ],
         )
 
+    def test_mutual_end_does_not_close_namespace(self) -> None:
+        source = (
+            "namespace Stage0Calibration\n"
+            "section Helpers\n"
+            "mutual\n"
+            "def left : Nat → Nat := fun n => right n\n"
+            "def right : Nat → Nat := fun n => left n\n"
+            "end\n"
+            "theorem inside_section : True := by trivial\n"
+            "end Helpers\n"
+            "theorem goal : True := by trivial\n"
+            "end Stage0Calibration\n"
+        )
+        self.assertEqual(
+            [row.name for row in declarations(source)],
+            [
+                "Stage0Calibration.left",
+                "Stage0Calibration.right",
+                "Stage0Calibration.inside_section",
+                "Stage0Calibration.goal",
+            ],
+        )
+        self.assertTrue(
+            audit_source(
+                "-- empty\n",
+                source,
+                required_declaration_names=["Stage0Calibration.goal"],
+            )["ok"]
+        )
+
+    def test_dotted_named_end_closes_namespace_suffix(self) -> None:
+        source = (
+            "namespace A\n"
+            "namespace B\n"
+            "namespace C\n"
+            "theorem inside : True := by trivial\n"
+            "end B.C\n"
+            "theorem after : True := by trivial\n"
+            "end A\n"
+        )
+        self.assertEqual(
+            [row.name for row in declarations(source)],
+            ["A.B.C.inside", "A.after"],
+        )
+        self.assertTrue(
+            audit_source(
+                "-- empty\n",
+                source,
+                required_declaration_names=["A.after"],
+            )["ok"]
+        )
+
+    def test_scope_mismatch_fails_closed(self) -> None:
+        result = audit_source(
+            "-- empty\n",
+            "namespace A\nsection S\nend A\nend S\n",
+        )
+        self.assertFalse(result["ok"])
+        self.assertTrue(
+            any("scope could not be parsed" in item for item in result["violations"])
+        )
+
     def test_namespace_scan_ignores_comments_and_strings(self) -> None:
         source = (
             "-- namespace LineComment\n"

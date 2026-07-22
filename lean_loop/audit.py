@@ -11,7 +11,7 @@ _DECLARATION_RE = re.compile(
     r"(?P<name>[A-Za-z_][A-Za-z0-9_'.]*)"
 )
 _STRUCTURE_RE = re.compile(
-    r"(?m)^[ \t]*(?P<command>namespace|section|end)\b"
+    r"(?m)^[ \t]*(?P<command>namespace|section|mutual|end)\b"
     r"(?:[ \t]+(?P<name>[A-Za-z_][A-Za-z0-9_'.]*))?"
 )
 _FORBIDDEN_PROOF_RE = re.compile(r"\b(sorryAx|sorry|admit)\b")
@@ -23,6 +23,10 @@ class Declaration:
     name: str
     signature: str
     block: str
+
+
+class _ScopeParseError(ValueError):
+    pass
 
 
 def _mask_comments_and_strings(source: str) -> str:
@@ -80,6 +84,46 @@ def _normalize(value: str) -> str:
     return " ".join(value.split())
 
 
+def _apply_structure(
+    scopes: list[tuple[str, str | None]], structure: re.Match[str]
+) -> None:
+    command = structure.group("command")
+    name = structure.group("name")
+    if command == "mutual":
+        if name:
+            raise _ScopeParseError("mutual block cannot have a scope name")
+        scopes.append((command, None))
+        return
+    if command in {"namespace", "section"}:
+        if command == "namespace" and not name:
+            raise _ScopeParseError("namespace scope is missing its name")
+        if name:
+            scopes.extend((command, component) for component in name.split("."))
+        else:
+            scopes.append((command, None))
+        return
+
+    if not scopes:
+        raise _ScopeParseError("end has no open scope")
+    if not name:
+        if scopes[-1] not in {("mutual", None), ("section", None)}:
+            raise _ScopeParseError("anonymous end does not match the open scope")
+        scopes.pop()
+        return
+
+    components = name.split(".")
+    if len(components) > len(scopes):
+        raise _ScopeParseError(f"end {name} does not match the open scope")
+    closing = scopes[-len(components) :]
+    closing_kind = closing[0][0]
+    if closing_kind not in {"namespace", "section"} or any(
+        kind != closing_kind or scope_name != component
+        for (kind, scope_name), component in zip(closing, components)
+    ):
+        raise _ScopeParseError(f"end {name} does not match the open scope")
+    del scopes[-len(components) :]
+
+
 def _qualified_names(masked: str, matches: list[re.Match[str]]) -> list[str]:
     structures = list(_STRUCTURE_RE.finditer(masked))
     structure_index = 0
@@ -91,11 +135,7 @@ def _qualified_names(masked: str, matches: list[re.Match[str]]) -> list[str]:
             and structures[structure_index].start() < declaration.start()
         ):
             structure = structures[structure_index]
-            command = structure.group("command")
-            if command in {"namespace", "section"}:
-                scopes.append((command, structure.group("name")))
-            elif scopes:
-                scopes.pop()
+            _apply_structure(scopes, structure)
             structure_index += 1
 
         name = declaration.group("name")
@@ -108,6 +148,11 @@ def _qualified_names(masked: str, matches: list[re.Match[str]]) -> list[str]:
             if scope_kind == "namespace" and scope_name
         ]
         names.append(".".join([*namespaces, name]))
+    while structure_index < len(structures):
+        _apply_structure(scopes, structures[structure_index])
+        structure_index += 1
+    if any(kind == "mutual" for kind, _ in scopes):
+        raise _ScopeParseError("mutual block is missing its end")
     return names
 
 
@@ -159,9 +204,17 @@ def audit_source(
     required_declaration: str | None = None,
     required_declaration_names: list[str] | None = None,
 ) -> dict[str, Any]:
-    baseline_rows = declarations(baseline)
-    candidate_rows = declarations(candidate)
     violations: list[str] = []
+    try:
+        baseline_rows = declarations(baseline)
+    except _ScopeParseError as exc:
+        baseline_rows = []
+        violations.append(f"Baseline declaration scope could not be parsed: {exc}")
+    try:
+        candidate_rows = declarations(candidate)
+    except _ScopeParseError as exc:
+        candidate_rows = []
+        violations.append(f"Candidate declaration scope could not be parsed: {exc}")
 
     if protect_existing_statements:
         for row in baseline_rows:
@@ -183,7 +236,10 @@ def audit_source(
 
     required_name = None
     if required_declaration:
-        required_rows = declarations(required_declaration + " := by trivial\n")
+        try:
+            required_rows = declarations(required_declaration + " := by trivial\n")
+        except _ScopeParseError:
+            required_rows = []
         if len(required_rows) != 1:
             violations.append("Formal goal contract could not be parsed deterministically")
         else:
