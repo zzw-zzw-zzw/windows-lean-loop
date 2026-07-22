@@ -1093,8 +1093,18 @@ def run_structured_workflow(
             if step_row.get("rejected_checkpoint") and isinstance(prior_global_review, dict):
                 last_review = prior_global_review
             elif prior_attempts:
-                review_path = store.paths.reviews / f"{int(prior_attempts[-1]):03d}.json"
-                last_review = read_json(review_path) if review_path.is_file() else last_review
+                prior_attempt = int(prior_attempts[-1])
+                review_path = store.paths.reviews / f"{prior_attempt:03d}.json"
+                if review_path.is_file():
+                    last_review = read_json(review_path)
+                elif (
+                    attempt_rows
+                    and int(attempt_rows[-1].get("attempt") or 0) == prior_attempt
+                    and attempt_rows[-1].get("failure_stage")
+                    == "prover_output_protocol"
+                    and isinstance(previous_manifest.get("final_review"), dict)
+                ):
+                    last_review = dict(previous_manifest["final_review"])
             else:
                 last_review = {
                     "verdict": "retry",
@@ -1803,15 +1813,34 @@ def run_structured_workflow(
                         target, failed_candidate.read_text(encoding="utf-8")
                     )
             current_sha = sha256_text(target.read_text(encoding="utf-8"))
+        failed_step_indexes = {
+            int(row["index"])
+            for row in step_rows
+            if row.get("status") in {"failed", "stopped"}
+        }
+        failure_attempt_rows = [
+            row
+            for row in attempt_rows
+            if int(row.get("step_index") or 0) in failed_step_indexes
+        ]
         if all_steps_succeeded:
             failure_error = "Global final audit did not accept the complete proof."
-        elif (
-            attempt_rows
-            and attempt_rows[-1].get("failure_stage") == "prover_output_protocol"
+        elif failure_attempt_rows and all(
+            row.get("failure_stage") == "prover_output_protocol"
+            and not row.get("candidate_sha256")
+            for row in failure_attempt_rows
         ):
             failure_error = (
                 "Prover output did not produce a valid Lean candidate within the "
                 "configured candidate budgets."
+            )
+        elif any(
+            row.get("failure_stage") == "prover_output_protocol"
+            for row in failure_attempt_rows
+        ) and any(row.get("candidate_sha256") for row in failure_attempt_rows):
+            failure_error = (
+                "Candidate budgets were exhausted after both Lean candidate validation "
+                "failures and Prover output protocol failures."
             )
         else:
             failure_error = "Lean did not pass within the configured candidate budgets."

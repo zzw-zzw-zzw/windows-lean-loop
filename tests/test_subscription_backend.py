@@ -180,6 +180,7 @@ if mode == "tool-events":
     pathlib.Path("artifact.txt").write_text("sandbox-only", encoding="utf-8")
 
 if provider == "codex":
+    print(json.dumps({"type": "thread.started", "thread_id": "thread"}))
     if mode == "top-level-error":
         print(json.dumps({"type": "error", "message": "reconnecting"}))
     if mode == "nonfatal-item-error":
@@ -236,7 +237,6 @@ if provider == "codex":
                 "status": "completed",
             },
         }))
-    print(json.dumps({"type": "thread.started", "thread_id": "thread"}))
     print(json.dumps({
         "type": "item.completed",
         "item": {"id": "a", "type": "agent_message", "text": result},
@@ -433,6 +433,127 @@ class SubscriptionBackendTests(unittest.TestCase):
                         output_type="lean_file",
                     )
                 self.assertEqual(raised.exception.kind, case["expected_kind"])
+
+    def test_codex_rejects_contract_match_before_invalid_last_agent_message(self) -> None:
+        backend = CodexSubscriptionBackend(command_prefix=("unused",))
+        events = [
+            {"type": "thread.started", "thread_id": "thread"},
+            {"type": "turn.started"},
+            {
+                "type": "item.completed",
+                "item": {
+                    "id": "intermediate",
+                    "type": "agent_message",
+                    "text": "example : True := by trivial\n",
+                },
+            },
+            {
+                "type": "item.completed",
+                "item": {
+                    "id": "last",
+                    "type": "agent_message",
+                    "text": "I could not produce the requested Lean file.",
+                },
+            },
+            {"type": "turn.completed", "usage": {}},
+        ]
+
+        with self.assertRaises(SubscriptionBackendError) as raised:
+            backend._parse(
+                "\n".join(json.dumps(event) for event in events) + "\n",
+                requested_model="gpt-5.6-sol",
+                sandbox_root=Path.cwd(),
+                output_type="lean_file",
+            )
+
+        self.assertEqual(raised.exception.kind, "output_protocol_incompatible")
+
+    def test_codex_rejects_agent_message_after_completed_turn(self) -> None:
+        backend = CodexSubscriptionBackend(command_prefix=("unused",))
+        events = [
+            {"type": "thread.started", "thread_id": "thread"},
+            {"type": "turn.started"},
+            {"type": "turn.completed", "usage": {}},
+            {
+                "type": "item.completed",
+                "item": {
+                    "id": "late",
+                    "type": "agent_message",
+                    "text": "example : True := by trivial\n",
+                },
+            },
+        ]
+
+        with self.assertRaises(SubscriptionBackendError) as raised:
+            backend._parse(
+                "\n".join(json.dumps(event) for event in events) + "\n",
+                requested_model="gpt-5.6-sol",
+                sandbox_root=Path.cwd(),
+                output_type="lean_file",
+            )
+
+        self.assertEqual(raised.exception.kind, "output_protocol_incompatible")
+
+    def test_codex_rejects_incomplete_second_turn_after_completed_turn(self) -> None:
+        backend = CodexSubscriptionBackend(command_prefix=("unused",))
+        events = [
+            {"type": "thread.started", "thread_id": "thread"},
+            {"type": "turn.started"},
+            {
+                "type": "item.completed",
+                "item": {
+                    "id": "final",
+                    "type": "agent_message",
+                    "text": "example : True := by trivial\n",
+                },
+            },
+            {"type": "turn.completed", "usage": {}},
+            {"type": "turn.started"},
+        ]
+
+        with self.assertRaises(SubscriptionBackendError) as raised:
+            backend._parse(
+                "\n".join(json.dumps(event) for event in events) + "\n",
+                requested_model="gpt-5.6-sol",
+                sandbox_root=Path.cwd(),
+                output_type="lean_file",
+            )
+
+        self.assertEqual(raised.exception.kind, "output_protocol_incompatible")
+
+    def test_codex_rejects_tool_start_after_completed_turn(self) -> None:
+        backend = CodexSubscriptionBackend(command_prefix=("unused",))
+        events = [
+            {"type": "thread.started", "thread_id": "thread"},
+            {"type": "turn.started"},
+            {
+                "type": "item.completed",
+                "item": {
+                    "id": "final",
+                    "type": "agent_message",
+                    "text": "example : True := by trivial\n",
+                },
+            },
+            {"type": "turn.completed", "usage": {}},
+            {
+                "type": "item.started",
+                "item": {
+                    "id": "late-tool",
+                    "type": "command_execution",
+                    "status": "in_progress",
+                },
+            },
+        ]
+
+        with self.assertRaises(SubscriptionBackendError) as raised:
+            backend._parse(
+                "\n".join(json.dumps(event) for event in events) + "\n",
+                requested_model="gpt-5.6-sol",
+                sandbox_root=Path.cwd(),
+                output_type="lean_file",
+            )
+
+        self.assertEqual(raised.exception.kind, "output_protocol_incompatible")
 
     def test_codex_archives_current_stream_stderr_and_tool_events(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
