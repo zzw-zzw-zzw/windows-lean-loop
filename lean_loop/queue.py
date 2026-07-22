@@ -455,6 +455,8 @@ class QueueProcessController(ProcessControl):
                 f"API timeout retry {details.get('retry')}/{details.get('retries')} · "
                 f"effort {details.get('reasoning_effort') or 'default'}"
             )
+        elif event == "transport.selected":
+            text = f"API transport · {details.get('transport') or 'auto'}"
         elif event == "response.completed":
             text = f"Model response complete · {details.get('output_characters', 0)} characters"
         elif event in {"response.created", "response.in_progress"}:

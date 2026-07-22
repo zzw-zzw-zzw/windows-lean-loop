@@ -155,6 +155,7 @@
         <label class="field model-field"><span>API Base</span><input id="configApiBase" type="url" required placeholder="https://www.heilovehei.com"></label>
         <label class="field"><span>默认模型</span><input id="configModel" type="text" required placeholder="gpt-5.6-sol"></label>
         <label class="field"><span>API 模式</span><select id="configApiMode"><option value="responses">responses</option><option value="chat-completions">chat-completions</option></select></label>
+        <label class="field"><span>API 传输</span><select id="configApiTransport"><option value="auto">自动</option><option value="python">Python/OpenSSL</option><option value="curl">curl/Schannel</option></select></label>
         <label class="field"><span>默认推理强度</span><select id="configReasoning"><option>low</option><option>medium</option><option>high</option><option>xhigh</option></select></label>
         <label class="field"><span>请求超时（秒）</span><input id="configTimeout" type="number" min="1" required></label>
         <label class="field"><span>超时自动重试</span><input id="configRetries" type="number" min="0" max="5" required></label>

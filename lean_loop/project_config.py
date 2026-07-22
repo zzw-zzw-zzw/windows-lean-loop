@@ -17,6 +17,7 @@ CONFIG_KEYS = {
     "api_base",
     "model",
     "api_mode",
+    "api_transport",
     "reasoning_effort",
     "disable_response_storage",
     "lake",
@@ -147,7 +148,7 @@ def _validated_config(value: dict[str, Any]) -> dict[str, Any]:
         )
     result: dict[str, Any] = {}
     for key in (
-        "api_base", "model", "api_mode", "reasoning_effort", "lake", "provider_kind"
+        "api_base", "model", "api_mode", "api_transport", "reasoning_effort", "lake", "provider_kind"
     ):
         if key in value:
             result[key] = str(value[key]).strip()
@@ -160,6 +161,12 @@ def _validated_config(value: dict[str, Any]) -> dict[str, Any]:
         "chat-completions",
     }:
         raise ProjectConfigError("API mode must be responses or chat-completions")
+    if result.get("api_transport") and result["api_transport"] not in {
+        "auto",
+        "python",
+        "curl",
+    }:
+        raise ProjectConfigError("API transport must be auto, python, or curl")
     if result.get("reasoning_effort") and result["reasoning_effort"] not in EFFORTS:
         raise ProjectConfigError("Reasoning effort must be low, medium, high, or xhigh")
     if result.get("provider_kind") and result["provider_kind"] not in PROVIDER_KINDS:
@@ -348,6 +355,9 @@ def project_config_view(project: Path) -> dict[str, Any]:
         "api_base": os.environ.get("LEAN_AGENT_API_BASE", "").strip(),
         "model": os.environ.get("LEAN_AGENT_MODEL", "").strip(),
         "api_mode": os.environ.get("LEAN_AGENT_API_MODE", "responses").strip(),
+        "api_transport": os.environ.get(
+            "LEAN_AGENT_API_TRANSPORT", "auto"
+        ).strip().lower(),
         "reasoning_effort": os.environ.get(
             "LEAN_AGENT_REASONING_EFFORT", "medium"
         ).strip(),

@@ -24,6 +24,7 @@ class ApiConfig:
     mode: str
     timeout_seconds: int
     curl_executable: str
+    api_transport: str = "auto"
     reasoning_effort: str | None = None
     disable_response_storage: bool = True
     max_output_tokens: int = 8192
@@ -76,6 +77,10 @@ class ApiConfig:
             or os.environ.get("LEAN_AGENT_API_MODE", "responses")
         ).strip().lower()
         curl_executable = os.environ.get("LEAN_AGENT_CURL", "curl.exe").strip()
+        api_transport = str(
+            project_values.get("api_transport")
+            or os.environ.get("LEAN_AGENT_API_TRANSPORT", "auto")
+        ).strip().lower()
         reasoning_effort = str(
             project_values.get("reasoning_effort")
             or os.environ.get("LEAN_AGENT_REASONING_EFFORT", "")
@@ -101,6 +106,10 @@ class ApiConfig:
         if mode not in {"responses", "chat-completions"}:
             raise ConfigError(
                 "LEAN_AGENT_API_MODE must be 'responses' or 'chat-completions'"
+            )
+        if api_transport not in {"auto", "python", "curl"}:
+            raise ConfigError(
+                "LEAN_AGENT_API_TRANSPORT must be 'auto', 'python', or 'curl'"
             )
         try:
             timeout_seconds = int(
@@ -165,6 +174,7 @@ class ApiConfig:
             mode=mode,
             timeout_seconds=timeout_seconds,
             curl_executable=curl_executable,
+            api_transport=api_transport,
             reasoning_effort=reasoning_effort or None,
             disable_response_storage=disable_response_storage,
             max_output_tokens=max_output_tokens,
