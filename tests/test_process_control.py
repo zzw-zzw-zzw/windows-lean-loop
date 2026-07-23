@@ -312,6 +312,42 @@ class ControlledProcessTests(unittest.TestCase):
         self.assertLess(time.monotonic() - started, 5)
         self.assert_control_cleaned(control)
 
+    def test_cancel_preserves_chunks_already_captured_by_reader_threads(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            ready = Path(directory) / "ready"
+
+            class QueuePressureControl(_Control):
+                def cancel_requested(self) -> bool:
+                    deadline = time.monotonic() + 3
+                    while time.monotonic() < deadline and not ready.is_file():
+                        time.sleep(0.01)
+                    if ready.is_file():
+                        time.sleep(0.2)
+                        return True
+                    return False
+
+            control = QueuePressureControl()
+            script = (
+                "import pathlib, sys, time\n"
+                "sys.stdout.write(('q' * 70000) + 'CAPTURED_TAIL')\n"
+                "sys.stdout.flush()\n"
+                f"pathlib.Path({str(ready)!r}).write_text('ready')\n"
+                "time.sleep(30)\n"
+            )
+            with self.assertRaises(ProcessCancelled) as raised:
+                run_controlled_process(
+                    [sys.executable, "-c", script],
+                    timeout_seconds=10,
+                    kind="bounded-queued-cancel-test",
+                    max_output_bytes=256 * 1024,
+                    control=control,
+                )
+            self.assertTrue(raised.exception.stdout.endswith("CAPTURED_TAIL"))
+            self.assertTrue(
+                raised.exception.complete_captured_prefix_saved
+            )
+            self.assert_control_cleaned(control)
+
     def test_bounded_collection_enforces_combined_stdout_stderr_limit(
         self,
     ) -> None:

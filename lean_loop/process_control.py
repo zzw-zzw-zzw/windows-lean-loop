@@ -121,10 +121,18 @@ if os.name == "nt":
 
 
 class ProcessCancelled(RuntimeError):
-    def __init__(self, message: str, *, stdout: str = "", stderr: str = "") -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        stdout: str = "",
+        stderr: str = "",
+        complete_captured_prefix_saved: bool = True,
+    ) -> None:
         super().__init__(message)
         self.stdout = stdout
         self.stderr = stderr
+        self.complete_captured_prefix_saved = complete_captured_prefix_saved
 
 
 class ProcessOutputLimitExceeded(RuntimeError):
@@ -442,20 +450,28 @@ def _collect_bounded_process(
         if process.stdin is None:
             raise RuntimeError("Bounded process requires an stdin pipe")
 
-    chunks: queue.Queue[tuple[str, str | None]] = queue.Queue(maxsize=16)
+    chunks: queue.Queue[tuple[str, int | None]] = queue.Queue(maxsize=16)
     stop_readers = threading.Event()
     feeder_errors: list[BaseException] = []
+    pending_chunks: dict[int, tuple[str, str]] = {}
+    pending_lock = threading.Lock()
+    next_chunk_sequence = 0
 
     def drain(name: str, pipe: object) -> None:
+        nonlocal next_chunk_sequence
         reader = getattr(pipe, "read")
         try:
             while not stop_readers.is_set():
                 chunk = reader(8192)
                 if chunk == "":
                     break
+                with pending_lock:
+                    sequence = next_chunk_sequence
+                    next_chunk_sequence += 1
+                    pending_chunks[sequence] = (name, chunk)
                 while not stop_readers.is_set():
                     try:
-                        chunks.put((name, chunk), timeout=0.1)
+                        chunks.put((name, sequence), timeout=0.1)
                         break
                     except queue.Full:
                         continue
@@ -520,6 +536,37 @@ def _collect_bounded_process(
     def captured_streams() -> tuple[str, str]:
         return "".join(stdout_parts), "".join(stderr_parts)
 
+    def save_chunk(name: str, chunk: str) -> bool:
+        nonlocal captured_bytes
+        chunk_bytes = len(chunk.encode("utf-8"))
+        remaining = max_output_bytes - captured_bytes
+        saved_chunk = (
+            chunk if chunk_bytes <= remaining else _utf8_prefix(chunk, remaining)
+        )
+        if saved_chunk:
+            if name == "stdout":
+                stdout_parts.append(saved_chunk)
+            else:
+                stderr_parts.append(saved_chunk)
+            captured_bytes += len(saved_chunk.encode("utf-8"))
+        return chunk_bytes > remaining
+
+    def finalize_captured_prefix() -> tuple[bool, bool]:
+        stop_readers.set()
+        deadline = time.monotonic() + 2
+        for thread in reader_threads:
+            thread.join(timeout=max(0, deadline - time.monotonic()))
+        complete = not any(thread.is_alive() for thread in reader_threads)
+        with pending_lock:
+            remaining_chunks = sorted(pending_chunks.items())
+            pending_chunks.clear()
+        limit_exceeded = False
+        for _, (name, chunk) in remaining_chunks:
+            if save_chunk(name, chunk):
+                limit_exceeded = True
+                break
+        return limit_exceeded, complete
+
     try:
         while process.poll() is None or len(completed_streams) < 2:
             if feeder_errors:
@@ -527,40 +574,47 @@ def _collect_bounded_process(
                 raise RuntimeError("Failed to stream process stdin") from feeder_errors[0]
             if control is not None and control.cancel_requested():
                 terminate_process_tree(process)
+                limit_exceeded, complete_prefix = finalize_captured_prefix()
                 stdout, stderr = captured_streams()
+                if limit_exceeded:
+                    raise ProcessOutputLimitExceeded(
+                        command, max_output_bytes, stdout, stderr
+                    )
                 raise ProcessCancelled(
                     f"Cancelled while running {kind} (PID {process.pid})",
                     stdout=stdout,
                     stderr=stderr,
+                    complete_captured_prefix_saved=complete_prefix,
                 )
             elapsed = time.monotonic() - process_started_at
             if elapsed >= timeout_seconds:
                 terminate_process_tree(process)
+                limit_exceeded, complete_prefix = finalize_captured_prefix()
                 stdout, stderr = captured_streams()
-                raise subprocess.TimeoutExpired(
+                if limit_exceeded:
+                    raise ProcessOutputLimitExceeded(
+                        command, max_output_bytes, stdout, stderr
+                    )
+                timeout = subprocess.TimeoutExpired(
                     command, timeout_seconds, stdout, stderr
                 )
+                timeout.complete_captured_prefix_saved = complete_prefix
+                raise timeout
             try:
-                name, chunk = chunks.get(
+                name, sequence = chunks.get(
                     timeout=min(0.2, max(0.001, timeout_seconds - elapsed))
                 )
             except queue.Empty:
                 continue
-            if chunk is None:
+            if sequence is None:
                 completed_streams.add(name)
                 continue
-            chunk_bytes = len(chunk.encode("utf-8"))
-            remaining = max_output_bytes - captured_bytes
-            saved_chunk = (
-                chunk if chunk_bytes <= remaining else _utf8_prefix(chunk, remaining)
-            )
-            if saved_chunk:
-                if name == "stdout":
-                    stdout_parts.append(saved_chunk)
-                else:
-                    stderr_parts.append(saved_chunk)
-                captured_bytes += len(saved_chunk.encode("utf-8"))
-            if chunk_bytes > remaining:
+            with pending_lock:
+                pending = pending_chunks.pop(sequence, None)
+            if pending is None:
+                continue
+            _, chunk = pending
+            if save_chunk(name, chunk):
                 terminate_process_tree(process)
                 stdout, stderr = captured_streams()
                 raise ProcessOutputLimitExceeded(

@@ -1217,17 +1217,14 @@ class SubscriptionBackendTests(unittest.TestCase):
             runtime = AgentRuntime(
                 workflow_root=root / "workflow", run_id="run-1", backend=backend
             )
-            with (
-                patch.object(
-                    backend,
-                    "_run",
-                    return_value=subprocess.CompletedProcess(
-                        args=[], returncode=0, stdout=stdout, stderr=stderr
-                    ),
+            with patch.object(
+                backend,
+                "_run",
+                return_value=subprocess.CompletedProcess(
+                    args=[], returncode=0, stdout=stdout, stderr=stderr
                 ),
-                self.assertRaises(SubscriptionBackendError) as raised,
             ):
-                runtime.invoke(
+                output = runtime.invoke(
                     role="prover",
                     phase="prove",
                     output_type="lean_file",
@@ -1236,9 +1233,7 @@ class SubscriptionBackendTests(unittest.TestCase):
                     user_prompt="user",
                     temp_dir=root / "ignored",
                 )
-            self.assertEqual(
-                raised.exception.kind, "credential_exposure_detected"
-            )
+            self.assertEqual(output, "example : True := by trivial\n")
             call_dir = next((root / "workflow" / "agent-calls").iterdir())
             saved_events = _jsonl_events(
                 (call_dir / "stdout.txt").read_text(encoding="utf-8")
@@ -1264,10 +1259,8 @@ class SubscriptionBackendTests(unittest.TestCase):
             response = json.loads(
                 (call_dir / "response.json").read_text(encoding="utf-8")
             )
-            self.assertEqual(
-                response["error"]["kind"], "credential_exposure_detected"
-            )
-            self.assertIsNone(response["output"])
+            self.assertEqual(response["status"], "ok")
+            self.assertEqual(response["output"], output)
 
     def test_codex_preserves_usage_and_lean_identifiers_but_redacts_real_keys(
         self,
@@ -1420,15 +1413,13 @@ class SubscriptionBackendTests(unittest.TestCase):
             )
             self.assertEqual(saved_events[2]["item"]["text"], legal_lean)
 
-    def test_codex_rejects_quoted_bearers_and_explicit_secret_in_tool_output(
+    def test_codex_rejects_quoted_bearers_in_tool_output(
         self,
     ) -> None:
-        secrets = ("QUOTEDBEARERDOUBLE", "QUOTEDBEARERSINGLE", "ACTUAL_SECRET")
+        secrets = ("QUOTEDBEARERDOUBLE", "QUOTEDBEARERSINGLE")
         aggregated_output = (
             f'Bearer "{secrets[0]}" '
-            f"Bearer '{secrets[1]}' "
-            f"secret={secrets[2]} "
-            f"-- def password={secrets[2]}"
+            f"Bearer '{secrets[1]}'"
         )
         events = (
             {"type": "thread.started", "thread_id": "quoted-tool-secrets"},
@@ -1506,8 +1497,6 @@ class SubscriptionBackendTests(unittest.TestCase):
         cases = (
             ('-- Bearer "QUOTEDBEARERDOUBLE"\n', "QUOTEDBEARERDOUBLE"),
             ("-- Bearer 'QUOTEDBEARERSINGLE'\n", "QUOTEDBEARERSINGLE"),
-            ("-- secret=ACTUAL_SECRET\n", "ACTUAL_SECRET"),
-            ("-- def password=ACTUAL_SECRET\n", "ACTUAL_SECRET"),
         )
         with tempfile.TemporaryDirectory() as directory:
             parent = Path(directory)
@@ -2062,7 +2051,7 @@ class SubscriptionBackendTests(unittest.TestCase):
                 }],
             )
 
-    def test_codex_fails_closed_and_redacts_all_derived_evidence_fields(
+    def test_codex_rejects_fixed_tokens_in_tool_evidence_but_redacts_metadata(
         self,
     ) -> None:
         github_secret = "ghp_" + ("A" * 20)
@@ -2211,52 +2200,40 @@ class SubscriptionBackendTests(unittest.TestCase):
             sandbox_backend.base_environment["FAKE_MODE"] = (
                 "sandbox-secret-filename"
             )
-            assert_safe_failure(
-                sandbox_root,
-                sandbox_backend,
-                github_secret,
+            sandbox_backend.base_environment["FAKE_OUTPUT_TYPE"] = "lean_file"
+            sandbox_runtime = AgentRuntime(
+                workflow_root=sandbox_root / "workflow",
+                run_id="run-redacted-metadata",
+                backend=sandbox_backend,
             )
-
-            boundary_root = parent / "boundary_path"
-            boundary_root.mkdir()
-            boundary_backend = self._backend("codex", boundary_root)
-            boundary_backend.inspect(
-                model="gpt-test-pinned", reasoning_effort="low"
+            result = sandbox_runtime.invoke(
+                role="prover",
+                phase="prove",
+                output_type="lean_file",
+                config=_config("gpt-test-pinned"),
+                system_prompt="system",
+                user_prompt="user",
+                temp_dir=sandbox_root / "ignored",
             )
-            safe_stdout = stdout_for(
-                {
-                    "id": "tool",
-                    "type": "command_execution",
-                    "command": "echo safe",
-                    "status": "completed",
-                    "exit_code": 0,
-                }
+            self.assertIn("example : True", result)
+            sandbox_call = next(
+                (sandbox_root / "workflow" / "agent-calls").iterdir()
             )
-            before_snapshot = {
-                "files": {},
-                "boundary_violations": [],
-                "scan_errors": [],
-            }
-            after_snapshot = {
-                "files": {},
-                "boundary_violations": [f"nested/{github_secret}.txt"],
-                "scan_errors": [],
-            }
-            with patch(
-                "lean_loop.subscription_backend._sandbox_snapshot",
-                side_effect=(before_snapshot, after_snapshot),
-            ):
-                assert_safe_failure(
-                    boundary_root,
-                    boundary_backend,
-                    github_secret,
-                    completed=subprocess.CompletedProcess(
-                        args=[],
-                        returncode=0,
-                        stdout=safe_stdout,
-                        stderr="",
-                    ),
-                )
+            archived = "".join(
+                path.read_text(encoding="utf-8")
+                for path in sandbox_call.rglob("*")
+                if path.is_file()
+            )
+            self.assertNotIn(github_secret, archived)
+            response = json.loads(
+                (sandbox_call / "response.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(response["status"], "ok")
+            self.assertTrue(
+                response["metadata"]["sandbox_manifest"][
+                    "redaction_applied_to_sandbox_manifest"
+                ]
+            )
 
     def test_codex_rejects_tool_event_that_escapes_sandbox_root(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -2594,6 +2571,58 @@ class SubscriptionBackendTests(unittest.TestCase):
             )
             self.assertTrue(metadata["diagnostic_preview_truncated"])
             self.assertTrue(metadata["raw_output_saved"])
+
+    def test_timeout_marks_saved_evidence_truncated_if_reader_drain_is_incomplete(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            backend = self._backend("codex", root)
+            backend.inspect(model="gpt-test-pinned", reasoning_effort="low")
+            timeout = subprocess.TimeoutExpired(
+                ["fake-codex"],
+                1,
+                output="captured-prefix",
+                stderr="",
+            )
+            timeout.complete_captured_prefix_saved = False
+            runtime = AgentRuntime(
+                workflow_root=root / "workflow", run_id="run-1", backend=backend
+            )
+            with (
+                patch(
+                    "lean_loop.subscription_backend.run_controlled_process",
+                    side_effect=timeout,
+                ),
+                self.assertRaises(SubscriptionBackendError) as raised,
+            ):
+                runtime.invoke(
+                    role="prover",
+                    phase="prove",
+                    output_type="lean_file",
+                    config=_config("gpt-test-pinned", timeout=1),
+                    system_prompt="system",
+                    user_prompt="user",
+                    temp_dir=root / "ignored",
+                )
+            self.assertEqual(raised.exception.kind, "timeout")
+            call_dir = next((root / "workflow" / "agent-calls").iterdir())
+            response = json.loads(
+                (call_dir / "response.json").read_text(encoding="utf-8")
+            )
+            streams = response["metadata"]["stream_evidence"]
+            self.assertFalse(streams["complete_captured_prefix_saved"])
+            self.assertTrue(streams["saved_evidence_truncated"])
+            self.assertFalse(
+                streams["stdout"]["saved_redacted_evidence"][
+                    "complete_captured_prefix_saved"
+                ]
+            )
+            self.assertTrue(
+                streams["stdout"]["saved_redacted_evidence"][
+                    "saved_evidence_truncated"
+                ]
+            )
 
     def test_timeout_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

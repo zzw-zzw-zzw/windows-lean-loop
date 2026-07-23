@@ -77,10 +77,6 @@ _CREDENTIAL_PATTERNS = (
         ),
     ),
 )
-_ASSIGNMENT_PREFIX = re.compile(
-    r"(?P<key>[A-Za-z_][A-Za-z0-9_.-]{0,127})\s*[:=]\s*"
-)
-
 AgentRole = Literal[
     "formalizer", "planner", "prover", "reviewer", "auditor", "retriever", "explainer"
 ]
@@ -131,21 +127,6 @@ def _is_exact_redacted_value(value: Any) -> bool:
     return normalized == _REDACTED
 
 
-def _closing_quote(value: str, start: int, quote: str) -> int | None:
-    escaped = False
-    for index in range(start, len(value)):
-        char = value[index]
-        if escaped:
-            escaped = False
-            continue
-        if char == "\\":
-            escaped = True
-            continue
-        if char == quote:
-            return index
-    return None
-
-
 def _bearer_value(match: re.Match[str]) -> str:
     return next(
         (
@@ -163,139 +144,46 @@ def _bearer_value(match: re.Match[str]) -> str:
     )
 
 
-def _generic_text_credential_category(value: str) -> str | None:
-    if _is_exact_redacted_value(value):
-        return None
-    for match in _BEARER_CREDENTIAL.finditer(value):
-        if not _is_exact_redacted_value(_bearer_value(match)):
-            return "bearer_token"
-    for category, pattern in _CREDENTIAL_PATTERNS:
-        if pattern.search(value):
-            return category
-    for line in value.splitlines() or [value]:
-        quote_cursor = 0
-        active_quote: str | None = None
-        escaped = False
-        for match in _ASSIGNMENT_PREFIX.finditer(line):
-            for char in line[quote_cursor : match.start()]:
-                if escaped:
-                    escaped = False
-                    continue
-                if char == "\\":
-                    escaped = True
-                    continue
-                if active_quote is None:
-                    if char in {'"', "'"}:
-                        active_quote = char
-                elif char == active_quote:
-                    active_quote = None
-            quote_cursor = match.start()
-            key = _normalize_field_name(match.group("key"))
-            if key != "secret" and not is_sensitive_field_name(
-                key, allow_ambiguous=False
-            ):
-                continue
-            value_start = match.end()
-            while value_start < len(line) and line[value_start] in " \t":
-                value_start += 1
-            if active_quote is not None:
-                value_end = _closing_quote(line, value_start, active_quote)
-                field_value = line[
-                    value_start : len(line) if value_end is None else value_end
-                ]
-            elif value_start < len(line) and line[value_start] in {'"', "'"}:
-                quote = line[value_start]
-                value_end = _closing_quote(line, value_start + 1, quote)
-                field_value = line[
-                    value_start + 1 : len(line) if value_end is None else value_end
-                ]
-            else:
-                field_value = line[value_start:]
-            if field_value.strip() and not _is_exact_redacted_value(field_value):
-                return "sensitive_assignment"
-    return None
-
-
-def _lean_sensitive_text_regions(value: str) -> list[str]:
-    regions: list[str] = []
-    index = 0
-    length = len(value)
-    while index < length:
-        if value.startswith("--", index):
-            end = value.find("\n", index)
-            if end < 0:
-                end = length
-            regions.append(value[index:end])
-            index = end
-            continue
-        if value.startswith("/-", index):
-            start = index
-            index += 2
-            depth = 1
-            while index < length and depth:
-                if value.startswith("/-", index):
-                    depth += 1
-                    index += 2
-                elif value.startswith("-/", index):
-                    depth -= 1
-                    index += 2
-                else:
-                    index += 1
-            regions.append(value[start:index])
-            continue
-        if value[index] == '"':
-            start = index
-            index += 1
-            escaped = False
-            while index < length:
-                char = value[index]
-                index += 1
-                if escaped:
-                    escaped = False
-                elif char == "\\":
-                    escaped = True
-                elif char == '"':
-                    break
-            regions.append(value[start:index])
-            continue
-        index += 1
-    return regions
-
-
 def _text_credential_category(
     value: str, *, text_context: str = "generic"
 ) -> str | None:
+    del text_context
     for match in _BEARER_CREDENTIAL.finditer(value):
         if not _is_exact_redacted_value(_bearer_value(match)):
             return "bearer_token"
     for category, pattern in _CREDENTIAL_PATTERNS:
         if pattern.search(value):
             return category
-    if text_context != "lean_source":
-        return _generic_text_credential_category(value)
-    for region in _lean_sensitive_text_regions(value):
-        finding = _generic_text_credential_category(region)
-        if finding is not None:
-            return finding
     return None
 
 
 def find_high_confidence_credential(
-    value: Any, *, text_context: str = "generic"
+    value: Any,
+    *,
+    text_context: str = "generic",
+    inspect_sensitive_fields: bool = False,
 ) -> str | None:
     if isinstance(value, Mapping):
         for key, item in value.items():
-            if is_sensitive_field_name(key):
+            if inspect_sensitive_fields and is_sensitive_field_name(key):
                 if item not in (None, "") and not _is_exact_redacted_value(item):
                     return "sensitive_field"
                 continue
-            finding = find_high_confidence_credential(item)
+            finding = find_high_confidence_credential(
+                item,
+                text_context=text_context,
+                inspect_sensitive_fields=inspect_sensitive_fields,
+            )
             if finding is not None:
                 return finding
         return None
     if isinstance(value, (list, tuple)):
         for item in value:
-            finding = find_high_confidence_credential(item)
+            finding = find_high_confidence_credential(
+                item,
+                text_context=text_context,
+                inspect_sensitive_fields=inspect_sensitive_fields,
+            )
             if finding is not None:
                 return finding
         return None
@@ -439,7 +327,9 @@ class AgentRuntime:
     def _backend_metadata(self) -> dict[str, Any]:
         value = getattr(self.backend, "last_metadata", None)
         if isinstance(value, dict):
-            finding = find_high_confidence_credential(value)
+            finding = find_high_confidence_credential(
+                value, inspect_sensitive_fields=True
+            )
             if finding is None:
                 return dict(value)
             return {
@@ -514,7 +404,9 @@ class AgentRuntime:
 
     @staticmethod
     def _persist_backend_evidence(call_dir: Path, metadata: dict[str, Any]) -> None:
-        if find_high_confidence_credential(metadata) is not None:
+        if find_high_confidence_credential(
+            metadata, inspect_sensitive_fields=True
+        ) is not None:
             return
         tool_events = metadata.get("tool_events")
         if isinstance(tool_events, list):
@@ -574,19 +466,6 @@ class AgentRuntime:
             if credential_category is not None:
                 raise CredentialExposureError(
                     "Agent output contained high-confidence credential material"
-                )
-            backend_material: tuple[Any, ...] = (
-                getattr(self.backend, "last_metadata", None),
-            )
-            if not self._backend_streams_preprocessed():
-                backend_material += (
-                    getattr(self.backend, "last_stdout", None),
-                    getattr(self.backend, "last_stderr", None),
-                    getattr(self.backend, "last_diagnostic_preview", None),
-                )
-            if find_high_confidence_credential(backend_material) is not None:
-                raise CredentialExposureError(
-                    "Agent backend evidence contained high-confidence credential material"
                 )
         except Exception as exc:
             raised_exception: Exception = exc

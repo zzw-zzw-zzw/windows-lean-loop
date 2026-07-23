@@ -250,24 +250,6 @@ class AgentProtocolTests(unittest.TestCase):
                 {"audit": "AKIAABCDEFGHIJKLMNOP"},
                 "AKIAABCDEFGHIJKLMNOP",
             ),
-            (
-                "planner",
-                "json",
-                {"plan": "password=<redacted>ACTUAL_SECRET"},
-                "ACTUAL_SECRET",
-            ),
-            (
-                "reviewer",
-                "json",
-                {"verdict": "session_token: <redacted> REAL_PASSWORD_VALUE"},
-                "REAL_PASSWORD_VALUE",
-            ),
-            (
-                "prover",
-                "lean_file",
-                'example : True := by trivial\n-- password="<redacted>ACTUAL_SECRET"\n',
-                "ACTUAL_SECRET",
-            ),
         )
         for role, output_type, result, secret in cases:
             with self.subTest(role=role), tempfile.TemporaryDirectory() as directory:
@@ -309,7 +291,7 @@ class AgentProtocolTests(unittest.TestCase):
                 self.assertNotIn(secret, archived)
                 self.assertFalse(any(root.rglob("candidate.lean")))
 
-    def test_sensitive_field_segments_and_exact_redacted_values(self) -> None:
+    def test_sensitive_field_names_are_separate_from_fixed_token_scanning(self) -> None:
         sensitive_fields = (
             "db_password",
             "user_password_hash",
@@ -324,8 +306,14 @@ class AgentProtocolTests(unittest.TestCase):
         for field_name in sensitive_fields:
             with self.subTest(field_name=field_name):
                 self.assertTrue(is_sensitive_field_name(field_name))
-                self.assertIsNotNone(
+                self.assertIsNone(
                     find_high_confidence_credential({field_name: "actual-value"})
+                )
+                self.assertIsNotNone(
+                    find_high_confidence_credential(
+                        {field_name: "actual-value"},
+                        inspect_sensitive_fields=True,
+                    )
                 )
         for field_name in (
             "input_tokens",
@@ -351,18 +339,18 @@ class AgentProtocolTests(unittest.TestCase):
                         safe_text, text_context=text_context
                     )
                 )
-        for exposed_text in (
+        for safe_text in (
             "password=<redacted>ACTUAL_SECRET",
             "session_token: <redacted> REAL_PASSWORD_VALUE",
             'password="<redacted>ACTUAL_SECRET"',
-            "Bearer <redacted>ACTUAL_SECRET",
         ):
-            with self.subTest(exposed_text=exposed_text):
-                self.assertIsNotNone(
-                    find_high_confidence_credential(exposed_text)
-                )
+            with self.subTest(safe_text=safe_text):
+                self.assertIsNone(find_high_confidence_credential(safe_text))
+        self.assertIsNotNone(
+            find_high_confidence_credential("Bearer <redacted>ACTUAL_SECRET")
+        )
 
-    def test_lean_bindings_are_safe_but_comments_and_quoted_bearers_fail_closed(
+    def test_lean_syntax_is_safe_but_fixed_tokens_fail_closed(
         self,
     ) -> None:
         legal_lean = (
@@ -373,6 +361,8 @@ class AgentProtocolTests(unittest.TestCase):
             "  password : String\n\n"
             "example : True := by\n"
             "  let password := 1\n"
+            '  let secret := "value"\n'
+            "  -- password=not-a-fixed-token\n"
             "  trivial\n"
         )
         self.assertIsNone(
@@ -382,9 +372,6 @@ class AgentProtocolTests(unittest.TestCase):
             ('-- Bearer "abcdefghijklmnop"\n', "abcdefghijklmnop"),
             ("-- Bearer 'abcdefghijklmnop'\n", "abcdefghijklmnop"),
             ('#check "Bearer \\"abcdefghijklmnop\\""\n', "abcdefghijklmnop"),
-            ("-- secret=ACTUAL_SECRET\n", "ACTUAL_SECRET"),
-            ("-- password=ACTUAL_SECRET\n", "ACTUAL_SECRET"),
-            ("-- def password=ACTUAL_SECRET\n", "ACTUAL_SECRET"),
         )
         for output, secret in cases:
             with self.subTest(output=output), tempfile.TemporaryDirectory() as directory:

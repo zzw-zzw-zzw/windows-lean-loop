@@ -535,6 +535,7 @@ def _stream_record(
     *,
     redaction_applied: bool,
     complete_process_stream_observed: bool,
+    complete_captured_prefix_saved: bool,
 ) -> dict[str, Any]:
     return {
         "process_stream": {
@@ -552,8 +553,8 @@ def _stream_record(
             "char_count": len(saved_stream),
             "byte_count": len(saved_stream.encode("utf-8")),
             "sha256": _text_sha256(saved_stream),
-            "complete_captured_prefix_saved": True,
-            "saved_evidence_truncated": False,
+            "complete_captured_prefix_saved": complete_captured_prefix_saved,
+            "saved_evidence_truncated": not complete_captured_prefix_saved,
         },
         "redaction_applied": redaction_applied,
     }
@@ -604,6 +605,7 @@ def _stream_evidence(
     stdout_redaction_applied: bool,
     stderr_redaction_applied: bool,
     complete_process_stream_observed: bool = True,
+    complete_captured_prefix_saved: bool = True,
     collection_stop_reason: str = "completed",
     output_safety_limit_bytes: int | None = None,
 ) -> tuple[dict[str, Any], str]:
@@ -622,12 +624,14 @@ def _stream_evidence(
             saved_stdout,
             redaction_applied=stdout_redaction_applied,
             complete_process_stream_observed=complete_process_stream_observed,
+            complete_captured_prefix_saved=complete_captured_prefix_saved,
         ),
         "stderr": _stream_record(
             observed_stderr,
             saved_stderr,
             redaction_applied=stderr_redaction_applied,
             complete_process_stream_observed=complete_process_stream_observed,
+            complete_captured_prefix_saved=complete_captured_prefix_saved,
         ),
         "raw_output": {
             "source": raw_source,
@@ -639,12 +643,12 @@ def _stream_evidence(
                 else "stderr.txt" if saved_stderr else None
             ),
             "duplicate_raw_output_artifact_suppressed": True,
-            "complete_captured_prefix_saved": True,
+            "complete_captured_prefix_saved": complete_captured_prefix_saved,
             "saved_redacted_evidence": {
                 "char_count": len(raw_output),
                 "byte_count": len(raw_output.encode("utf-8")),
                 "sha256": _text_sha256(raw_output),
-                "saved_evidence_truncated": False,
+                "saved_evidence_truncated": not complete_captured_prefix_saved,
             },
             "contains_unredacted_process_stream": False,
         },
@@ -663,8 +667,8 @@ def _stream_evidence(
         "captured_process_bytes": len(observed_stdout.encode("utf-8"))
         + len(observed_stderr.encode("utf-8")),
         "complete_process_stream_observed": complete_process_stream_observed,
-        "complete_captured_prefix_saved": True,
-        "saved_evidence_truncated": False,
+        "complete_captured_prefix_saved": complete_captured_prefix_saved,
+        "saved_evidence_truncated": not complete_captured_prefix_saved,
         "collection_stop_reason": collection_stop_reason,
         "output_safety_limit_exceeded": (
             collection_stop_reason == "output_safety_limit_exceeded"
@@ -1008,6 +1012,7 @@ class _SubscriptionBackend:
         collection_stop_reason: str,
         output_safety_limit_bytes: int | None = None,
         output_type: str | None = None,
+        complete_captured_prefix_saved: bool = True,
     ) -> dict[str, Any]:
         self.last_stdout, stdout_redaction_applied = _redact_codex_stdout(
             stdout, output_type=output_type
@@ -1021,6 +1026,7 @@ class _SubscriptionBackend:
             stdout_redaction_applied=stdout_redaction_applied,
             stderr_redaction_applied=stderr_redaction_applied,
             complete_process_stream_observed=complete_process_stream_observed,
+            complete_captured_prefix_saved=complete_captured_prefix_saved,
             collection_stop_reason=collection_stop_reason,
             output_safety_limit_bytes=output_safety_limit_bytes,
         )
@@ -1060,6 +1066,9 @@ class _SubscriptionBackend:
                     collection_stop_reason="cancelled",
                     output_safety_limit_bytes=self.max_process_output_bytes,
                     output_type=output_type,
+                    complete_captured_prefix_saved=getattr(
+                        exc, "complete_captured_prefix_saved", True
+                    ),
                 )
                 self.last_metadata.update(
                     {
@@ -1110,6 +1119,9 @@ class _SubscriptionBackend:
                     collection_stop_reason="timeout",
                     output_safety_limit_bytes=self.max_process_output_bytes,
                     output_type=output_type,
+                    complete_captured_prefix_saved=getattr(
+                        exc, "complete_captured_prefix_saved", True
+                    ),
                 )
                 self.last_metadata.update(
                     {
@@ -1301,15 +1313,9 @@ class _SubscriptionBackend:
                 redacted_manifest["redaction_applied_to_sandbox_manifest"] = bool(
                     redaction_applied or exposure_category
                 )
-                if exposure_category is not None:
-                    redacted_manifest[
-                        "_high_confidence_exposure_category"
-                    ] = exposure_category
                 return redacted_manifest
 
             def safety_violation(manifest: Mapping[str, Any]) -> str | None:
-                if manifest.get("_high_confidence_exposure_category"):
-                    return "credential_exposure_detected"
                 if not manifest.get("protected_state_unchanged"):
                     return "side_effect_detected"
                 if manifest.get("sandbox_boundary_violations"):
