@@ -216,6 +216,7 @@ python -m lean_loop workflow run `
   --model gpt-5.6-sol `
   --max-attempts 12 `
   --max-attempts-per-step 3 `
+  --planning-mode planner `
   --formalize-goal `
   --import-policy auto `
   --api-timeout 600 `
@@ -224,6 +225,16 @@ python -m lean_loop workflow run `
   --prove-effort high `
   --review-effort medium
 ```
+
+`--planning-mode` controls how the proof Plan is created:
+
+- `planner` is the default and always asks the Planner to decompose the task.
+- `direct` skips Planner decomposition and keeps one direct proof step for the configured step budget.
+- `direct-then-planner` tries three direct candidates, then archives that direct Plan and automatically asks the Planner to decompose the task while preserving the remaining global candidate budget.
+
+Direct theorem hints are conservative: only case-sensitive, Lean-shaped names such as
+`Real.pi_gt_three` or `useful_true` may trigger an exact declaration hint. Natural-language
+point labels such as `ABC`, `M`, or `N` are never treated as exact Mathlib theorems.
 
 `--model` 是单次 workflow 覆盖项；留空时继续使用 `LEAN_AGENT_MODEL`。中转站模型名按
 中转站实际提供的名称填写。失败时默认恢复原文件。只有明确传入 `--keep-failed` 才保留
@@ -309,6 +320,7 @@ python -m lean_loop queue add `
   --task "修复所有 Lean 错误，不改变已有定理陈述" `
   --model gpt-5.6-sol `
   --max-attempts 3 `
+  --planning-mode planner `
   --api-timeout 600 `
   --api-retries 1 `
   --lean-timeout 120

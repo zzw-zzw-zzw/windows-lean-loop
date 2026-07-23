@@ -56,6 +56,8 @@ WorkflowCreatedCallback = Callable[[str], None]
 BackendIdentityCallback = Callable[[dict[str, Any]], None]
 
 IMPORT_POLICIES = {"auto", "proof-first", "precise", "broad"}
+PLANNING_MODES = {"planner", "direct", "direct-then-planner"}
+DIRECT_FALLBACK_FAILURES = 3
 _RECOVERABLE_CODEX_PROVER_OUTPUT_FAILURES = {
     "empty_output",
     "malformed_output",
@@ -442,16 +444,21 @@ def _apply_plan_contract(
 def _exact_theorem_hits(
     retrieval: dict[str, object], preferred_terms: list[str]
 ) -> list[dict[str, object]]:
-    preferred = {term.casefold() for term in preferred_terms}
+    preferred = set(preferred_terms)
     hits: list[dict[str, object]] = []
     for row in retrieval.get("hits", []):
         if not isinstance(row, dict):
             continue
         query = str(row.get("query") or "")
+        name = str(row.get("name") or "")
+        short_name = name.rsplit(".", 1)[-1]
+        lean_shaped_query = "." in query or "_" in query
         if (
             str(row.get("match") or "") == "exact"
             and str(row.get("kind") or "") in {"theorem", "lemma"}
-            and query.casefold() in preferred
+            and query in preferred
+            and lean_shaped_query
+            and query in {name, short_name}
         ):
             hits.append(row)
     return hits
@@ -463,17 +470,25 @@ def _direct_proof_plan(
     names = list(
         dict.fromkeys(str(row.get("name") or row.get("query")) for row in hits)
     )
+    declaration_guidance = (
+        " by applying or specializing the verified local declaration(s): "
+        + ", ".join(names)
+        if names
+        else " without a separate planning call"
+    )
     plan = validate_plan(
         {
             "summary": (
-                "Use exact local Mathlib declarations directly: " + ", ".join(names)
+                "Attempt the complete proof directly"
+                + (": " + ", ".join(names) if names else ".")
             ),
             "steps": [
                 {
                     "id": "direct-proof",
                     "goal": (
-                        "Prove the complete requested theorem by applying or specializing "
-                        "the exact local declaration(s): " + ", ".join(names)
+                        "Prove the complete requested theorem"
+                        + declaration_guidance
+                        + "."
                     ),
                     "success_criteria": (
                         "The complete file passes Lean and the final source audit."
@@ -483,7 +498,9 @@ def _direct_proof_plan(
                 }
             ],
             "preserve": [],
-            "risks": ["Lean must verify the exact arguments and witness order."],
+            "risks": [
+                "This mode deliberately skips task decomposition; Lean and the final audit must verify the complete result."
+            ],
         }
     )
     return _apply_plan_contract(plan, formal_goal)
@@ -510,6 +527,9 @@ def _resume_replan_reason(
     old_providers = old_settings.get("provider_signatures")
     if old_providers and old_providers != current_settings.get("provider_signatures"):
         return "provider_changed"
+    old_planning_mode = str(old_settings.get("planning_mode") or "legacy-auto")
+    if old_planning_mode != str(current_settings.get("planning_mode") or "planner"):
+        return "planning_mode_changed"
 
     attempts = list(previous.get("attempts") or [])
     if len(attempts) < 2:
@@ -649,6 +669,7 @@ def run_structured_workflow(
     keep_failed: bool = False,
     formalize_goal: bool = False,
     import_policy: str = "auto",
+    planning_mode: str = "planner",
     protect_existing_statements: bool = True,
     protected_declarations: list[str] | None = None,
     resume_run_id: str | None = None,
@@ -668,6 +689,8 @@ def run_structured_workflow(
         max_attempts_per_step = max_attempts
     if max_attempts_per_step < 1:
         raise ValueError("max_attempts_per_step must be positive")
+    if planning_mode not in PLANNING_MODES:
+        raise ValueError(f"Unsupported planning mode: {planning_mode}")
     protected_declarations = list(protected_declarations or [])
     if agent_backend_id not in {
         "direct",
@@ -712,6 +735,7 @@ def run_structured_workflow(
         "formalize_goal": formalize_goal,
         "import_policy": import_policy,
         "effective_import_policy": effective_import_policy,
+        "planning_mode": planning_mode,
         "protect_existing_statements": protect_existing_statements,
         "protected_declarations": protected_declarations,
         "models": {
@@ -1032,6 +1056,75 @@ def run_structured_workflow(
         safe_sha = original_sha
         safe_checkpoint = None
 
+    def create_planner_plan(
+        *,
+        source: str,
+        diagnostics: str,
+        retrieval: dict[str, object],
+        timing_phase: str,
+    ) -> dict[str, Any]:
+        plan_prompt = build_plan_prompt(
+            relative_file=relative.as_posix(),
+            task=task,
+            source=source,
+            diagnostics=diagnostics,
+            retrieval=retrieval_prompt_block(retrieval),
+            formal_goal=_formal_goal_prompt_block(formal_goal),
+        )
+        try:
+            with timings.measure(timing_phase):
+                return _apply_plan_contract(
+                    validate_plan(
+                        agent_runtime.invoke(
+                            role="planner",
+                            phase="plan",
+                            output_type="json",
+                            config=plan_config,
+                            system_prompt=PLAN_SYSTEM_PROMPT,
+                            user_prompt=plan_prompt,
+                            temp_dir=store.paths.temp,
+                            context={"target_file": relative.as_posix()},
+                        )
+                    ),
+                    formal_goal,
+                )
+        except ApiError as exc:
+            fallback_plan = _apply_plan_contract(
+                validate_plan(
+                    {
+                        "summary": "Deterministic one-step fallback because Planner output was invalid.",
+                        "steps": [
+                            {
+                                "id": "step-1",
+                                "goal": "Produce the complete requested Lean theorem and make the file compile.",
+                                "success_criteria": "The complete file passes Lean and source audit.",
+                                "search_terms": natural_language_search_terms(task),
+                                "required_declarations": [],
+                            }
+                        ],
+                        "preserve": [],
+                        "risks": [str(exc)],
+                    }
+                ),
+                formal_goal,
+            )
+            fallback_plan["planner_error"] = str(exc)
+            return fallback_plan
+
+    def new_step_rows(value: dict[str, Any]) -> list[dict[str, Any]]:
+        return [
+            {
+                "index": index,
+                "id": step["id"],
+                "goal": step["goal"],
+                "success_criteria": step["success_criteria"],
+                "status": "pending",
+                "attempts": [],
+                "checkpoint": None,
+            }
+            for index, step in enumerate(value["steps"], 1)
+        ]
+
     try:
         previous_manifest = store.read()
         saved_steps = list(previous_manifest.get("steps") or [])
@@ -1078,85 +1171,43 @@ def run_structured_workflow(
             if phase_callback is not None:
                 phase_callback("planning", None)
             store.event("phase_started", phase="plan")
-            plan_prompt = build_plan_prompt(
-                relative_file=relative.as_posix(),
-                task=task,
-                source=safe_source,
-                diagnostics=initial_check.output,
-                retrieval=retrieval_prompt_block(planning_retrieval),
-                formal_goal=_formal_goal_prompt_block(formal_goal),
-            )
             preferred_terms = natural_language_search_terms(task)
             for term in source_search_terms("", task):
                 if term not in preferred_terms:
                     preferred_terms.append(term)
             exact_hits = _exact_theorem_hits(planning_retrieval, preferred_terms)
-            if exact_hits:
+            prior_direct_fallback = previous_manifest.get("direct_fallback")
+            direct_fallback_already_triggered = (
+                isinstance(prior_direct_fallback, dict)
+                and bool(prior_direct_fallback.get("triggered"))
+            )
+            should_start_direct = planning_mode == "direct" or (
+                planning_mode == "direct-then-planner"
+                and not direct_fallback_already_triggered
+            )
+            if should_start_direct:
                 plan = _direct_proof_plan(exact_hits, formal_goal)
                 store.event(
                     "direct_plan_selected",
+                    mode=planning_mode,
                     declarations=[
                         str(row.get("name") or row.get("query")) for row in exact_hits
                     ],
                 )
             else:
-                try:
-                    with timings.measure("plan_api"):
-                        plan = _apply_plan_contract(
-                            validate_plan(
-                                agent_runtime.invoke(
-                                    role="planner",
-                                    phase="plan",
-                                    output_type="json",
-                                    config=plan_config,
-                                    system_prompt=PLAN_SYSTEM_PROMPT,
-                                    user_prompt=plan_prompt,
-                                    temp_dir=store.paths.temp,
-                                    context={"target_file": relative.as_posix()},
-                                )
-                            ),
-                            formal_goal,
-                        )
-                except ApiError as exc:
-                    fallback_terms = natural_language_search_terms(task)
-                    plan = _apply_plan_contract(
-                        validate_plan(
-                            {
-                                "summary": "Deterministic one-step fallback because Planner output was invalid.",
-                                "steps": [
-                                    {
-                                        "id": "step-1",
-                                        "goal": "Produce the complete requested Lean theorem and make the file compile.",
-                                        "success_criteria": "The complete file passes Lean and source audit.",
-                                        "search_terms": fallback_terms,
-                                        "required_declarations": [],
-                                    }
-                                ],
-                                "preserve": [],
-                                "risks": [str(exc)],
-                            }
-                        ),
-                        formal_goal,
-                    )
-                    plan["planner_error"] = str(exc)
+                plan = create_planner_plan(
+                    source=safe_source,
+                    diagnostics=initial_check.output,
+                    retrieval=planning_retrieval,
+                    timing_phase="plan_api",
+                )
             atomic_write_json(store.paths.plan, plan)
             store.update(phase="prove", plan_summary=plan["summary"])
             store.event("phase_completed", phase="plan", summary=plan["summary"])
             attempt_rows = (
                 list(previous_manifest.get("attempts") or []) if resuming else []
             )
-            step_rows = [
-                {
-                    "index": index,
-                    "id": step["id"],
-                    "goal": step["goal"],
-                    "success_criteria": step["success_criteria"],
-                    "status": "pending",
-                    "attempts": [],
-                    "checkpoint": None,
-                }
-                for index, step in enumerate(plan["steps"], 1)
-            ]
+            step_rows = new_step_rows(plan)
             store.update(steps=step_rows)
             attempt, orphaned_attempts = _resume_attempt_number(store, attempt_rows)
             if orphaned_attempts:
@@ -1183,9 +1234,12 @@ def run_structured_workflow(
             2, int(prove_config.api_timeout_retries) + 1
         )
 
-        for step_index, active_step in enumerate(plan["steps"], 1):
+        step_index = 1
+        while step_index <= len(plan["steps"]):
+            active_step = plan["steps"][step_index - 1]
             step_row = step_rows[step_index - 1]
             if step_row.get("status") == "succeeded":
+                step_index += 1
                 continue
             step_row["status"] = "running"
             store.update(
@@ -1359,6 +1413,7 @@ def run_structured_workflow(
                         checkpoint=str(checkpoint_dir),
                         recovered=True,
                     )
+                    step_index += 1
                     continue
                 recovery_failure = (
                     recovered_check.output
@@ -1377,7 +1432,13 @@ def run_structured_workflow(
                     diagnostics=recovery_failure,
                 )
 
-            while attempt < max_attempts and step_attempt < max_attempts_per_step:
+            step_attempt_limit = (
+                DIRECT_FALLBACK_FAILURES
+                if planning_mode == "direct-then-planner"
+                and active_step["id"] == "direct-proof"
+                else max_attempts_per_step
+            )
+            while attempt < max_attempts and step_attempt < step_attempt_limit:
                 candidate_attempt = attempt + 1
                 candidate_step_attempt = step_attempt + 1
                 candidate_base_attempt = working_base_attempt
@@ -1886,17 +1947,102 @@ def run_structured_workflow(
                 store.update(phase="prove")
 
             if not step_completed:
+                should_fallback_to_planner = (
+                    planning_mode == "direct-then-planner"
+                    and active_step["id"] == "direct-proof"
+                    and step_attempt >= step_attempt_limit
+                    and attempt < max_attempts
+                    and not workflow_stopped
+                )
+                if should_fallback_to_planner:
+                    step_row["status"] = "superseded"
+                    step_row["fallback_reason"] = "direct_attempt_limit"
+                    superseded_steps = list(
+                        store.read().get("superseded_steps") or []
+                    )
+                    superseded_steps.append(
+                        {
+                            "mode": "direct",
+                            "plan": plan,
+                            "steps": step_rows,
+                            "failed_attempts": step_attempt,
+                            "last_attempt": attempt,
+                        }
+                    )
+                    atomic_write_json(store.paths.root / "direct-plan.json", plan)
+                    fallback_terms = natural_language_search_terms(task)
+                    for term in (formal_goal or {}).get("search_terms", []):
+                        if term not in fallback_terms:
+                            fallback_terms.append(term)
+                    for term in last_review.get("search_terms", []):
+                        if term not in fallback_terms:
+                            fallback_terms.append(term)
+                    for term in source_search_terms(working_source, task):
+                        if term not in fallback_terms:
+                            fallback_terms.append(term)
+                    if phase_callback is not None:
+                        phase_callback("planning", None)
+                    store.update(
+                        phase="plan",
+                        steps=step_rows,
+                        superseded_steps=superseded_steps,
+                    )
+                    store.event(
+                        "direct_plan_fallback_started",
+                        failed_attempts=step_attempt,
+                        last_attempt=attempt,
+                    )
+                    with timings.measure("fallback_planning_retrieval"):
+                        fallback_retrieval = _safe_retrieval(
+                            project,
+                            diagnostics=last_check.output,
+                            requested_terms=fallback_terms,
+                            process_control=process_control,
+                        )
+                    atomic_write_json(
+                        store.paths.root / "fallback-planning-retrieval.json",
+                        fallback_retrieval,
+                    )
+                    plan = create_planner_plan(
+                        source=working_source,
+                        diagnostics=last_check.output,
+                        retrieval=fallback_retrieval,
+                        timing_phase="fallback_plan_api",
+                    )
+                    atomic_write_json(store.paths.plan, plan)
+                    step_rows = new_step_rows(plan)
+                    store.update(
+                        phase="prove",
+                        plan_summary=plan["summary"],
+                        steps=step_rows,
+                        superseded_steps=superseded_steps,
+                        direct_fallback={
+                            "triggered": True,
+                            "failed_attempts": step_attempt,
+                            "last_attempt": attempt,
+                        },
+                    )
+                    store.event(
+                        "direct_plan_fallback_completed",
+                        failed_attempts=step_attempt,
+                        last_attempt=attempt,
+                        planner_steps=len(step_rows),
+                        summary=plan["summary"],
+                    )
+                    step_index = 1
+                    continue
                 if step_row["status"] == "running":
                     step_row["status"] = "failed"
                 step_row["budget_exhausted"] = (
                     "global"
                     if attempt >= max_attempts
                     else "step"
-                    if step_attempt >= max_attempts_per_step
+                    if step_attempt >= step_attempt_limit
                     else None
                 )
                 store.update(steps=step_rows)
                 break
+            step_index += 1
 
         all_steps_succeeded = bool(step_rows) and all(
             row["status"] == "succeeded" for row in step_rows

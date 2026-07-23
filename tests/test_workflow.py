@@ -11,6 +11,7 @@ from lean_loop.mathlib_index import build_mathlib_index
 from lean_loop.process_control import ProcessCancelled
 from lean_loop.subscription_backend import SubscriptionBackendError
 from lean_loop.workflow import (
+    _exact_theorem_hits,
     _resume_replan_reason,
     run_structured_workflow,
     validate_formal_goal,
@@ -118,6 +119,14 @@ class _CodexWorkflowBackend:
 
 
 class StructuredWorkflowTests(unittest.TestCase):
+    def test_legacy_workflow_replans_into_default_planner_mode(self) -> None:
+        previous = {"settings": {}}
+        current = {"planning_mode": "planner"}
+        self.assertEqual(
+            _resume_replan_reason(None, previous, current),  # type: ignore[arg-type]
+            "planning_mode_changed",
+        )
+
     def test_backend_change_is_a_visible_resume_replan_reason(self) -> None:
         previous = {"settings": {"agent_backend": "codex-subscription"}}
         current = {"agent_backend": "claude-subscription"}
@@ -2384,6 +2393,7 @@ class StructuredWorkflowTests(unittest.TestCase):
                 lean_timeout_seconds=10,
                 lake_executable="lake",
                 formalize_goal=True,
+                planning_mode="direct",
                 json_model_call=json_model,
                 file_model_call=lambda config, prompt, temp: (
                     "import Mathlib.Logic.Basic\n"
@@ -2398,6 +2408,320 @@ class StructuredWorkflowTests(unittest.TestCase):
             self.assertNotIn("query='Created'", formalizer_prompt)
             events = (result.state_dir / "events.jsonl").read_text(encoding="utf-8")
             self.assertIn("direct_plan_selected", events)
+
+    def test_exact_hit_rejects_natural_language_geometry_labels(self) -> None:
+        retrieval = {
+            "hits": [
+                {
+                    "query": "ABC",
+                    "name": "Polynomial.abc",
+                    "kind": "theorem",
+                    "match": "exact",
+                },
+                {
+                    "query": "M",
+                    "name": "Example.M",
+                    "kind": "lemma",
+                    "match": "exact",
+                },
+                {
+                    "query": "useful_true",
+                    "name": "useful_true",
+                    "kind": "theorem",
+                    "match": "exact",
+                },
+                {
+                    "query": "Real.pi_gt_three",
+                    "name": "Real.pi_gt_three",
+                    "kind": "theorem",
+                    "match": "exact",
+                },
+            ]
+        }
+
+        hits = _exact_theorem_hits(
+            retrieval,
+            ["ABC", "M", "useful_true", "Real.pi_gt_three"],
+        )
+
+        self.assertEqual(
+            [row["name"] for row in hits],
+            ["useful_true", "Real.pi_gt_three"],
+        )
+
+    def test_planner_is_the_default_even_for_a_simple_proof(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            project, target = self._project(
+                Path(directory), "example : True := by exact missing\n"
+            )
+            planner_calls = 0
+
+            def checker(project: Path, target: Path, timeout: int, lake: str) -> LeanCheck:
+                ok = "by trivial" in target.read_text(encoding="utf-8")
+                return LeanCheck(ok, 0 if ok else 1, "" if ok else "missing", ())
+
+            def json_model(config, system, user, temp):
+                nonlocal planner_calls
+                if "Planner" in system:
+                    planner_calls += 1
+                    return {
+                        "summary": "planned proof",
+                        "steps": [{
+                            "id": "planned-step",
+                            "goal": "prove True",
+                            "success_criteria": "Lean passes",
+                            "search_terms": [],
+                            "required_declarations": [],
+                        }],
+                        "preserve": [],
+                        "risks": [],
+                    }
+                return {
+                    "verdict": "accept",
+                    "summary": "accepted",
+                    "failure_analysis": [],
+                    "next_actions": [],
+                    "search_terms": [],
+                }
+
+            result = run_structured_workflow(
+                project=project,
+                target=target,
+                task="prove True",
+                plan_config=_config(),
+                prove_config=_config(),
+                review_config=_config(),
+                max_attempts=1,
+                lean_timeout_seconds=10,
+                lake_executable="lake",
+                json_model_call=json_model,
+                file_model_call=lambda config, prompt, temp: (
+                    "example : True := by trivial\n"
+                ),
+                lean_checker=checker,
+            )
+
+            self.assertTrue(result.ok)
+            self.assertEqual(planner_calls, 1)
+            plan = json.loads((result.state_dir / "plan.json").read_text(encoding="utf-8"))
+            self.assertEqual(plan["steps"][0]["id"], "planned-step")
+
+    def test_direct_then_planner_falls_back_after_three_failures(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            project, target = self._project(
+                Path(directory), "example : True := by exact original_missing\n"
+            )
+            planner_calls = 0
+            prover_calls = 0
+
+            def checker(project: Path, target: Path, timeout: int, lake: str) -> LeanCheck:
+                source = target.read_text(encoding="utf-8")
+                ok = "by trivial" in source
+                return LeanCheck(ok, 0 if ok else 1, "" if ok else source.strip(), ())
+
+            def json_model(config, system, user, temp):
+                nonlocal planner_calls
+                if "Planner" in system:
+                    planner_calls += 1
+                    return {
+                        "summary": "fallback plan",
+                        "steps": [{
+                            "id": "planned-step",
+                            "goal": "finish after direct attempts",
+                            "success_criteria": "Lean passes",
+                            "search_terms": [],
+                            "required_declarations": [],
+                        }],
+                        "preserve": [],
+                        "risks": [],
+                    }
+                return {
+                    "verdict": "accept" if "Lean check success: true" in user else "retry",
+                    "summary": "reviewed",
+                    "failure_analysis": [],
+                    "next_actions": [],
+                    "search_terms": [],
+                }
+
+            def file_model(config, prompt, temp):
+                nonlocal prover_calls
+                prover_calls += 1
+                if prover_calls <= 3:
+                    return f"example : True := by exact missing_{prover_calls}\n"
+                return "example : True := by trivial\n"
+
+            result = run_structured_workflow(
+                project=project,
+                target=target,
+                task="prove True directly, then plan if needed",
+                plan_config=_config(),
+                prove_config=_config(),
+                review_config=_config(),
+                max_attempts=6,
+                max_attempts_per_step=5,
+                lean_timeout_seconds=10,
+                lake_executable="lake",
+                planning_mode="direct-then-planner",
+                json_model_call=json_model,
+                file_model_call=file_model,
+                lean_checker=checker,
+            )
+
+            self.assertTrue(result.ok)
+            self.assertEqual(planner_calls, 1)
+            self.assertEqual(prover_calls, 4)
+            manifest = json.loads((result.state_dir / "run.json").read_text(encoding="utf-8"))
+            self.assertEqual(manifest["settings"]["planning_mode"], "direct-then-planner")
+            self.assertEqual(manifest["direct_fallback"]["failed_attempts"], 3)
+            self.assertEqual(manifest["steps"][0]["id"], "planned-step")
+            self.assertEqual(manifest["steps"][0]["attempts"], [4])
+            self.assertEqual(
+                manifest["superseded_steps"][0]["steps"][0]["attempts"],
+                [1, 2, 3],
+            )
+            attempts = manifest["attempts"]
+            self.assertEqual([row["step_id"] for row in attempts], [
+                "direct-proof", "direct-proof", "direct-proof", "planned-step"
+            ])
+            self.assertIsNone(attempts[3].get("base_attempt"))
+            self.assertTrue((result.state_dir / "direct-plan.json").is_file())
+            events = (result.state_dir / "events.jsonl").read_text(encoding="utf-8")
+            self.assertIn('"event": "direct_plan_fallback_completed"', events)
+
+    def test_direct_mode_never_falls_back_to_planner(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            project, target = self._project(
+                Path(directory), "example : True := by exact original_missing\n"
+            )
+            prover_calls = 0
+
+            def checker(project: Path, target: Path, timeout: int, lake: str) -> LeanCheck:
+                return LeanCheck(False, 1, "still missing", ())
+
+            def json_model(config, system, user, temp):
+                if "Planner" in system:
+                    raise AssertionError("direct mode must not call Planner")
+                return {
+                    "verdict": "retry",
+                    "summary": "retry",
+                    "failure_analysis": [],
+                    "next_actions": [],
+                    "search_terms": [],
+                }
+
+            def file_model(config, prompt, temp):
+                nonlocal prover_calls
+                prover_calls += 1
+                return f"example : True := by exact missing_{prover_calls}\n"
+
+            result = run_structured_workflow(
+                project=project,
+                target=target,
+                task="keep trying directly",
+                plan_config=_config(),
+                prove_config=_config(),
+                review_config=_config(),
+                max_attempts=4,
+                max_attempts_per_step=4,
+                lean_timeout_seconds=10,
+                lake_executable="lake",
+                planning_mode="direct",
+                json_model_call=json_model,
+                file_model_call=file_model,
+                lean_checker=checker,
+            )
+
+            self.assertFalse(result.ok)
+            self.assertEqual(prover_calls, 4)
+            manifest = json.loads((result.state_dir / "run.json").read_text(encoding="utf-8"))
+            self.assertNotIn("direct_fallback", manifest)
+
+    def test_hybrid_resume_falls_back_without_a_fourth_direct_attempt(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            project, target = self._project(
+                Path(directory), "example : True := by exact original_missing\n"
+            )
+            planner_calls = 0
+            prover_calls = 0
+
+            def checker(project: Path, target: Path, timeout: int, lake: str) -> LeanCheck:
+                source = target.read_text(encoding="utf-8")
+                ok = "by trivial" in source
+                return LeanCheck(ok, 0 if ok else 1, "" if ok else source.strip(), ())
+
+            def json_model(config, system, user, temp):
+                nonlocal planner_calls
+                if "Planner" in system:
+                    planner_calls += 1
+                    return {
+                        "summary": "resume fallback plan",
+                        "steps": [{
+                            "id": "planned-step",
+                            "goal": "finish",
+                            "success_criteria": "Lean passes",
+                            "search_terms": [],
+                            "required_declarations": [],
+                        }],
+                        "preserve": [],
+                        "risks": [],
+                    }
+                return {
+                    "verdict": "accept" if "Lean check success: true" in user else "retry",
+                    "summary": "reviewed",
+                    "failure_analysis": [],
+                    "next_actions": [],
+                    "search_terms": [],
+                }
+
+            def file_model(config, prompt, temp):
+                nonlocal prover_calls
+                prover_calls += 1
+                if prover_calls <= 3:
+                    return f"example : True := by exact resume_missing_{prover_calls}\n"
+                return "example : True := by trivial\n"
+
+            first = run_structured_workflow(
+                project=project,
+                target=target,
+                task="resume hybrid",
+                plan_config=_config(),
+                prove_config=_config(),
+                review_config=_config(),
+                max_attempts=3,
+                max_attempts_per_step=5,
+                lean_timeout_seconds=10,
+                lake_executable="lake",
+                planning_mode="direct-then-planner",
+                json_model_call=json_model,
+                file_model_call=file_model,
+                lean_checker=checker,
+            )
+            self.assertFalse(first.ok)
+            self.assertEqual(planner_calls, 0)
+
+            resumed = run_structured_workflow(
+                project=project,
+                target=target,
+                task="resume hybrid",
+                plan_config=_config(),
+                prove_config=_config(),
+                review_config=_config(),
+                max_attempts=5,
+                max_attempts_per_step=5,
+                lean_timeout_seconds=10,
+                lake_executable="lake",
+                planning_mode="direct-then-planner",
+                resume_run_id=first.run_id,
+                json_model_call=json_model,
+                file_model_call=file_model,
+                lean_checker=checker,
+            )
+
+            self.assertTrue(resumed.ok)
+            self.assertEqual(planner_calls, 1)
+            self.assertEqual(prover_calls, 4)
+            manifest = json.loads((resumed.state_dir / "run.json").read_text(encoding="utf-8"))
+            self.assertEqual([row["attempt"] for row in manifest["attempts"]], [1, 2, 3, 4])
 
     def test_resume_replans_after_repeated_diagnostics(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

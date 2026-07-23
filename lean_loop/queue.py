@@ -566,6 +566,7 @@ def run_queue_task(
             keep_failed=bool(settings.get("keep_failed", False)),
             formalize_goal=bool(settings.get("formalize_goal", True)),
             import_policy=str(settings.get("import_policy") or "auto"),
+            planning_mode=str(settings.get("planning_mode") or "planner"),
             protect_existing_statements=bool(
                 settings.get("protect_existing_statements", True)
             ),
@@ -734,6 +735,7 @@ def _run_queue_race(
                 keep_failed=False,
                 formalize_goal=bool(settings.get("formalize_goal", True)),
                 import_policy=str(settings.get("import_policy") or "auto"),
+                planning_mode=str(settings.get("planning_mode") or "planner"),
                 protect_existing_statements=bool(
                     settings.get("protect_existing_statements", True)
                 ),
