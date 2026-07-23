@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import textwrap
@@ -11,7 +12,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from lean_loop.agent_protocol import AgentRequest
+from lean_loop.agent_protocol import AgentRequest, AgentRuntime
+from lean_loop.api import extract_file_content
 from lean_loop.config import ApiConfig
 from lean_loop.process_control import ProcessCancelled, run_controlled_process
 from lean_loop.subscription_backend import (
@@ -178,8 +180,10 @@ if mode == "tool-events":
     pathlib.Path("artifact.txt").write_text("sandbox-only", encoding="utf-8")
 
 if provider == "codex":
-    if mode == "nonfatal-event":
+    print(json.dumps({"type": "thread.started", "thread_id": "thread"}))
+    if mode == "top-level-error":
         print(json.dumps({"type": "error", "message": "reconnecting"}))
+    if mode == "nonfatal-item-error":
         print(json.dumps({
             "type": "item.completed",
             "item": {"id": "e", "type": "error", "message": "transport fallback"},
@@ -233,7 +237,6 @@ if provider == "codex":
                 "status": "completed",
             },
         }))
-    print(json.dumps({"type": "thread.started", "thread_id": "thread"}))
     print(json.dumps({
         "type": "item.completed",
         "item": {"id": "a", "type": "agent_message", "text": result},
@@ -262,6 +265,21 @@ else:
 
 
 class SubscriptionBackendTests(unittest.TestCase):
+    fixture_root = Path(__file__).parent / "fixtures" / "codex_cli_0_144_4"
+
+    def _fixture_case(self, name: str) -> tuple[dict, str, str]:
+        manifest = json.loads(
+            (self.fixture_root / "manifest.json").read_text(encoding="utf-8")
+        )
+        case = dict(manifest["cases"][name])
+        stdout = (self.fixture_root / case["stdout"]).read_text(encoding="utf-8")
+        stderr = (
+            (self.fixture_root / case["stderr"]).read_text(encoding="utf-8")
+            if case.get("stderr")
+            else ""
+        )
+        return case, stdout, stderr
+
     def _fake_cli(self, root: Path) -> Path:
         path = root / "fake_cli.py"
         path.write_text(textwrap.dedent(FAKE_CLI), encoding="utf-8")
@@ -292,7 +310,7 @@ class SubscriptionBackendTests(unittest.TestCase):
             return CodexSubscriptionBackend(**common)
         return ClaudeSubscriptionBackend(**common)
 
-    def test_codex_accepts_final_result_after_nonfatal_stream_events(self) -> None:
+    def test_codex_accepts_final_result_after_nonfatal_item_error(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             backend = self._backend("codex", root)
@@ -301,7 +319,7 @@ class SubscriptionBackendTests(unittest.TestCase):
             self.assertNotIn("TUSHARE_TOKEN", backend.base_environment)
             self.assertNotIn("GH_TOKEN", backend.base_environment)
             self.assertNotIn("TOKEN", backend.base_environment)
-            backend.base_environment["FAKE_MODE"] = "nonfatal-event"
+            backend.base_environment["FAKE_MODE"] = "nonfatal-item-error"
             output = backend.invoke(
                 _request(), _config("gpt-test-pinned"), root / "ignored"
             )
@@ -335,7 +353,7 @@ class SubscriptionBackendTests(unittest.TestCase):
                 "REQUESTED_MODEL_AND_OFFICIAL_CATALOG_ONLY",
             )
             self.assertEqual(backend.last_metadata["authentication_type"], "chatgpt")
-            self.assertEqual(backend.last_metadata["nonfatal_event_count"], 2)
+            self.assertEqual(backend.last_metadata["nonfatal_event_count"], 1)
             self.assertEqual(
                 backend.last_metadata["tool_execution_policy"],
                 "TOOL_ENABLED_AGENT_SANDBOX",
@@ -353,6 +371,270 @@ class SubscriptionBackendTests(unittest.TestCase):
                 self.assertEqual(
                     backend.last_metadata["sandbox_profile"][field], value
                 )
+
+    def test_codex_rejects_top_level_error_even_with_valid_final(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            backend = self._backend("codex", root)
+            backend.base_environment["FAKE_MODE"] = "top-level-error"
+
+            with self.assertRaises(SubscriptionBackendError) as raised:
+                backend.invoke(
+                    _request(), _config("gpt-test-pinned"), root / "ignored"
+                )
+
+            self.assertEqual(raised.exception.kind, "output_protocol_incompatible")
+            self.assertEqual(raised.exception.metadata["exit_code"], 0)
+            self.assertEqual(
+                raised.exception.metadata["terminal_state"],
+                "output_protocol_incompatible",
+            )
+
+    def test_codex_replays_current_and_legacy_final_result_formats(self) -> None:
+        backend = CodexSubscriptionBackend(command_prefix=("unused",))
+        expected_message_counts = {
+            "current_multi_message": 2,
+            "legacy_single_message": 1,
+            "tool_events_with_final": 1,
+        }
+        for name, message_count in expected_message_counts.items():
+            with self.subTest(name=name):
+                case, stdout, _ = self._fixture_case(name)
+                final_text, metadata = backend._parse(
+                    stdout,
+                    requested_model="gpt-5.6-sol",
+                    sandbox_root=Path.cwd(),
+                    output_type="lean_file",
+                )
+                self.assertEqual(
+                    extract_file_content(final_text), case["expected_content"]
+                )
+                self.assertEqual(metadata["final_result_candidate_count"], 1)
+                self.assertEqual(
+                    metadata["actual_model_status"], "NOT_REPORTED_BY_CLIENT"
+                )
+                self.assertEqual(metadata["agent_message_event_count"], message_count)
+
+    def test_codex_fixture_protocol_failures_are_fail_closed(self) -> None:
+        backend = CodexSubscriptionBackend(command_prefix=("unused",))
+        for name in (
+            "no_final",
+            "duplicate_final",
+            "truncated_no_terminal",
+            "malformed_event",
+        ):
+            with self.subTest(name=name):
+                case, stdout, _ = self._fixture_case(name)
+                with self.assertRaises(SubscriptionBackendError) as raised:
+                    backend._parse(
+                        stdout,
+                        requested_model="gpt-5.6-sol",
+                        sandbox_root=Path.cwd(),
+                        output_type="lean_file",
+                    )
+                self.assertEqual(raised.exception.kind, case["expected_kind"])
+
+    def test_codex_rejects_contract_match_before_invalid_last_agent_message(self) -> None:
+        backend = CodexSubscriptionBackend(command_prefix=("unused",))
+        events = [
+            {"type": "thread.started", "thread_id": "thread"},
+            {"type": "turn.started"},
+            {
+                "type": "item.completed",
+                "item": {
+                    "id": "intermediate",
+                    "type": "agent_message",
+                    "text": "example : True := by trivial\n",
+                },
+            },
+            {
+                "type": "item.completed",
+                "item": {
+                    "id": "last",
+                    "type": "agent_message",
+                    "text": "I could not produce the requested Lean file.",
+                },
+            },
+            {"type": "turn.completed", "usage": {}},
+        ]
+
+        with self.assertRaises(SubscriptionBackendError) as raised:
+            backend._parse(
+                "\n".join(json.dumps(event) for event in events) + "\n",
+                requested_model="gpt-5.6-sol",
+                sandbox_root=Path.cwd(),
+                output_type="lean_file",
+            )
+
+        self.assertEqual(raised.exception.kind, "output_protocol_incompatible")
+
+    def test_codex_rejects_agent_message_after_completed_turn(self) -> None:
+        backend = CodexSubscriptionBackend(command_prefix=("unused",))
+        events = [
+            {"type": "thread.started", "thread_id": "thread"},
+            {"type": "turn.started"},
+            {"type": "turn.completed", "usage": {}},
+            {
+                "type": "item.completed",
+                "item": {
+                    "id": "late",
+                    "type": "agent_message",
+                    "text": "example : True := by trivial\n",
+                },
+            },
+        ]
+
+        with self.assertRaises(SubscriptionBackendError) as raised:
+            backend._parse(
+                "\n".join(json.dumps(event) for event in events) + "\n",
+                requested_model="gpt-5.6-sol",
+                sandbox_root=Path.cwd(),
+                output_type="lean_file",
+            )
+
+        self.assertEqual(raised.exception.kind, "output_protocol_incompatible")
+
+    def test_codex_rejects_incomplete_second_turn_after_completed_turn(self) -> None:
+        backend = CodexSubscriptionBackend(command_prefix=("unused",))
+        events = [
+            {"type": "thread.started", "thread_id": "thread"},
+            {"type": "turn.started"},
+            {
+                "type": "item.completed",
+                "item": {
+                    "id": "final",
+                    "type": "agent_message",
+                    "text": "example : True := by trivial\n",
+                },
+            },
+            {"type": "turn.completed", "usage": {}},
+            {"type": "turn.started"},
+        ]
+
+        with self.assertRaises(SubscriptionBackendError) as raised:
+            backend._parse(
+                "\n".join(json.dumps(event) for event in events) + "\n",
+                requested_model="gpt-5.6-sol",
+                sandbox_root=Path.cwd(),
+                output_type="lean_file",
+            )
+
+        self.assertEqual(raised.exception.kind, "output_protocol_incompatible")
+
+    def test_codex_rejects_tool_start_after_completed_turn(self) -> None:
+        backend = CodexSubscriptionBackend(command_prefix=("unused",))
+        events = [
+            {"type": "thread.started", "thread_id": "thread"},
+            {"type": "turn.started"},
+            {
+                "type": "item.completed",
+                "item": {
+                    "id": "final",
+                    "type": "agent_message",
+                    "text": "example : True := by trivial\n",
+                },
+            },
+            {"type": "turn.completed", "usage": {}},
+            {
+                "type": "item.started",
+                "item": {
+                    "id": "late-tool",
+                    "type": "command_execution",
+                    "status": "in_progress",
+                },
+            },
+        ]
+
+        with self.assertRaises(SubscriptionBackendError) as raised:
+            backend._parse(
+                "\n".join(json.dumps(event) for event in events) + "\n",
+                requested_model="gpt-5.6-sol",
+                sandbox_root=Path.cwd(),
+                output_type="lean_file",
+            )
+
+        self.assertEqual(raised.exception.kind, "output_protocol_incompatible")
+
+    def test_codex_archives_current_stream_stderr_and_tool_events(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            backend = self._backend("codex", root)
+            backend.inspect(model="gpt-test-pinned", reasoning_effort="low")
+            case, stdout, stderr = self._fixture_case("current_multi_message")
+            completed = subprocess.CompletedProcess(
+                args=[],
+                returncode=case["exit_code"],
+                stdout=stdout,
+                stderr=stderr,
+            )
+            runtime = AgentRuntime(
+                workflow_root=root / "workflow", run_id="run-1", backend=backend
+            )
+            with patch.object(backend, "_run", return_value=completed):
+                output = runtime.invoke(
+                    role="prover",
+                    phase="prove",
+                    output_type="lean_file",
+                    config=_config("gpt-test-pinned"),
+                    system_prompt="system",
+                    user_prompt="user",
+                    temp_dir=root / "ignored",
+                )
+
+            self.assertEqual(output, case["expected_content"])
+            call_dir = next((root / "workflow" / "agent-calls").iterdir())
+            self.assertEqual((call_dir / "stdout.txt").read_text(encoding="utf-8"), stdout)
+            self.assertEqual((call_dir / "stderr.txt").read_text(encoding="utf-8"), stderr)
+            self.assertEqual((call_dir / "raw-output.txt").read_text(encoding="utf-8"), stdout)
+            tool_events = json.loads(
+                (call_dir / "tool-events.json").read_text(encoding="utf-8")
+            )["events"]
+            self.assertEqual(
+                [event["event_type"] for event in tool_events],
+                ["command_execution", "command_execution"],
+            )
+            self.assertEqual(
+                [event["protocol_event_type"] for event in tool_events],
+                ["item.started", "item.completed"],
+            )
+
+    def test_codex_nonzero_exit_rejects_valid_final_and_archives_streams(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            backend = self._backend("codex", root)
+            backend.inspect(model="gpt-test-pinned", reasoning_effort="low")
+            case, stdout, stderr = self._fixture_case("nonzero_with_valid_final")
+            completed = subprocess.CompletedProcess(
+                args=[],
+                returncode=case["exit_code"],
+                stdout=stdout,
+                stderr=stderr,
+            )
+            runtime = AgentRuntime(
+                workflow_root=root / "workflow", run_id="run-1", backend=backend
+            )
+            with (
+                patch.object(backend, "_run", return_value=completed),
+                self.assertRaises(SubscriptionBackendError) as raised,
+            ):
+                runtime.invoke(
+                    role="prover",
+                    phase="prove",
+                    output_type="lean_file",
+                    config=_config("gpt-test-pinned"),
+                    system_prompt="system",
+                    user_prompt="user",
+                    temp_dir=root / "ignored",
+                )
+
+            self.assertEqual(raised.exception.kind, case["expected_kind"])
+            call_dir = next((root / "workflow" / "agent-calls").iterdir())
+            self.assertEqual((call_dir / "stdout.txt").read_text(encoding="utf-8"), stdout)
+            self.assertEqual((call_dir / "stderr.txt").read_text(encoding="utf-8"), stderr)
+            response = json.loads((call_dir / "response.json").read_text(encoding="utf-8"))
+            self.assertEqual(response["status"], "error")
+            self.assertEqual(response["error"]["kind"], "nonzero_exit")
+
 
     def test_codex_archives_tool_events_and_allows_sandbox_internal_changes(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

@@ -9,6 +9,7 @@ from lean_loop.config import ApiConfig
 from lean_loop.lean import LeanCheck
 from lean_loop.mathlib_index import build_mathlib_index
 from lean_loop.process_control import ProcessCancelled
+from lean_loop.subscription_backend import SubscriptionBackendError
 from lean_loop.workflow import (
     _resume_replan_reason,
     run_structured_workflow,
@@ -26,6 +27,94 @@ def _config() -> ApiConfig:
         curl_executable="curl.exe",
         reasoning_effort="low",
     )
+
+
+class _CodexWorkflowBackend:
+    backend_id = "codex-subscription"
+
+    def __init__(
+        self,
+        prover_results: list[str | None],
+        *,
+        reviewer_verdict: str = "accept",
+    ) -> None:
+        self.prover_results = prover_results
+        self.reviewer_verdict = reviewer_verdict
+        self.prover_calls = 0
+        self.prover_prompts: list[str] = []
+        self.last_metadata: dict[str, object] = {"backend_id": self.backend_id}
+
+    def inspect(self, *, model: str, reasoning_effort: str):
+        return {
+            "status": "ready",
+            "backend_id": self.backend_id,
+            "cli_version": "codex-cli 0.144.4",
+            "authentication_type": "chatgpt",
+            "requested_model": model,
+            "requested_model_catalog_status": "VALIDATED",
+            "actual_model": None,
+            "actual_model_status": "NOT_REPORTED_BY_CLIENT",
+            "model_identity_source": "REQUESTED_MODEL_AND_OFFICIAL_CATALOG_ONLY",
+            "requested_reasoning_effort": reasoning_effort,
+            "effective_reasoning_effort": reasoning_effort,
+            "tool_execution_policy": "TOOL_ENABLED_AGENT_SANDBOX",
+            "filesystem_read_scope": "WINDOWS_BROAD_READ",
+            "filesystem_write_scope": "REPO_EXTERNAL_EPHEMERAL_WORKSPACE",
+            "read_isolation_status": "NOT_ENFORCED_BY_LEGACY_WINDOWS_SANDBOX",
+            "network_policy": "DISABLED",
+            "sandbox_profile": {"network_policy": "DISABLED"},
+        }
+
+    def invoke(self, request, config, temp_dir):
+        del temp_dir
+        identity = self.inspect(
+            model=config.model,
+            reasoning_effort=config.reasoning_effort,
+        )
+        self.last_metadata = dict(identity)
+        if request.role == "planner":
+            return {
+                "summary": "repair",
+                "steps": [{
+                    "id": "step-1",
+                    "goal": "prove True",
+                    "success_criteria": "Lean passes",
+                    "search_terms": [],
+                }],
+                "preserve": [],
+                "risks": [],
+            }
+        if request.role == "prover":
+            self.prover_prompts.append(request.user_prompt)
+            if self.prover_calls >= len(self.prover_results):
+                raise AssertionError("Unexpected extra Prover call")
+            result = self.prover_results[self.prover_calls]
+            self.prover_calls += 1
+            if result is None:
+                metadata = {
+                    **identity,
+                    "exit_code": 0,
+                    "terminal_state": "output_protocol_incompatible",
+                }
+                self.last_metadata = metadata
+                raise SubscriptionBackendError(
+                    "output_protocol_incompatible",
+                    "Codex did not return one completed final result",
+                    raw_output='{"type":"turn.completed","usage":{}}\n',
+                    metadata=metadata,
+                )
+            return result
+        return {
+            "verdict": self.reviewer_verdict,
+            "summary": f"reviewer verdict: {self.reviewer_verdict}",
+            "failure_analysis": (
+                [] if self.reviewer_verdict == "accept" else ["semantic revision needed"]
+            ),
+            "next_actions": (
+                [] if self.reviewer_verdict == "accept" else ["revise the candidate"]
+            ),
+            "search_terms": [],
+        }
 
 
 class StructuredWorkflowTests(unittest.TestCase):
@@ -1010,6 +1099,13 @@ class StructuredWorkflowTests(unittest.TestCase):
                 (result.state_dir / "restore-check.json").read_text(encoding="utf-8")
             )
             self.assertTrue(restore_check["reused_initial_check"])
+            manifest = json.loads(
+                (result.state_dir / "run.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                manifest["error"],
+                "Lean did not pass within the configured candidate budgets.",
+            )
 
     def test_cancellation_restores_original_and_marks_workflow_cancelled(self) -> None:
         original = "example : True := by exact missing\n"
@@ -1487,6 +1583,669 @@ class StructuredWorkflowTests(unittest.TestCase):
             manifest = json.loads((result.state_dir / "run.json").read_text(encoding="utf-8"))
             self.assertEqual(len(manifest["api_failures"]), 1)
             self.assertEqual([row["attempt"] for row in manifest["attempts"]], [1])
+
+    def test_codex_protocol_failure_consumes_candidate_attempt_and_retries(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            project, target = self._project(
+                Path(directory), "example : True := by exact missing\n"
+            )
+
+            def checker(project: Path, target: Path, timeout: int, lake: str) -> LeanCheck:
+                ok = "by trivial" in target.read_text(encoding="utf-8")
+                return LeanCheck(ok, 0 if ok else 1, "" if ok else "missing", ())
+
+            config = ApiConfig(
+                api_base="",
+                api_key="",
+                model="gpt-5.6-sol",
+                mode="subscription",
+                timeout_seconds=10,
+                curl_executable="",
+                reasoning_effort="high",
+            )
+            backend = _CodexWorkflowBackend(
+                [None, "example : True := by trivial\n"]
+            )
+            result = run_structured_workflow(
+                project=project,
+                target=target,
+                task="fix proof",
+                plan_config=config,
+                prove_config=config,
+                review_config=config,
+                max_attempts=2,
+                max_attempts_per_step=2,
+                lean_timeout_seconds=10,
+                lake_executable="lake",
+                lean_checker=checker,
+                agent_backend=backend,
+                agent_backend_id="codex-subscription",
+            )
+
+            self.assertTrue(result.ok)
+            self.assertEqual(backend.prover_calls, 2)
+            manifest = json.loads(
+                (result.state_dir / "run.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                [row["attempt"] for row in manifest["attempts"]], [1, 2]
+            )
+            self.assertEqual(manifest["attempts"][0]["failure_stage"], "prover_output_protocol")
+            self.assertEqual(manifest["attempts"][0]["review_verdict"], "not_run")
+            self.assertEqual(manifest.get("api_failures", []), [])
+            first_attempt = result.state_dir / "attempts" / "001"
+            self.assertTrue((first_attempt / "protocol-failure.json").is_file())
+            self.assertFalse((first_attempt / "candidate.lean").exists())
+            events = (result.state_dir / "events.jsonl").read_text(encoding="utf-8")
+            self.assertIn('"event": "prover_output_rejected"', events)
+
+    def test_codex_protocol_retry_guidance_survives_resume(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            project, target = self._project(
+                Path(directory), "example : True := by exact missing\n"
+            )
+
+            def checker(project: Path, target: Path, timeout: int, lake: str) -> LeanCheck:
+                ok = "by trivial" in target.read_text(encoding="utf-8")
+                return LeanCheck(ok, 0 if ok else 1, "" if ok else "missing", ())
+
+            config = ApiConfig(
+                api_base="",
+                api_key="",
+                model="gpt-5.6-sol",
+                mode="subscription",
+                timeout_seconds=10,
+                curl_executable="",
+                reasoning_effort="high",
+            )
+            backend = _CodexWorkflowBackend(
+                [None, "example : True := by trivial\n"]
+            )
+            first = run_structured_workflow(
+                project=project,
+                target=target,
+                task="fix proof",
+                plan_config=config,
+                prove_config=config,
+                review_config=config,
+                max_attempts=1,
+                max_attempts_per_step=1,
+                lean_timeout_seconds=10,
+                lake_executable="lake",
+                lean_checker=checker,
+                agent_backend=backend,
+                agent_backend_id="codex-subscription",
+            )
+            first_manifest = json.loads(
+                (first.state_dir / "run.json").read_text(encoding="utf-8")
+            )
+            guidance = first_manifest["final_review"]
+            self.assertFalse(first.ok)
+            self.assertFalse((first.state_dir / "reviews" / "001.json").exists())
+
+            resumed = run_structured_workflow(
+                project=project,
+                target=target,
+                task="fix proof",
+                plan_config=config,
+                prove_config=config,
+                review_config=config,
+                max_attempts=2,
+                max_attempts_per_step=2,
+                lean_timeout_seconds=10,
+                lake_executable="lake",
+                resume_run_id=first.run_id,
+                lean_checker=checker,
+                agent_backend=backend,
+                agent_backend_id="codex-subscription",
+            )
+
+            self.assertTrue(resumed.ok)
+            self.assertEqual(backend.prover_calls, 2)
+            self.assertIn(
+                json.dumps(guidance, ensure_ascii=False, indent=2),
+                backend.prover_prompts[1],
+            )
+            self.assertIn(
+                "example : True := by exact missing", backend.prover_prompts[1]
+            )
+            self.assertFalse((resumed.state_dir / "reviews" / "001.json").exists())
+            manifest = json.loads(
+                (resumed.state_dir / "run.json").read_text(encoding="utf-8")
+            )
+            self.assertIsNone(manifest["attempts"][1]["base_attempt"])
+            events = (resumed.state_dir / "events.jsonl").read_text(encoding="utf-8")
+            self.assertNotIn('"event": "working_candidate_restored"', events)
+
+    def test_codex_protocol_resume_uses_latest_real_candidate_and_guidance(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            project, target = self._project(
+                Path(directory), "example : True := by exact original_missing\n"
+            )
+
+            def checker(project: Path, target: Path, timeout: int, lake: str) -> LeanCheck:
+                source = target.read_text(encoding="utf-8")
+                ok = "by trivial" in source
+                if ok:
+                    diagnostics = ""
+                elif "candidate_marker" in source:
+                    diagnostics = "CANDIDATE_DIAGNOSTIC"
+                else:
+                    diagnostics = "ORIGINAL_DIAGNOSTIC"
+                return LeanCheck(ok, 0 if ok else 1, diagnostics, ())
+
+            config = ApiConfig(
+                api_base="",
+                api_key="",
+                model="gpt-5.6-sol",
+                mode="subscription",
+                timeout_seconds=10,
+                curl_executable="",
+                reasoning_effort="high",
+            )
+            backend = _CodexWorkflowBackend(
+                [
+                    "example : True := by exact candidate_marker\n",
+                    None,
+                    "example : True := by trivial\n",
+                ]
+            )
+            first = run_structured_workflow(
+                project=project,
+                target=target,
+                task="fix proof",
+                plan_config=config,
+                prove_config=config,
+                review_config=config,
+                max_attempts=2,
+                max_attempts_per_step=2,
+                lean_timeout_seconds=10,
+                lake_executable="lake",
+                lean_checker=checker,
+                agent_backend=backend,
+                agent_backend_id="codex-subscription",
+            )
+            first_manifest = json.loads(
+                (first.state_dir / "run.json").read_text(encoding="utf-8")
+            )
+            guidance = first_manifest["final_review"]
+            self.assertFalse(first.ok)
+            self.assertIsNotNone(first_manifest["attempts"][0]["candidate_sha256"])
+            self.assertIsNone(first_manifest["attempts"][1]["candidate_sha256"])
+            self.assertFalse((first.state_dir / "reviews" / "002.json").exists())
+
+            resumed = run_structured_workflow(
+                project=project,
+                target=target,
+                task="fix proof",
+                plan_config=config,
+                prove_config=config,
+                review_config=config,
+                max_attempts=3,
+                max_attempts_per_step=3,
+                lean_timeout_seconds=10,
+                lake_executable="lake",
+                resume_run_id=first.run_id,
+                lean_checker=checker,
+                agent_backend=backend,
+                agent_backend_id="codex-subscription",
+            )
+
+            self.assertTrue(resumed.ok)
+            self.assertIn("candidate_marker", backend.prover_prompts[2])
+            self.assertIn("CANDIDATE_DIAGNOSTIC", backend.prover_prompts[2])
+            self.assertNotIn("ORIGINAL_DIAGNOSTIC", backend.prover_prompts[2])
+            self.assertIn(
+                json.dumps(guidance, ensure_ascii=False, indent=2),
+                backend.prover_prompts[2],
+            )
+            manifest = json.loads(
+                (resumed.state_dir / "run.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(manifest["attempts"][2]["base_attempt"], 1)
+            events = [
+                json.loads(line)
+                for line in (resumed.state_dir / "events.jsonl")
+                .read_text(encoding="utf-8")
+                .splitlines()
+            ]
+            self.assertTrue(
+                any(
+                    event.get("event") == "working_candidate_restored"
+                    and event.get("attempt") == 1
+                    for event in events
+                )
+            )
+
+    def test_codex_protocol_resume_fails_closed_for_invalid_candidate_artifacts(self) -> None:
+        invalid_check_values = {
+            "empty-check": {},
+            "missing-ok": {
+                "returncode": 1,
+                "output": "x",
+                "command": [],
+            },
+            "missing-returncode": {
+                "ok": False,
+                "output": "x",
+                "command": [],
+            },
+            "missing-output": {
+                "ok": False,
+                "returncode": 1,
+                "command": [],
+            },
+            "missing-command": {
+                "ok": False,
+                "returncode": 1,
+                "output": "x",
+            },
+            "string-ok": {
+                "ok": "false",
+                "returncode": 1,
+                "output": "x",
+                "command": [],
+            },
+            "string-returncode": {
+                "ok": False,
+                "returncode": "1",
+                "output": "x",
+                "command": [],
+            },
+            "bool-returncode": {
+                "ok": False,
+                "returncode": True,
+                "output": "x",
+                "command": [],
+            },
+            "list-output": {
+                "ok": False,
+                "returncode": 1,
+                "output": [],
+                "command": [],
+            },
+            "string-command": {
+                "ok": False,
+                "returncode": 1,
+                "output": "x",
+                "command": "lake",
+            },
+            "non-string-command-element": {
+                "ok": False,
+                "returncode": 1,
+                "output": "x",
+                "command": ["lake", 1],
+            },
+        }
+        for mutation, expected_error in (
+            ("missing", "Resume candidate is missing"),
+            ("hash-mismatch", "Resume candidate hash mismatch"),
+            ("missing-check", "Resume candidate check is missing"),
+            ("malformed-check", "Resume candidate check is invalid"),
+            *(
+                (mutation, "Resume candidate check is invalid")
+                for mutation in invalid_check_values
+            ),
+        ):
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as directory:
+                project, target = self._project(
+                    Path(directory), "example : True := by exact original_missing\n"
+                )
+
+                def checker(
+                    project: Path, target: Path, timeout: int, lake: str
+                ) -> LeanCheck:
+                    return LeanCheck(False, 1, "missing", ())
+
+                config = ApiConfig(
+                    api_base="",
+                    api_key="",
+                    model="gpt-5.6-sol",
+                    mode="subscription",
+                    timeout_seconds=10,
+                    curl_executable="",
+                    reasoning_effort="high",
+                )
+                first = run_structured_workflow(
+                    project=project,
+                    target=target,
+                    task="fix proof",
+                    plan_config=config,
+                    prove_config=config,
+                    review_config=config,
+                    max_attempts=2,
+                    max_attempts_per_step=2,
+                    lean_timeout_seconds=10,
+                    lake_executable="lake",
+                    lean_checker=checker,
+                    agent_backend=_CodexWorkflowBackend(
+                        ["example : True := by exact candidate_marker\n", None]
+                    ),
+                    agent_backend_id="codex-subscription",
+                )
+                candidate = first.state_dir / "attempts" / "001" / "candidate.lean"
+                candidate_check = first.state_dir / "attempts" / "001" / "check.json"
+                if mutation == "missing":
+                    candidate.unlink()
+                elif mutation == "hash-mismatch":
+                    candidate.write_text(
+                        "example : True := by exact tampered\n", encoding="utf-8"
+                    )
+                elif mutation == "missing-check":
+                    candidate_check.unlink()
+                elif mutation == "malformed-check":
+                    candidate_check.write_text("{malformed\n", encoding="utf-8")
+                else:
+                    candidate_check.write_text(
+                        json.dumps(invalid_check_values[mutation]) + "\n",
+                        encoding="utf-8",
+                    )
+
+                with self.assertRaisesRegex(ValueError, expected_error):
+                    run_structured_workflow(
+                        project=project,
+                        target=target,
+                        task="fix proof",
+                        plan_config=config,
+                        prove_config=config,
+                        review_config=config,
+                        max_attempts=3,
+                        max_attempts_per_step=3,
+                        lean_timeout_seconds=10,
+                        lake_executable="lake",
+                        resume_run_id=first.run_id,
+                        lean_checker=checker,
+                        agent_backend=_CodexWorkflowBackend(
+                            ["example : True := by trivial\n"]
+                        ),
+                        agent_backend_id="codex-subscription",
+                    )
+
+    def test_codex_pure_protocol_failures_report_no_valid_candidate(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            project, target = self._project(
+                Path(directory), "example : True := by exact missing\n"
+            )
+
+            def checker(project: Path, target: Path, timeout: int, lake: str) -> LeanCheck:
+                return LeanCheck(False, 1, "missing", ())
+
+            config = ApiConfig(
+                api_base="",
+                api_key="",
+                model="gpt-5.6-sol",
+                mode="subscription",
+                timeout_seconds=10,
+                curl_executable="",
+                reasoning_effort="high",
+            )
+            result = run_structured_workflow(
+                project=project,
+                target=target,
+                task="fix proof",
+                plan_config=config,
+                prove_config=config,
+                review_config=config,
+                max_attempts=2,
+                max_attempts_per_step=2,
+                lean_timeout_seconds=10,
+                lake_executable="lake",
+                lean_checker=checker,
+                agent_backend=_CodexWorkflowBackend([None, None]),
+                agent_backend_id="codex-subscription",
+            )
+
+            manifest = json.loads(
+                (result.state_dir / "run.json").read_text(encoding="utf-8")
+            )
+            self.assertFalse(result.ok)
+            self.assertEqual(
+                manifest["error"],
+                "Prover output did not produce a valid Lean candidate within the "
+                "configured candidate budgets.",
+            )
+            self.assertTrue(
+                all(row["candidate_sha256"] is None for row in manifest["attempts"])
+            )
+
+    def test_codex_mixed_candidate_and_protocol_failures_are_reported_accurately(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            project, target = self._project(
+                Path(directory), "example : True := by exact missing\n"
+            )
+
+            def checker(project: Path, target: Path, timeout: int, lake: str) -> LeanCheck:
+                return LeanCheck(False, 1, "missing", ())
+
+            config = ApiConfig(
+                api_base="",
+                api_key="",
+                model="gpt-5.6-sol",
+                mode="subscription",
+                timeout_seconds=10,
+                curl_executable="",
+                reasoning_effort="high",
+            )
+            result = run_structured_workflow(
+                project=project,
+                target=target,
+                task="fix proof",
+                plan_config=config,
+                prove_config=config,
+                review_config=config,
+                max_attempts=2,
+                max_attempts_per_step=2,
+                lean_timeout_seconds=10,
+                lake_executable="lake",
+                lean_checker=checker,
+                agent_backend=_CodexWorkflowBackend(
+                    ["example : True := by exact missing\n", None]
+                ),
+                agent_backend_id="codex-subscription",
+            )
+
+            manifest = json.loads(
+                (result.state_dir / "run.json").read_text(encoding="utf-8")
+            )
+            self.assertFalse(result.ok)
+            self.assertEqual(
+                manifest["error"],
+                "Candidate budgets were exhausted after both Lean candidate validation "
+                "failures and Prover output protocol failures.",
+            )
+            self.assertIsNotNone(manifest["attempts"][0]["candidate_sha256"])
+            self.assertEqual(
+                manifest["attempts"][1]["failure_stage"],
+                "prover_output_protocol",
+            )
+
+    def test_codex_mixed_protocol_failure_keep_failed_uses_latest_candidate(self) -> None:
+        original = "example : True := by exact original_missing\n"
+        candidate = "example : True := by exact candidate_marker\n"
+        with tempfile.TemporaryDirectory() as directory:
+            project, target = self._project(Path(directory), original)
+
+            def checker(project: Path, target: Path, timeout: int, lake: str) -> LeanCheck:
+                source = target.read_text(encoding="utf-8")
+                diagnostics = (
+                    "CANDIDATE_DIAGNOSTIC"
+                    if "candidate_marker" in source
+                    else "ORIGINAL_DIAGNOSTIC"
+                )
+                return LeanCheck(False, 1, diagnostics, ())
+
+            config = ApiConfig(
+                api_base="",
+                api_key="",
+                model="gpt-5.6-sol",
+                mode="subscription",
+                timeout_seconds=10,
+                curl_executable="",
+                reasoning_effort="high",
+            )
+            result = run_structured_workflow(
+                project=project,
+                target=target,
+                task="fix proof",
+                plan_config=config,
+                prove_config=config,
+                review_config=config,
+                max_attempts=2,
+                max_attempts_per_step=2,
+                lean_timeout_seconds=10,
+                lake_executable="lake",
+                keep_failed=True,
+                lean_checker=checker,
+                agent_backend=_CodexWorkflowBackend([candidate, None]),
+                agent_backend_id="codex-subscription",
+            )
+
+            self.assertFalse(result.ok)
+            self.assertFalse(result.restored)
+            self.assertEqual(target.read_text(encoding="utf-8"), candidate)
+
+    def test_codex_pure_protocol_keep_failed_preserves_safe_source(self) -> None:
+        original = "example : True := by exact original_missing\n"
+        with tempfile.TemporaryDirectory() as directory:
+            project, target = self._project(Path(directory), original)
+
+            def checker(project: Path, target: Path, timeout: int, lake: str) -> LeanCheck:
+                return LeanCheck(False, 1, "ORIGINAL_DIAGNOSTIC", ())
+
+            config = ApiConfig(
+                api_base="",
+                api_key="",
+                model="gpt-5.6-sol",
+                mode="subscription",
+                timeout_seconds=10,
+                curl_executable="",
+                reasoning_effort="high",
+            )
+            result = run_structured_workflow(
+                project=project,
+                target=target,
+                task="fix proof",
+                plan_config=config,
+                prove_config=config,
+                review_config=config,
+                max_attempts=2,
+                max_attempts_per_step=2,
+                lean_timeout_seconds=10,
+                lake_executable="lake",
+                keep_failed=True,
+                lean_checker=checker,
+                agent_backend=_CodexWorkflowBackend([None, None]),
+                agent_backend_id="codex-subscription",
+            )
+
+            self.assertFalse(result.ok)
+            self.assertFalse(result.restored)
+            self.assertEqual(target.read_text(encoding="utf-8"), original)
+
+    def test_codex_reviewer_and_protocol_failures_are_reported_accurately(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            project, target = self._project(
+                Path(directory), "example : True := by exact original_missing\n"
+            )
+
+            def checker(project: Path, target: Path, timeout: int, lake: str) -> LeanCheck:
+                ok = "by trivial" in target.read_text(encoding="utf-8")
+                return LeanCheck(ok, 0 if ok else 1, "" if ok else "missing", ())
+
+            config = ApiConfig(
+                api_base="",
+                api_key="",
+                model="gpt-5.6-sol",
+                mode="subscription",
+                timeout_seconds=10,
+                curl_executable="",
+                reasoning_effort="high",
+            )
+            result = run_structured_workflow(
+                project=project,
+                target=target,
+                task="fix proof",
+                plan_config=config,
+                prove_config=config,
+                review_config=config,
+                max_attempts=2,
+                max_attempts_per_step=2,
+                lean_timeout_seconds=10,
+                lake_executable="lake",
+                lean_checker=checker,
+                agent_backend=_CodexWorkflowBackend(
+                    ["example : True := by trivial\n", None],
+                    reviewer_verdict="retry",
+                ),
+                agent_backend_id="codex-subscription",
+            )
+
+            manifest = json.loads(
+                (result.state_dir / "run.json").read_text(encoding="utf-8")
+            )
+            self.assertFalse(result.ok)
+            self.assertEqual(manifest["attempts"][0]["check_ok"], True)
+            self.assertEqual(manifest["attempts"][0]["review_verdict"], "retry")
+            self.assertEqual(
+                manifest["error"],
+                "Candidate budgets were exhausted after both Reviewer rejection of "
+                "Lean-valid candidates and Prover output protocol failures.",
+            )
+            self.assertNotIn("Lean candidate validation failures", manifest["error"])
+
+    def test_codex_lean_reviewer_and_protocol_failures_are_all_reported(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            project, target = self._project(
+                Path(directory), "example : True := by exact original_missing\n"
+            )
+
+            def checker(project: Path, target: Path, timeout: int, lake: str) -> LeanCheck:
+                source = target.read_text(encoding="utf-8")
+                ok = "by trivial" in source
+                return LeanCheck(ok, 0 if ok else 1, "" if ok else "missing", ())
+
+            config = ApiConfig(
+                api_base="",
+                api_key="",
+                model="gpt-5.6-sol",
+                mode="subscription",
+                timeout_seconds=10,
+                curl_executable="",
+                reasoning_effort="high",
+            )
+            result = run_structured_workflow(
+                project=project,
+                target=target,
+                task="fix proof",
+                plan_config=config,
+                prove_config=config,
+                review_config=config,
+                max_attempts=3,
+                max_attempts_per_step=3,
+                lean_timeout_seconds=10,
+                lake_executable="lake",
+                lean_checker=checker,
+                agent_backend=_CodexWorkflowBackend(
+                    [
+                        "example : True := by exact missing\n",
+                        "example : True := by trivial\n",
+                        None,
+                    ],
+                    reviewer_verdict="retry",
+                ),
+                agent_backend_id="codex-subscription",
+            )
+
+            manifest = json.loads(
+                (result.state_dir / "run.json").read_text(encoding="utf-8")
+            )
+            self.assertFalse(result.ok)
+            self.assertEqual(
+                manifest["error"],
+                "Candidate budgets were exhausted after Lean candidate validation "
+                "failures, Reviewer rejection of Lean-valid candidates, and Prover "
+                "output protocol failures.",
+            )
 
     def test_new_formal_goal_is_required_only_on_final_plan_step(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

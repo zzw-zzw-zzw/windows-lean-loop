@@ -1,0 +1,1 @@
+fixture client exited before the result could be trusted

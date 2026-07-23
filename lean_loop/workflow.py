@@ -56,6 +56,11 @@ WorkflowCreatedCallback = Callable[[str], None]
 BackendIdentityCallback = Callable[[dict[str, Any]], None]
 
 IMPORT_POLICIES = {"auto", "proof-first", "precise", "broad"}
+_RECOVERABLE_CODEX_PROVER_OUTPUT_FAILURES = {
+    "empty_output",
+    "malformed_output",
+    "output_protocol_incompatible",
+}
 _TOP_LEVEL_DECLARATION_RE = re.compile(
     r"^\s*(?:theorem|lemma|def|abbrev|structure|class|inductive|example)\b",
     re.MULTILINE,
@@ -64,6 +69,16 @@ _FORMAL_DECLARATION_RE = re.compile(
     r"^\s*theorem\s+(?P<name>[A-Za-z_][A-Za-z0-9_'.]*)\b"
 )
 _DECLARATION_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_'.]*$")
+
+
+def _recoverable_codex_prover_output_failure(error: ApiError) -> bool:
+    metadata = getattr(error, "metadata", None)
+    return (
+        getattr(error, "kind", None) in _RECOVERABLE_CODEX_PROVER_OUTPUT_FAILURES
+        and isinstance(metadata, dict)
+        and metadata.get("backend_id") == "codex-subscription"
+        and metadata.get("exit_code") == 0
+    )
 
 
 def _qualify_formal_declaration(declaration: str) -> str:
@@ -231,6 +246,33 @@ def _archived_candidate_source(
     if not expected_sha or source_sha != expected_sha:
         raise ValueError(f"Resume candidate hash mismatch: {candidate_path}")
     return source, source_sha
+
+
+def _archived_candidate_check(store: WorkflowStore, attempt: int) -> LeanCheck:
+    check_path = store.paths.attempt_dir(attempt) / "check.json"
+    if not check_path.is_file():
+        raise ValueError(f"Resume candidate check is missing: {check_path}")
+    try:
+        value = read_json(check_path)
+        if not isinstance(value, dict):
+            raise TypeError("candidate check must be a JSON object")
+        required_fields = {"ok", "returncode", "output", "command"}
+        if not required_fields.issubset(value):
+            raise TypeError("candidate check is missing required fields")
+        if type(value["ok"]) is not bool:
+            raise TypeError("candidate check ok must be a boolean")
+        if type(value["returncode"]) is not int:
+            raise TypeError("candidate check returncode must be an integer")
+        if type(value["output"]) is not str:
+            raise TypeError("candidate check output must be a string")
+        command = value["command"]
+        if type(command) is not list or any(
+            type(part) is not str for part in command
+        ):
+            raise TypeError("candidate check command must be a string list")
+        return _check_from_json(value)
+    except (OSError, TypeError, ValueError) as exc:
+        raise ValueError(f"Resume candidate check is invalid: {check_path}") from exc
 
 
 def _accepted_attempt_row(
@@ -480,7 +522,7 @@ def _resume_replan_reason(
         check_path = store.paths.attempt_dir(number) / "check.json"
         if not check_path.is_file():
             return None
-        output = str(read_json(check_path).get("output") or "")
+        output = _archived_candidate_check(store, number).output
         diagnostics.append(" ".join(output.split()))
     if diagnostics[0] and diagnostics[0] == diagnostics[1]:
         return "repeated_diagnostics"
@@ -1169,8 +1211,18 @@ def run_structured_workflow(
             if step_row.get("rejected_checkpoint") and isinstance(prior_global_review, dict):
                 last_review = prior_global_review
             elif prior_attempts:
-                review_path = store.paths.reviews / f"{int(prior_attempts[-1]):03d}.json"
-                last_review = read_json(review_path) if review_path.is_file() else last_review
+                prior_attempt = int(prior_attempts[-1])
+                review_path = store.paths.reviews / f"{prior_attempt:03d}.json"
+                if review_path.is_file():
+                    last_review = read_json(review_path)
+                elif (
+                    attempt_rows
+                    and int(attempt_rows[-1].get("attempt") or 0) == prior_attempt
+                    and attempt_rows[-1].get("failure_stage")
+                    == "prover_output_protocol"
+                    and isinstance(previous_manifest.get("final_review"), dict)
+                ):
+                    last_review = dict(previous_manifest["final_review"])
             else:
                 last_review = {
                     "verdict": "retry",
@@ -1196,12 +1248,29 @@ def run_structured_workflow(
             working_source = target.read_text(encoding="utf-8")
             working_base_attempt: int | None = None
             archived_base_attempt: int | None = None
-            if prior_attempts:
-                archived_base_attempt = int(prior_attempts[-1])
+            for prior_attempt in reversed(prior_attempts):
+                prior_attempt_number = int(prior_attempt)
+                prior_attempt_row = next(
+                    (
+                        row
+                        for row in attempt_rows
+                        if int(row.get("attempt") or 0) == prior_attempt_number
+                    ),
+                    None,
+                )
+                if prior_attempt_row is None:
+                    raise ValueError(
+                        "Resume attempt is missing from the workflow manifest: "
+                        f"{prior_attempt_number}"
+                    )
+                if prior_attempt_row.get("candidate_sha256"):
+                    archived_base_attempt = prior_attempt_number
+                    break
             if archived_base_attempt is not None:
                 working_source, working_source_sha = _archived_candidate_source(
                     store, attempt_rows, archived_base_attempt
                 )
+                last_check = _archived_candidate_check(store, archived_base_attempt)
                 working_base_attempt = archived_base_attempt
                 store.event(
                     "working_candidate_restored",
@@ -1396,6 +1465,85 @@ def run_structured_workflow(
                 except ApiError as exc:
                     prover_error = exc
                 if prover_error is not None:
+                    if _recoverable_codex_prover_output_failure(prover_error):
+                        consecutive_prover_api_failures = 0
+                        attempt = candidate_attempt
+                        step_attempt = candidate_step_attempt
+                        attempt_dir = store.paths.attempt_dir(attempt)
+                        attempt_dir.mkdir(parents=True, exist_ok=False)
+                        atomic_write_json(attempt_dir / "retrieval.json", retrieval)
+                        protocol_failure = {
+                            "attempt": attempt,
+                            "step_index": step_index,
+                            "step_id": active_step["id"],
+                            "step_attempt": step_attempt,
+                            "stage": "prover_output_protocol",
+                            "error_kind": getattr(prover_error, "kind", None),
+                            "error": str(prover_error),
+                            "process_exit_code": getattr(
+                                prover_error, "metadata", {}
+                            ).get("exit_code"),
+                        }
+                        atomic_write_json(
+                            attempt_dir / "protocol-failure.json", protocol_failure
+                        )
+                        attempt_row = {
+                            "attempt": attempt,
+                            "step_index": step_index,
+                            "step_id": active_step["id"],
+                            "step_attempt": step_attempt,
+                            "candidate_sha256": None,
+                            "check_ok": False,
+                            "returncode": None,
+                            "review_verdict": "not_run",
+                            "prover_error": str(prover_error),
+                            "failure_stage": "prover_output_protocol",
+                            "error_kind": getattr(prover_error, "kind", None),
+                            "artifacts": {
+                                "retrieval": str(attempt_dir / "retrieval.json"),
+                                "protocol_failure": str(
+                                    attempt_dir / "protocol-failure.json"
+                                ),
+                            },
+                        }
+                        attempt_rows.append(attempt_row)
+                        step_row["attempts"].append(attempt)
+                        last_review = {
+                            "verdict": "retry",
+                            "summary": (
+                                "The Prover process completed, but its output did not "
+                                "contain one unique result matching the Lean-file contract."
+                            ),
+                            "failure_analysis": [str(prover_error)],
+                            "next_actions": [
+                                "Return exactly one complete Lean file using the required output contract."
+                            ],
+                            "search_terms": [],
+                        }
+                        store.update(
+                            attempts=attempt_rows,
+                            steps=step_rows,
+                            final_review=last_review,
+                            phase="prove",
+                        )
+                        store.event(
+                            "prover_output_rejected",
+                            attempt=attempt,
+                            step_index=step_index,
+                            step_id=active_step["id"],
+                            step_attempt=step_attempt,
+                            error_kind=getattr(prover_error, "kind", None),
+                        )
+                        store.event(
+                            "phase_completed",
+                            phase="prove",
+                            attempt=attempt,
+                            step_index=step_index,
+                            step_id=active_step["id"],
+                            check_ok=False,
+                            failure_stage="prover_output_protocol",
+                        )
+                        continue
                     consecutive_prover_api_failures += 1
                     failure_root = store.paths.root / "api-failures"
                     failure_root.mkdir(parents=True, exist_ok=True)
@@ -1911,15 +2059,82 @@ def run_structured_workflow(
             )
             current_sha = safe_sha
         else:
-            if attempt_rows:
-                failed_candidate = store.paths.attempt_dir(
-                    int(attempt_rows[-1]["attempt"])
-                ) / "candidate.lean"
-                if failed_candidate.is_file():
-                    atomic_write_text(
-                        target, failed_candidate.read_text(encoding="utf-8")
-                    )
+            failed_candidate_attempt = next(
+                (
+                    int(row.get("attempt") or 0)
+                    for row in reversed(attempt_rows)
+                    if row.get("candidate_sha256")
+                ),
+                None,
+            )
+            if failed_candidate_attempt is not None:
+                failed_candidate, _ = _archived_candidate_source(
+                    store, attempt_rows, failed_candidate_attempt
+                )
+                atomic_write_text(target, failed_candidate)
             current_sha = sha256_text(target.read_text(encoding="utf-8"))
+        failed_step_indexes = {
+            int(row["index"])
+            for row in step_rows
+            if row.get("status") in {"failed", "stopped"}
+        }
+        failure_attempt_rows = [
+            row
+            for row in attempt_rows
+            if int(row.get("step_index") or 0) in failed_step_indexes
+        ]
+        has_protocol_failure = any(
+            row.get("failure_stage") == "prover_output_protocol"
+            for row in failure_attempt_rows
+        )
+        has_lean_validation_failure = any(
+            row.get("candidate_sha256") and row.get("check_ok") is False
+            for row in failure_attempt_rows
+        )
+        has_reviewer_rejection = any(
+            row.get("candidate_sha256")
+            and row.get("check_ok") is True
+            and row.get("review_verdict") != "accept"
+            for row in failure_attempt_rows
+        )
+        if all_steps_succeeded:
+            failure_error = "Global final audit did not accept the complete proof."
+        elif failure_attempt_rows and all(
+            row.get("failure_stage") == "prover_output_protocol"
+            and not row.get("candidate_sha256")
+            for row in failure_attempt_rows
+        ):
+            failure_error = (
+                "Prover output did not produce a valid Lean candidate within the "
+                "configured candidate budgets."
+            )
+        elif (
+            has_protocol_failure
+            and has_lean_validation_failure
+            and has_reviewer_rejection
+        ):
+            failure_error = (
+                "Candidate budgets were exhausted after Lean candidate validation "
+                "failures, Reviewer rejection of Lean-valid candidates, and Prover "
+                "output protocol failures."
+            )
+        elif has_protocol_failure and has_lean_validation_failure:
+            failure_error = (
+                "Candidate budgets were exhausted after both Lean candidate validation "
+                "failures and Prover output protocol failures."
+            )
+        elif has_protocol_failure and has_reviewer_rejection:
+            failure_error = (
+                "Candidate budgets were exhausted after both Reviewer rejection of "
+                "Lean-valid candidates and Prover output protocol failures."
+            )
+        elif has_protocol_failure:
+            failure_error = (
+                "Candidate budgets were exhausted after Prover output protocol failures "
+                "and other recorded attempt failures."
+            )
+        else:
+            failure_error = "Lean did not pass within the configured candidate budgets."
         timing_summary = timings.finish("failed")
         store.update(
             status="failed",
@@ -1927,11 +2142,7 @@ def run_structured_workflow(
             current_sha256=current_sha,
             restored=restored,
             restored_to_checkpoint=safe_checkpoint,
-            error=(
-                "Global final audit did not accept the complete proof."
-                if all_steps_succeeded
-                else "Lean did not pass within the configured candidate budgets."
-            ),
+            error=failure_error,
             timings=timing_summary,
         )
         store.event(

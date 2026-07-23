@@ -1,0 +1,57 @@
+{
+  "source": {
+    "cli_version": "codex-cli 0.144.4",
+    "description": "Minimal event envelopes derived from the two Issue #4 failure artifacts; prompts, proof text, paths, identifiers, and credentials were replaced.",
+    "contains_credentials": false
+  },
+  "cases": {
+    "current_multi_message": {
+      "stdout": "current-multi-message.jsonl",
+      "stderr": "stderr-noise.txt",
+      "exit_code": 0,
+      "expected_content": "import Mathlib\n\nexample : True := by\n  trivial\n"
+    },
+    "legacy_single_message": {
+      "stdout": "legacy-single-message.jsonl",
+      "stderr": null,
+      "exit_code": 0,
+      "expected_content": "import Mathlib\n\nexample : True := by\n  trivial\n"
+    },
+    "no_final": {
+      "stdout": "no-final.jsonl",
+      "stderr": null,
+      "exit_code": 0,
+      "expected_kind": "output_protocol_incompatible"
+    },
+    "duplicate_final": {
+      "stdout": "duplicate-final.jsonl",
+      "stderr": null,
+      "exit_code": 0,
+      "expected_kind": "output_protocol_incompatible"
+    },
+    "truncated_no_terminal": {
+      "stdout": "truncated-no-terminal.jsonl",
+      "stderr": null,
+      "exit_code": 0,
+      "expected_kind": "output_protocol_incompatible"
+    },
+    "malformed_event": {
+      "stdout": "malformed-event.jsonl",
+      "stderr": null,
+      "exit_code": 0,
+      "expected_kind": "malformed_output"
+    },
+    "tool_events_with_final": {
+      "stdout": "tool-events-with-final.jsonl",
+      "stderr": null,
+      "exit_code": 0,
+      "expected_content": "import Mathlib\n\nexample : True := by\n  trivial\n"
+    },
+    "nonzero_with_valid_final": {
+      "stdout": "nonzero-with-valid-final.jsonl",
+      "stderr": "nonzero-stderr.txt",
+      "exit_code": 9,
+      "expected_kind": "nonzero_exit"
+    }
+  }
+}
