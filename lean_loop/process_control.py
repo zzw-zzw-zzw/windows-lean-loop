@@ -1,13 +1,123 @@
 from __future__ import annotations
 
+import ctypes
+import errno
 import os
 import queue
+import shutil
 import signal
 import subprocess
+import sys
 import threading
 import time
+import uuid
 from pathlib import Path
 from typing import Callable, Mapping, Protocol, Sequence
+
+
+_WINDOWS_JOB_HANDLE_ATTRIBUTE = "_lean_loop_job_handle"
+_WINDOWS_START_GATE_HANDLE_ATTRIBUTE = "_lean_loop_start_gate_handle"
+_JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
+_JOB_OBJECT_EXTENDED_LIMIT_INFORMATION_CLASS = 9
+_WINDOWS_SYNCHRONIZE = 0x00100000
+_WINDOWS_WAIT_OBJECT_0 = 0
+_WINDOWS_JOB_WRAPPER = """
+import ctypes
+import subprocess
+import sys
+
+kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+kernel32.OpenEventW.argtypes = [ctypes.c_ulong, ctypes.c_int, ctypes.c_wchar_p]
+kernel32.OpenEventW.restype = ctypes.c_void_p
+kernel32.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
+kernel32.WaitForSingleObject.restype = ctypes.c_ulong
+kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+kernel32.CloseHandle.restype = ctypes.c_int
+gate = kernel32.OpenEventW(0x00100000, False, sys.argv[1])
+if not gate:
+    raise ctypes.WinError(ctypes.get_last_error())
+try:
+    if kernel32.WaitForSingleObject(gate, 30000) != 0:
+        raise TimeoutError("Timed out waiting for the process-tree safety gate")
+finally:
+    kernel32.CloseHandle(gate)
+child = subprocess.Popen(
+    sys.argv[2:],
+    stdin=sys.stdin,
+    stdout=sys.stdout,
+    stderr=sys.stderr,
+)
+raise SystemExit(child.wait())
+""".strip()
+
+
+if os.name == "nt":
+    class _JobObjectBasicLimitInformation(ctypes.Structure):
+        _fields_ = [
+            ("PerProcessUserTimeLimit", ctypes.c_longlong),
+            ("PerJobUserTimeLimit", ctypes.c_longlong),
+            ("LimitFlags", ctypes.c_ulong),
+            ("MinimumWorkingSetSize", ctypes.c_size_t),
+            ("MaximumWorkingSetSize", ctypes.c_size_t),
+            ("ActiveProcessLimit", ctypes.c_ulong),
+            ("Affinity", ctypes.c_size_t),
+            ("PriorityClass", ctypes.c_ulong),
+            ("SchedulingClass", ctypes.c_ulong),
+        ]
+
+
+    class _IoCounters(ctypes.Structure):
+        _fields_ = [
+            ("ReadOperationCount", ctypes.c_ulonglong),
+            ("WriteOperationCount", ctypes.c_ulonglong),
+            ("OtherOperationCount", ctypes.c_ulonglong),
+            ("ReadTransferCount", ctypes.c_ulonglong),
+            ("WriteTransferCount", ctypes.c_ulonglong),
+            ("OtherTransferCount", ctypes.c_ulonglong),
+        ]
+
+
+    class _JobObjectExtendedLimitInformation(ctypes.Structure):
+        _fields_ = [
+            ("BasicLimitInformation", _JobObjectBasicLimitInformation),
+            ("IoInfo", _IoCounters),
+            ("ProcessMemoryLimit", ctypes.c_size_t),
+            ("JobMemoryLimit", ctypes.c_size_t),
+            ("PeakProcessMemoryUsed", ctypes.c_size_t),
+            ("PeakJobMemoryUsed", ctypes.c_size_t),
+        ]
+
+
+    def _windows_kernel32():
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CreateJobObjectW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p]
+        kernel32.CreateJobObjectW.restype = ctypes.c_void_p
+        kernel32.CreateEventW.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_wchar_p,
+        ]
+        kernel32.CreateEventW.restype = ctypes.c_void_p
+        kernel32.SetEvent.argtypes = [ctypes.c_void_p]
+        kernel32.SetEvent.restype = ctypes.c_int
+        kernel32.SetInformationJobObject.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.c_void_p,
+            ctypes.c_ulong,
+        ]
+        kernel32.SetInformationJobObject.restype = ctypes.c_int
+        kernel32.AssignProcessToJobObject.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+        ]
+        kernel32.AssignProcessToJobObject.restype = ctypes.c_int
+        kernel32.TerminateJobObject.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+        kernel32.TerminateJobObject.restype = ctypes.c_int
+        kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+        kernel32.CloseHandle.restype = ctypes.c_int
+        return kernel32
 
 
 class ProcessCancelled(RuntimeError):
@@ -43,28 +153,143 @@ class ProcessControl(Protocol):
     def process_finished(self, pid: int) -> None: ...
 
 
-def terminate_process_tree(process: subprocess.Popen[str]) -> None:
-    if process.poll() is not None:
+def _attach_windows_job(process: subprocess.Popen[str]) -> None:
+    if os.name != "nt":
         return
-    if os.name == "nt":
-        subprocess.run(
-            ["taskkill.exe", "/PID", str(process.pid), "/T", "/F"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            check=False,
+    process_handle = getattr(process, "_handle", None)
+    if not isinstance(process_handle, int):
+        return
+    kernel32 = _windows_kernel32()
+    job_handle = kernel32.CreateJobObjectW(None, None)
+    if not job_handle:
+        raise ctypes.WinError()
+    information = _JobObjectExtendedLimitInformation()
+    information.BasicLimitInformation.LimitFlags = (
+        _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+    )
+    if not kernel32.SetInformationJobObject(
+        job_handle,
+        _JOB_OBJECT_EXTENDED_LIMIT_INFORMATION_CLASS,
+        ctypes.byref(information),
+        ctypes.sizeof(information),
+    ):
+        error = ctypes.get_last_error()
+        kernel32.CloseHandle(job_handle)
+        raise ctypes.WinError(error)
+    if not kernel32.AssignProcessToJobObject(job_handle, process_handle):
+        error = ctypes.get_last_error()
+        kernel32.CloseHandle(job_handle)
+        raise ctypes.WinError(error)
+    setattr(process, _WINDOWS_JOB_HANDLE_ATTRIBUTE, job_handle)
+
+
+def _create_windows_start_gate(
+    command: Sequence[str],
+) -> tuple[list[str], int | None]:
+    if os.name != "nt":
+        return list(command), None
+    kernel32 = _windows_kernel32()
+    event_name = (
+        f"Local\\LeanLoopProcessStart-{os.getpid()}-{uuid.uuid4().hex}"
+    )
+    gate_handle = kernel32.CreateEventW(None, True, False, event_name)
+    if not gate_handle:
+        raise ctypes.WinError(ctypes.get_last_error())
+    return [
+        sys.executable,
+        "-c",
+        _WINDOWS_JOB_WRAPPER,
+        event_name,
+        *command,
+    ], gate_handle
+
+
+def _ensure_windows_command_available(
+    command: Sequence[str],
+    *,
+    cwd: Path | None,
+    env: Mapping[str, str] | None,
+) -> None:
+    if os.name != "nt" or not command:
+        return
+    executable = str(command[0])
+    candidate = Path(executable)
+    if candidate.is_absolute() or candidate.parent != Path("."):
+        resolved = (
+            candidate
+            if candidate.is_absolute()
+            else (cwd or Path.cwd()) / candidate
         )
-        if process.poll() is None:
-            process.kill()
+        available = resolved.is_file()
     else:
-        try:
-            os.killpg(process.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
+        search_path = str(env.get("PATH") or "") if env is not None else None
+        available = shutil.which(executable, path=search_path) is not None
+    if not available:
+        raise FileNotFoundError(
+            errno.ENOENT,
+            os.strerror(errno.ENOENT),
+            executable,
+        )
+
+
+def _release_windows_start_gate(process: subprocess.Popen[str]) -> None:
+    if os.name != "nt":
+        return
+    gate_handle = getattr(
+        process, _WINDOWS_START_GATE_HANDLE_ATTRIBUTE, None
+    )
+    if not gate_handle:
+        return
+    if not _windows_kernel32().SetEvent(gate_handle):
+        raise ctypes.WinError(ctypes.get_last_error())
+
+
+def _close_windows_resources(process: subprocess.Popen[str]) -> None:
+    if os.name != "nt":
+        return
+    job_handle = getattr(process, _WINDOWS_JOB_HANDLE_ATTRIBUTE, None)
+    gate_handle = getattr(
+        process, _WINDOWS_START_GATE_HANDLE_ATTRIBUTE, None
+    )
+    setattr(process, _WINDOWS_JOB_HANDLE_ATTRIBUTE, None)
+    setattr(process, _WINDOWS_START_GATE_HANDLE_ATTRIBUTE, None)
+    kernel32 = _windows_kernel32()
+    if job_handle:
+        kernel32.CloseHandle(job_handle)
+    if gate_handle:
+        kernel32.CloseHandle(gate_handle)
+
+
+def terminate_process_tree(process: subprocess.Popen[str]) -> None:
+    job_handle = getattr(process, _WINDOWS_JOB_HANDLE_ATTRIBUTE, None)
     try:
-        process.wait(timeout=2)
+        if os.name == "nt" and job_handle:
+            _windows_kernel32().TerminateJobObject(job_handle, 1)
+        elif os.name == "nt" and process.poll() is None:
+            subprocess.run(
+                ["taskkill.exe", "/PID", str(process.pid), "/T", "/F"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+            if process.poll() is None:
+                process.kill()
+        elif os.name != "nt":
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+    finally:
+        _close_windows_resources(process)
+    try:
+        if process.poll() is None:
+            process.wait(timeout=2)
     except subprocess.TimeoutExpired:
         process.kill()
-        process.wait()
+        try:
+            process.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            pass
 
 
 def run_controlled_process(
@@ -87,19 +312,41 @@ def run_controlled_process(
         )
     creationflags = subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
     process_started_at = time.monotonic()
-    process = subprocess.Popen(
-        list(command),
-        cwd=cwd,
-        stdin=subprocess.PIPE if input_text is not None else None,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        creationflags=creationflags,
-        start_new_session=os.name != "nt",
-        env=dict(env) if env is not None else None,
-    )
+    launch_command = list(command)
+    start_gate_handle: int | None = None
+    if os.name == "nt" and max_output_bytes is not None:
+        _ensure_windows_command_available(command, cwd=cwd, env=env)
+        launch_command, start_gate_handle = _create_windows_start_gate(command)
+    try:
+        process = subprocess.Popen(
+            launch_command,
+            cwd=cwd,
+            stdin=subprocess.PIPE if input_text is not None else None,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            creationflags=creationflags,
+            start_new_session=os.name != "nt",
+            env=dict(env) if env is not None else None,
+        )
+    except Exception:
+        if start_gate_handle:
+            _windows_kernel32().CloseHandle(start_gate_handle)
+        raise
+    if start_gate_handle:
+        setattr(
+            process,
+            _WINDOWS_START_GATE_HANDLE_ATTRIBUTE,
+            start_gate_handle,
+        )
+    try:
+        _attach_windows_job(process)
+        _release_windows_start_gate(process)
+    except Exception:
+        terminate_process_tree(process)
+        raise
     if control is not None:
         try:
             control.process_started(process.pid, kind)
@@ -162,8 +409,7 @@ def run_controlled_process(
         terminate_process_tree(process)
         raise
     finally:
-        if process.poll() is None:
-            terminate_process_tree(process)
+        terminate_process_tree(process)
         if control is not None:
             control.process_finished(process.pid)
 
@@ -222,8 +468,18 @@ def _collect_bounded_process(
                     continue
 
     reader_threads = [
-        threading.Thread(target=drain, args=("stdout", process.stdout), daemon=True),
-        threading.Thread(target=drain, args=("stderr", process.stderr), daemon=True),
+        threading.Thread(
+            target=drain,
+            args=("stdout", process.stdout),
+            name=f"process-stdout-{process.pid}",
+            daemon=True,
+        ),
+        threading.Thread(
+            target=drain,
+            args=("stderr", process.stderr),
+            name=f"process-stderr-{process.pid}",
+            daemon=True,
+        ),
     ]
     for thread in reader_threads:
         thread.start()
@@ -316,14 +572,24 @@ def _collect_bounded_process(
         raise
     finally:
         stop_readers.set()
-        if process.poll() is None:
-            terminate_process_tree(process)
+        terminate_process_tree(process)
+        deadline = time.monotonic() + 2
         if feeder_thread is not None:
-            feeder_thread.join()
+            feeder_thread.join(timeout=max(0, deadline - time.monotonic()))
         for thread in reader_threads:
-            thread.join()
-        process.stdout.close()
-        process.stderr.close()
+            thread.join(timeout=max(0, deadline - time.monotonic()))
+        for pipe in (process.stdin, process.stdout, process.stderr):
+            if pipe is not None:
+                try:
+                    pipe.close()
+                except (BrokenPipeError, OSError, ValueError):
+                    pass
+        for thread in (
+            *((feeder_thread,) if feeder_thread is not None else ()),
+            *reader_threads,
+        ):
+            if thread.is_alive():
+                thread.join(timeout=0.5)
         if control is not None:
             control.process_finished(process.pid)
 
@@ -365,8 +631,18 @@ def _collect_streaming_process(
             lines.put((name, None))
 
     threads = [
-        threading.Thread(target=drain, args=("stdout", process.stdout), daemon=True),
-        threading.Thread(target=drain, args=("stderr", process.stderr), daemon=True),
+        threading.Thread(
+            target=drain,
+            args=("stdout", process.stdout),
+            name=f"process-stdout-{process.pid}",
+            daemon=True,
+        ),
+        threading.Thread(
+            target=drain,
+            args=("stderr", process.stderr),
+            name=f"process-stderr-{process.pid}",
+            daemon=True,
+        ),
     ]
     for thread in threads:
         thread.start()
@@ -409,8 +685,7 @@ def _collect_streaming_process(
         terminate_process_tree(process)
         raise
     finally:
-        if process.poll() is None:
-            terminate_process_tree(process)
+        terminate_process_tree(process)
         for thread in threads:
             thread.join(timeout=1)
         process.stdout.close()

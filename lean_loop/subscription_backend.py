@@ -44,7 +44,18 @@ _SECRET_ENV_PARTS = (
 _SENSITIVE_ENV_PREFIXES = ("LEAN_AGENT_", "OPENAI_", "ANTHROPIC_", "CLAUDE_CODE_")
 _EXTERNAL_OVERRIDE_ENV_PARTS = ("BASE_URL", "GATEWAY", "API_HOST", "ENDPOINT")
 _REDACTED = "<redacted>"
-_BEARER_REDACTION = re.compile(r"(?i)(\bBearer\s+)([^\s\"']+)")
+_BEARER_REDACTION = re.compile(
+    r"""(?ix)
+    (?P<prefix>\bBearer[ \t]+)
+    (?:
+        \\"(?P<escaped_double>(?:\\.|[^"\\])*)\\"
+      | \\'(?P<escaped_single>(?:\\.|[^'\\])*)\\'
+      | "(?P<double>(?:\\.|[^"\\])*)"
+      | '(?P<single>(?:\\.|[^'\\])*)'
+      | (?P<bare>[A-Za-z0-9._~+/=<>\-]{1,})
+    )
+    """
+)
 _SK_REDACTION = re.compile(r"\bsk-[A-Za-z0-9_-]{8,}\b")
 _STANDALONE_TOKEN_REDACTIONS = (
     re.compile(r"\bghp_[A-Za-z0-9]{16,}\b"),
@@ -127,14 +138,29 @@ class SubscriptionBackendError(ApiError):
         self.metadata = dict(metadata or {})
 
 
-def _redact_text(value: str) -> tuple[str, bool]:
-    clean = _BEARER_REDACTION.sub(
-        lambda match: match.group(1) + _REDACTED,
-        value,
-    )
+def _redact_bearer(match: re.Match[str]) -> str:
+    prefix = match.group("prefix")
+    if match.group("escaped_double") is not None:
+        return prefix + '\\"' + _REDACTED + '\\"'
+    if match.group("escaped_single") is not None:
+        return prefix + "\\'" + _REDACTED + "\\'"
+    if match.group("double") is not None:
+        return prefix + '"' + _REDACTED + '"'
+    if match.group("single") is not None:
+        return prefix + "'" + _REDACTED + "'"
+    return prefix + _REDACTED
+
+
+def _redact_standalone_credentials(value: str) -> str:
+    clean = _BEARER_REDACTION.sub(_redact_bearer, value)
     clean = _SK_REDACTION.sub(_REDACTED, clean)
     for pattern in _STANDALONE_TOKEN_REDACTIONS:
         clean = pattern.sub(_REDACTED, clean)
+    return clean
+
+
+def _redact_assignments(value: str) -> str:
+    clean = value
     for pattern in (
         _DOUBLE_QUOTED_FIELD_REDACTION,
         _SINGLE_QUOTED_FIELD_REDACTION,
@@ -144,6 +170,66 @@ def _redact_text(value: str) -> tuple[str, bool]:
             clean,
         )
     clean = _redact_unquoted_sensitive_fields(clean)
+    return clean
+
+
+def _redact_lean_source(value: str) -> str:
+    clean = _redact_standalone_credentials(value)
+    saved: list[str] = []
+    cursor = 0
+    index = 0
+    length = len(clean)
+    while index < length:
+        start = index
+        if clean.startswith("--", index):
+            end = clean.find("\n", index)
+            if end < 0:
+                end = length
+        elif clean.startswith("/-", index):
+            index += 2
+            depth = 1
+            while index < length and depth:
+                if clean.startswith("/-", index):
+                    depth += 1
+                    index += 2
+                elif clean.startswith("-/", index):
+                    depth -= 1
+                    index += 2
+                else:
+                    index += 1
+            end = index
+        elif clean[index] == '"':
+            index += 1
+            escaped = False
+            while index < length:
+                char = clean[index]
+                index += 1
+                if escaped:
+                    escaped = False
+                elif char == "\\":
+                    escaped = True
+                elif char == '"':
+                    break
+            end = index
+        else:
+            index += 1
+            continue
+        saved.append(clean[cursor:start])
+        saved.append(_redact_assignments(clean[start:end]))
+        cursor = end
+        index = end
+    saved.append(clean[cursor:])
+    return "".join(saved)
+
+
+def _redact_text(
+    value: str, *, text_context: str = "generic"
+) -> tuple[str, bool]:
+    clean = (
+        _redact_lean_source(value)
+        if text_context == "lean_source"
+        else _redact_assignments(_redact_standalone_credentials(value))
+    )
     return clean, clean != value
 
 
@@ -154,8 +240,6 @@ def _redact(value: str) -> str:
 def _redact_text_field(match: re.Match[str]) -> str:
     key = match.groupdict().get("quoted_key") or match.groupdict().get("bare_key")
     if not is_sensitive_field_name(key):
-        return match.group(0)
-    if _is_lean_declaration_key(match.string, match.start()):
         return match.group(0)
     if str(match.groupdict().get("value") or "").strip() == _REDACTED:
         return match.group(0)
@@ -179,16 +263,6 @@ def _closing_quote(value: str, start: int, quote: str) -> int | None:
         if char == quote:
             return index
     return None
-
-
-def _is_lean_declaration_key(value: str, position: int) -> bool:
-    local_prefix = value[max(0, position - 64) : position]
-    return bool(
-        re.search(
-            r"\b(?:abbrev|class|def|example|instance|lemma|structure|theorem)\s+$",
-            local_prefix,
-        )
-    )
 
 
 def _field_value_is_exact_redacted(
@@ -248,9 +322,14 @@ def _redact_unquoted_sensitive_fields(value: str) -> str:
                 or match.group("single_quoted_key")
                 or match.group("bare_key")
             )
-            if not is_sensitive_field_name(key, allow_ambiguous=False):
-                continue
-            if _is_lean_declaration_key(line, match.start()):
+            normalized_key = re.sub(
+                r"[^a-z0-9]+",
+                "_",
+                re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", str(key)).lower(),
+            ).strip("_")
+            if normalized_key != "secret" and not is_sensitive_field_name(
+                key, allow_ambiguous=False
+            ):
                 continue
             remainder = line[match.end() :]
             leading_space = remainder[: len(remainder) - len(remainder.lstrip(" \t"))]
@@ -279,7 +358,9 @@ def _redact_unquoted_sensitive_fields(value: str) -> str:
     return "".join(saved_lines)
 
 
-def _redact_json_value(value: Any) -> tuple[Any, bool]:
+def _redact_json_value(
+    value: Any, *, text_context: str = "generic"
+) -> tuple[Any, bool]:
     if isinstance(value, dict):
         redacted: dict[Any, Any] = {}
         changed = False
@@ -288,7 +369,9 @@ def _redact_json_value(value: Any) -> tuple[Any, bool]:
                 redacted[key] = _REDACTED
                 changed = True
             else:
-                redacted_item, item_changed = _redact_json_value(item)
+                redacted_item, item_changed = _redact_json_value(
+                    item, text_context=text_context
+                )
                 redacted[key] = redacted_item
                 changed = changed or item_changed
         return redacted, changed
@@ -296,16 +379,66 @@ def _redact_json_value(value: Any) -> tuple[Any, bool]:
         redacted_items: list[Any] = []
         changed = False
         for item in value:
-            redacted_item, item_changed = _redact_json_value(item)
+            redacted_item, item_changed = _redact_json_value(
+                item, text_context=text_context
+            )
             redacted_items.append(redacted_item)
             changed = changed or item_changed
         return redacted_items, changed
     if isinstance(value, str):
-        return _redact_text(value)
+        return _redact_text(value, text_context=text_context)
     return value, False
 
 
-def _redact_codex_stdout(value: str) -> tuple[str, bool]:
+def _redact_codex_event(
+    event: Mapping[str, Any], *, output_type: str | None
+) -> tuple[dict[Any, Any], bool]:
+    redacted: dict[Any, Any] = {}
+    changed = False
+    agent_item = event.get("item")
+    for key, item in event.items():
+        if is_sensitive_field_name(key):
+            redacted[key] = _REDACTED
+            changed = True
+            continue
+        if (
+            key == "item"
+            and isinstance(agent_item, Mapping)
+            and agent_item.get("type") == "agent_message"
+        ):
+            saved_item: dict[Any, Any] = {}
+            item_changed = False
+            for item_key, item_value in agent_item.items():
+                if is_sensitive_field_name(item_key):
+                    saved_item[item_key] = _REDACTED
+                    item_changed = True
+                elif item_key == "text" and isinstance(item_value, str):
+                    saved_value, value_changed = _redact_text(
+                        item_value,
+                        text_context=(
+                            "lean_source"
+                            if output_type == "lean_file"
+                            else "generic"
+                        ),
+                    )
+                    saved_item[item_key] = saved_value
+                    item_changed = item_changed or value_changed
+                else:
+                    saved_value, value_changed = _redact_json_value(item_value)
+                    saved_item[item_key] = saved_value
+                    item_changed = item_changed or value_changed
+            redacted[key] = saved_item
+            changed = changed or item_changed
+            continue
+        saved_value, value_changed = _redact_json_value(item)
+        redacted[key] = saved_value
+        changed = changed or value_changed
+    return redacted, changed
+
+
+def _redact_codex_stdout(
+    value: str, *, output_type: str | None = None
+) -> tuple[str, bool]:
     if not value:
         return "", False
     has_terminal_newline = value.endswith("\n")
@@ -321,7 +454,12 @@ def _redact_codex_stdout(value: str) -> tuple[str, bool]:
         except json.JSONDecodeError:
             saved_line, changed = _redact_text(line)
         else:
-            redacted_event, changed = _redact_json_value(event)
+            if isinstance(event, Mapping):
+                redacted_event, changed = _redact_codex_event(
+                    event, output_type=output_type
+                )
+            else:
+                redacted_event, changed = _redact_json_value(event)
             saved_line = json.dumps(
                 redacted_event,
                 ensure_ascii=False,
@@ -334,6 +472,39 @@ def _redact_codex_stdout(value: str) -> tuple[str, bool]:
     if has_terminal_newline:
         saved += "\n"
     return saved, redaction_applied
+
+
+def _codex_events_credential_category(
+    events: Sequence[Mapping[str, Any]], *, output_type: str
+) -> str | None:
+    for event in events:
+        item = event.get("item")
+        if isinstance(item, Mapping) and item.get("type") == "agent_message":
+            for key, value in event.items():
+                if key == "item":
+                    continue
+                finding = find_high_confidence_credential({key: value})
+                if finding is not None:
+                    return finding
+            for key, value in item.items():
+                if key == "text" and isinstance(value, str):
+                    finding = find_high_confidence_credential(
+                        value,
+                        text_context=(
+                            "lean_source"
+                            if output_type == "lean_file"
+                            else "generic"
+                        ),
+                    )
+                else:
+                    finding = find_high_confidence_credential({key: value})
+                if finding is not None:
+                    return finding
+            continue
+        finding = find_high_confidence_credential(event)
+        if finding is not None:
+            return finding
+    return None
 
 
 def _diagnostic_preview(value: str) -> str:
@@ -608,7 +779,14 @@ def _codex_tool_evidence(
     sandbox_root: Path,
     protected_root: Path | None,
 ) -> dict[str, Any]:
-    exposure_category = find_high_confidence_credential(events)
+    exposure_category = find_high_confidence_credential(
+        [
+            event["item"]
+            for event in events
+            if isinstance(event.get("item"), Mapping)
+            and str(event["item"].get("type") or "") in _CODEX_TOOL_EVENT_TYPES
+        ]
+    )
     archived: list[dict[str, Any]] = []
     boundary_violations: list[str] = []
     path_redactions = [
@@ -829,8 +1007,11 @@ class _SubscriptionBackend:
         complete_process_stream_observed: bool,
         collection_stop_reason: str,
         output_safety_limit_bytes: int | None = None,
+        output_type: str | None = None,
     ) -> dict[str, Any]:
-        self.last_stdout, stdout_redaction_applied = _redact_codex_stdout(stdout)
+        self.last_stdout, stdout_redaction_applied = _redact_codex_stdout(
+            stdout, output_type=output_type
+        )
         self.last_stderr, stderr_redaction_applied = _redact_text(stderr)
         stream_evidence, self.last_diagnostic_preview = _stream_evidence(
             stdout,
@@ -857,6 +1038,7 @@ class _SubscriptionBackend:
         timeout_seconds: int,
         input_text: str | None = None,
         kind: str,
+        output_type: str | None = None,
     ) -> subprocess.CompletedProcess[str]:
         try:
             return run_controlled_process(
@@ -877,6 +1059,7 @@ class _SubscriptionBackend:
                     complete_process_stream_observed=False,
                     collection_stop_reason="cancelled",
                     output_safety_limit_bytes=self.max_process_output_bytes,
+                    output_type=output_type,
                 )
                 self.last_metadata.update(
                     {
@@ -900,6 +1083,7 @@ class _SubscriptionBackend:
                     complete_process_stream_observed=False,
                     collection_stop_reason="output_safety_limit_exceeded",
                     output_safety_limit_bytes=exc.limit_bytes,
+                    output_type=output_type,
                 )
                 self.last_metadata.update(
                     {
@@ -925,6 +1109,7 @@ class _SubscriptionBackend:
                     complete_process_stream_observed=False,
                     collection_stop_reason="timeout",
                     output_safety_limit_bytes=self.max_process_output_bytes,
+                    output_type=output_type,
                 )
                 self.last_metadata.update(
                     {
@@ -1146,6 +1331,7 @@ class _SubscriptionBackend:
                     timeout_seconds=config.timeout_seconds,
                     input_text=_prompt(request),
                     kind=self.backend_id,
+                    output_type=request.output_type,
                 )
             except ProcessCancelled:
                 manifest = sandbox_manifest()
@@ -1189,6 +1375,7 @@ class _SubscriptionBackend:
                     complete_process_stream_observed=True,
                     collection_stop_reason="completed",
                     output_safety_limit_bytes=self.max_process_output_bytes,
+                    output_type=request.output_type,
                 )
                 metadata = {
                     **metadata,
@@ -1494,7 +1681,10 @@ class CodexSubscriptionBackend(_SubscriptionBackend):
             and isinstance(event.get("item"), dict)
             and event["item"].get("type") == "agent_message"
         ]
-        if find_high_confidence_credential(events) is not None:
+        if (
+            _codex_events_credential_category(events, output_type=output_type)
+            is not None
+        ):
             raise SubscriptionBackendError(
                 "credential_exposure_detected",
                 "Codex result stream contained high-confidence credential material",

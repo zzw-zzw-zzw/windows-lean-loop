@@ -1361,6 +1361,231 @@ class SubscriptionBackendTests(unittest.TestCase):
                 {key: "<redacted>" for key in composite_values},
             )
 
+    def test_codex_preserves_legal_lean_bindings_in_final_and_stream_evidence(
+        self,
+    ) -> None:
+        legal_lean = (
+            "theorem foo (password : Nat) : True := by\n"
+            "  trivial\n\n"
+            "def foo (password : Nat) := password\n\n"
+            "structure Credentials where\n"
+            "  password : String\n\n"
+            "example : True := by\n"
+            "  let password := 1\n"
+            "  trivial\n"
+        )
+        events = (
+            {"type": "thread.started", "thread_id": "legal-lean"},
+            {"type": "turn.started"},
+            {
+                "type": "item.completed",
+                "item": {
+                    "id": "final",
+                    "type": "agent_message",
+                    "text": legal_lean,
+                },
+            },
+            {"type": "turn.completed", "usage": {}},
+        )
+        stdout = "\n".join(json.dumps(event) for event in events) + "\n"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            backend = self._backend("codex", root)
+            backend.inspect(model="gpt-test-pinned", reasoning_effort="low")
+            runtime = AgentRuntime(
+                workflow_root=root / "workflow",
+                run_id="run-legal-lean",
+                backend=backend,
+            )
+            with patch.object(
+                backend,
+                "_run",
+                return_value=subprocess.CompletedProcess(
+                    args=[], returncode=0, stdout=stdout, stderr=""
+                ),
+            ):
+                result = runtime.invoke(
+                    role="prover",
+                    phase="prove",
+                    output_type="lean_file",
+                    config=_config("gpt-test-pinned"),
+                    system_prompt="system",
+                    user_prompt="user",
+                    temp_dir=root / "ignored",
+                )
+            self.assertEqual(result, legal_lean)
+            call_dir = next((root / "workflow" / "agent-calls").iterdir())
+            saved_events = _jsonl_events(
+                (call_dir / "stdout.txt").read_text(encoding="utf-8")
+            )
+            self.assertEqual(saved_events[2]["item"]["text"], legal_lean)
+
+    def test_codex_rejects_quoted_bearers_and_explicit_secret_in_tool_output(
+        self,
+    ) -> None:
+        secrets = ("QUOTEDBEARERDOUBLE", "QUOTEDBEARERSINGLE", "ACTUAL_SECRET")
+        aggregated_output = (
+            f'Bearer "{secrets[0]}" '
+            f"Bearer '{secrets[1]}' "
+            f"secret={secrets[2]} "
+            f"-- def password={secrets[2]}"
+        )
+        events = (
+            {"type": "thread.started", "thread_id": "quoted-tool-secrets"},
+            {"type": "turn.started"},
+            {
+                "type": "item.completed",
+                "item": {
+                    "id": "tool",
+                    "type": "command_execution",
+                    "status": "completed",
+                    "exit_code": 0,
+                    "aggregated_output": aggregated_output,
+                },
+            },
+            {
+                "type": "item.completed",
+                "item": {
+                    "id": "final",
+                    "type": "agent_message",
+                    "text": "example : True := by trivial\n",
+                },
+            },
+            {"type": "turn.completed", "usage": {}},
+        )
+        stdout = "\n".join(json.dumps(event) for event in events) + "\n"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            backend = self._backend("codex", root)
+            backend.inspect(model="gpt-test-pinned", reasoning_effort="low")
+            runtime = AgentRuntime(
+                workflow_root=root / "workflow",
+                run_id="run-quoted-tool-secrets",
+                backend=backend,
+            )
+            with (
+                patch.object(
+                    backend,
+                    "_run",
+                    return_value=subprocess.CompletedProcess(
+                        args=[], returncode=0, stdout=stdout, stderr=""
+                    ),
+                ),
+                self.assertRaises(SubscriptionBackendError) as raised,
+            ):
+                runtime.invoke(
+                    role="prover",
+                    phase="prove",
+                    output_type="lean_file",
+                    config=_config("gpt-test-pinned"),
+                    system_prompt="system",
+                    user_prompt="user",
+                    temp_dir=root / "ignored",
+                )
+            self.assertEqual(
+                raised.exception.kind, "credential_exposure_detected"
+            )
+            call_dir = next((root / "workflow" / "agent-calls").iterdir())
+            response = json.loads(
+                (call_dir / "response.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                response["error"]["kind"], "credential_exposure_detected"
+            )
+            archived = "".join(
+                path.read_text(encoding="utf-8")
+                for path in call_dir.rglob("*")
+                if path.is_file()
+            )
+            for secret in secrets:
+                self.assertNotIn(secret, archived)
+
+    def test_codex_rejects_exact_final_agent_message_credential_bypasses(
+        self,
+    ) -> None:
+        cases = (
+            ('-- Bearer "QUOTEDBEARERDOUBLE"\n', "QUOTEDBEARERDOUBLE"),
+            ("-- Bearer 'QUOTEDBEARERSINGLE'\n", "QUOTEDBEARERSINGLE"),
+            ("-- secret=ACTUAL_SECRET\n", "ACTUAL_SECRET"),
+            ("-- def password=ACTUAL_SECRET\n", "ACTUAL_SECRET"),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            parent = Path(directory)
+            backend = self._backend("codex", parent)
+            backend.inspect(model="gpt-test-pinned", reasoning_effort="low")
+            for index, (final_text, secret) in enumerate(cases, start=1):
+                with self.subTest(final_text=final_text):
+                    events = (
+                        {
+                            "type": "thread.started",
+                            "thread_id": f"final-secret-{index}",
+                        },
+                        {"type": "turn.started"},
+                        {
+                            "type": "item.completed",
+                            "item": {
+                                "id": "final",
+                                "type": "agent_message",
+                                "text": final_text,
+                            },
+                        },
+                        {"type": "turn.completed", "usage": {}},
+                    )
+                    stdout = (
+                        "\n".join(json.dumps(event) for event in events) + "\n"
+                    )
+                    workflow_root = parent / f"workflow-{index}"
+                    runtime = AgentRuntime(
+                        workflow_root=workflow_root,
+                        run_id=f"run-final-secret-{index}",
+                        backend=backend,
+                    )
+                    with (
+                        patch.object(
+                            backend,
+                            "_run",
+                            return_value=subprocess.CompletedProcess(
+                                args=[],
+                                returncode=0,
+                                stdout=stdout,
+                                stderr="",
+                            ),
+                        ),
+                        self.assertRaises(SubscriptionBackendError) as raised,
+                    ):
+                        runtime.invoke(
+                            role="prover",
+                            phase="prove",
+                            output_type="lean_file",
+                            config=_config("gpt-test-pinned"),
+                            system_prompt="system",
+                            user_prompt="user",
+                            temp_dir=parent / "ignored",
+                        )
+                    self.assertEqual(
+                        raised.exception.kind, "credential_exposure_detected"
+                    )
+                    call_dir = next(
+                        (workflow_root / "agent-calls").iterdir()
+                    )
+                    response = json.loads(
+                        (call_dir / "response.json").read_text(encoding="utf-8")
+                    )
+                    self.assertEqual(
+                        response["error"]["kind"],
+                        "credential_exposure_detected",
+                    )
+                    self.assertIsNone(response["output"])
+                    self.assertFalse(any(workflow_root.rglob("candidate.lean")))
+                    self.assertNotIn(
+                        secret,
+                        "".join(
+                            path.read_text(encoding="utf-8")
+                            for path in call_dir.rglob("*")
+                            if path.is_file()
+                        ),
+                    )
+
     def test_codex_redacts_unparseable_late_line_and_large_stderr(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

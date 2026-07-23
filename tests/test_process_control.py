@@ -1,4 +1,5 @@
 import os
+import ctypes
 import subprocess
 import sys
 import tempfile
@@ -20,6 +21,7 @@ class _Control:
         self.cancel = False
         self.started = threading.Event()
         self.pid = None
+        self.active_pid = None
         self.finished = None
 
     def cancel_requested(self) -> bool:
@@ -27,22 +29,101 @@ class _Control:
 
     def process_started(self, pid: int, kind: str) -> None:
         self.pid = pid
+        self.active_pid = pid
         self.started.set()
 
     def process_finished(self, pid: int) -> None:
         self.finished = pid
+        if self.active_pid == pid:
+            self.active_pid = None
 
 
 class ControlledProcessTests(unittest.TestCase):
     def assert_control_cleaned(self, control: _Control) -> None:
         self.assertIsNotNone(control.pid)
         self.assertEqual(control.finished, control.pid)
+        self.assertIsNone(control.active_pid)
         self.assertFalse(
             any(
                 thread.is_alive()
                 and thread.name == f"process-stdin-{control.pid}"
                 for thread in threading.enumerate()
             )
+        )
+        self.assertFalse(
+            any(
+                thread.is_alive()
+                and thread.name
+                in {
+                    f"process-stdout-{control.pid}",
+                    f"process-stderr-{control.pid}",
+                }
+                for thread in threading.enumerate()
+            )
+        )
+
+    @staticmethod
+    def _windows_process_active(pid: int) -> bool:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.OpenProcess.argtypes = [
+            ctypes.c_ulong,
+            ctypes.c_int,
+            ctypes.c_ulong,
+        ]
+        kernel32.OpenProcess.restype = ctypes.c_void_p
+        kernel32.GetExitCodeProcess.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_ulong),
+        ]
+        kernel32.GetExitCodeProcess.restype = ctypes.c_int
+        kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+        kernel32.CloseHandle.restype = ctypes.c_int
+        handle = kernel32.OpenProcess(0x1000, False, pid)
+        if not handle:
+            return False
+        try:
+            exit_code = ctypes.c_ulong()
+            if not kernel32.GetExitCodeProcess(
+                handle, ctypes.byref(exit_code)
+            ):
+                return False
+            return exit_code.value == 259
+        finally:
+            kernel32.CloseHandle(handle)
+
+    def _wait_for_descendant_exit(self, pid_file: Path) -> int:
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline and not pid_file.is_file():
+            time.sleep(0.02)
+        self.assertTrue(pid_file.is_file(), "descendant PID was not recorded")
+        pid = int(pid_file.read_text(encoding="utf-8"))
+        while time.monotonic() < deadline and self._windows_process_active(pid):
+            time.sleep(0.02)
+        self.assertFalse(
+            self._windows_process_active(pid),
+            f"descendant process {pid} survived collection cleanup",
+        )
+        return pid
+
+    @staticmethod
+    def _parent_exits_with_pipe_descendant_script(
+        pid_file: Path, *, flood_output: bool = False
+    ) -> str:
+        child_script = (
+            "import sys,time;"
+            + (
+                "sys.stdout.write('x'*200000);sys.stdout.flush();"
+                if flood_output
+                else ""
+            )
+            + "time.sleep(30)"
+        )
+        return (
+            "import pathlib,subprocess,sys\n"
+            "sys.stdin.readline()\n"
+            f"child=subprocess.Popen([sys.executable,'-c',{child_script!r}],"
+            "stdout=sys.stdout,stderr=sys.stderr)\n"
+            f"pathlib.Path({str(pid_file)!r}).write_text(str(child.pid),encoding='utf-8')\n"
         )
 
     def test_cancellation_terminates_long_running_process(self) -> None:
@@ -260,6 +341,115 @@ class ControlledProcessTests(unittest.TestCase):
         self.assertGreater(len(raised.exception.stdout), 0)
         self.assertGreater(len(raised.exception.stderr), 0)
         self.assert_control_cleaned(control)
+
+    @unittest.skipUnless(os.name == "nt", "Windows process-tree regression")
+    def test_timeout_kills_descendant_after_parent_exits_with_inherited_pipes(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            pid_file = Path(directory) / "descendant.pid"
+            control = _Control()
+            started = time.monotonic()
+            with self.assertRaises(subprocess.TimeoutExpired):
+                run_controlled_process(
+                    [
+                        sys.executable,
+                        "-c",
+                        self._parent_exits_with_pipe_descendant_script(pid_file),
+                    ],
+                    input_text="go\n",
+                    timeout_seconds=1,
+                    kind="descendant-timeout",
+                    max_output_bytes=4096,
+                    control=control,
+                )
+            elapsed = time.monotonic() - started
+            self.assertLess(elapsed, 5)
+            descendant_pid = self._wait_for_descendant_exit(pid_file)
+            self.assert_control_cleaned(control)
+            print(
+                "WINDOWS_PROCESS_TREE "
+                f"mode=timeout elapsed_seconds={elapsed:.6f} "
+                f"descendant_pid={descendant_pid} descendant_active=false "
+                "process_finished=true active_pid_cleared=true"
+            )
+
+    @unittest.skipUnless(os.name == "nt", "Windows process-tree regression")
+    def test_cancel_kills_descendant_after_parent_exits_with_inherited_pipes(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            pid_file = Path(directory) / "descendant.pid"
+            control = _Control()
+
+            def cancel_after_descendant_starts() -> None:
+                deadline = time.monotonic() + 3
+                while time.monotonic() < deadline and not pid_file.is_file():
+                    time.sleep(0.02)
+                control.cancel = True
+
+            canceller = threading.Thread(target=cancel_after_descendant_starts)
+            canceller.start()
+            started = time.monotonic()
+            with self.assertRaises(ProcessCancelled):
+                run_controlled_process(
+                    [
+                        sys.executable,
+                        "-c",
+                        self._parent_exits_with_pipe_descendant_script(pid_file),
+                    ],
+                    input_text="go\n",
+                    timeout_seconds=10,
+                    kind="descendant-cancel",
+                    max_output_bytes=4096,
+                    control=control,
+                )
+            canceller.join(timeout=3)
+            self.assertFalse(canceller.is_alive())
+            elapsed = time.monotonic() - started
+            self.assertLess(elapsed, 5)
+            descendant_pid = self._wait_for_descendant_exit(pid_file)
+            self.assert_control_cleaned(control)
+            print(
+                "WINDOWS_PROCESS_TREE "
+                f"mode=cancel elapsed_seconds={elapsed:.6f} "
+                f"descendant_pid={descendant_pid} descendant_active=false "
+                "process_finished=true active_pid_cleared=true"
+            )
+
+    @unittest.skipUnless(os.name == "nt", "Windows process-tree regression")
+    def test_output_limit_kills_descendant_after_parent_exits_with_inherited_pipes(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            pid_file = Path(directory) / "descendant.pid"
+            control = _Control()
+            started = time.monotonic()
+            with self.assertRaises(ProcessOutputLimitExceeded):
+                run_controlled_process(
+                    [
+                        sys.executable,
+                        "-c",
+                        self._parent_exits_with_pipe_descendant_script(
+                            pid_file, flood_output=True
+                        ),
+                    ],
+                    input_text="go\n",
+                    timeout_seconds=10,
+                    kind="descendant-output-limit",
+                    max_output_bytes=4096,
+                    control=control,
+                )
+            elapsed = time.monotonic() - started
+            self.assertLess(elapsed, 5)
+            descendant_pid = self._wait_for_descendant_exit(pid_file)
+            self.assert_control_cleaned(control)
+            print(
+                "WINDOWS_PROCESS_TREE "
+                f"mode=output_limit elapsed_seconds={elapsed:.6f} "
+                f"descendant_pid={descendant_pid} descendant_active=false "
+                "process_finished=true active_pid_cleared=true"
+            )
 
 
 if __name__ == "__main__":

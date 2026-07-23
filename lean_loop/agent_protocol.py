@@ -49,7 +49,16 @@ _SENSITIVE_FIELD_SEGMENTS = {
     "secret",
 }
 _BEARER_CREDENTIAL = re.compile(
-    r"(?i)\bBearer\s+(?P<value>[A-Za-z0-9._~+/=<>\-]{1,})"
+    r"""(?ix)
+    \bBearer[ \t]+
+    (?:
+        \\"(?P<escaped_double>(?:\\.|[^"\\])*)\\"
+      | \\'(?P<escaped_single>(?:\\.|[^'\\])*)\\'
+      | "(?P<double>(?:\\.|[^"\\])*)"
+      | '(?P<single>(?:\\.|[^'\\])*)'
+      | (?P<bare>[A-Za-z0-9._~+/=<>\-]{1,})
+    )
+    """
 )
 _CREDENTIAL_PATTERNS = (
     ("openai_key", re.compile(r"\bsk-[A-Za-z0-9_-]{8,}\b")),
@@ -137,21 +146,28 @@ def _closing_quote(value: str, start: int, quote: str) -> int | None:
     return None
 
 
-def _is_lean_declaration_key(value: str, position: int) -> bool:
-    local_prefix = value[max(0, position - 64) : position]
-    return bool(
-        re.search(
-            r"\b(?:abbrev|class|def|example|instance|lemma|structure|theorem)\s+$",
-            local_prefix,
-        )
+def _bearer_value(match: re.Match[str]) -> str:
+    return next(
+        (
+            value
+            for name in (
+                "escaped_double",
+                "escaped_single",
+                "double",
+                "single",
+                "bare",
+            )
+            if (value := match.groupdict().get(name)) is not None
+        ),
+        "",
     )
 
 
-def _text_credential_category(value: str) -> str | None:
+def _generic_text_credential_category(value: str) -> str | None:
     if _is_exact_redacted_value(value):
         return None
     for match in _BEARER_CREDENTIAL.finditer(value):
-        if not _is_exact_redacted_value(match.group("value")):
+        if not _is_exact_redacted_value(_bearer_value(match)):
             return "bearer_token"
     for category, pattern in _CREDENTIAL_PATTERNS:
         if pattern.search(value):
@@ -174,11 +190,10 @@ def _text_credential_category(value: str) -> str | None:
                 elif char == active_quote:
                     active_quote = None
             quote_cursor = match.start()
-            if not is_sensitive_field_name(
-                match.group("key"), allow_ambiguous=False
+            key = _normalize_field_name(match.group("key"))
+            if key != "secret" and not is_sensitive_field_name(
+                key, allow_ambiguous=False
             ):
-                continue
-            if _is_lean_declaration_key(line, match.start()):
                 continue
             value_start = match.end()
             while value_start < len(line) and line[value_start] in " \t":
@@ -201,7 +216,73 @@ def _text_credential_category(value: str) -> str | None:
     return None
 
 
-def find_high_confidence_credential(value: Any) -> str | None:
+def _lean_sensitive_text_regions(value: str) -> list[str]:
+    regions: list[str] = []
+    index = 0
+    length = len(value)
+    while index < length:
+        if value.startswith("--", index):
+            end = value.find("\n", index)
+            if end < 0:
+                end = length
+            regions.append(value[index:end])
+            index = end
+            continue
+        if value.startswith("/-", index):
+            start = index
+            index += 2
+            depth = 1
+            while index < length and depth:
+                if value.startswith("/-", index):
+                    depth += 1
+                    index += 2
+                elif value.startswith("-/", index):
+                    depth -= 1
+                    index += 2
+                else:
+                    index += 1
+            regions.append(value[start:index])
+            continue
+        if value[index] == '"':
+            start = index
+            index += 1
+            escaped = False
+            while index < length:
+                char = value[index]
+                index += 1
+                if escaped:
+                    escaped = False
+                elif char == "\\":
+                    escaped = True
+                elif char == '"':
+                    break
+            regions.append(value[start:index])
+            continue
+        index += 1
+    return regions
+
+
+def _text_credential_category(
+    value: str, *, text_context: str = "generic"
+) -> str | None:
+    for match in _BEARER_CREDENTIAL.finditer(value):
+        if not _is_exact_redacted_value(_bearer_value(match)):
+            return "bearer_token"
+    for category, pattern in _CREDENTIAL_PATTERNS:
+        if pattern.search(value):
+            return category
+    if text_context != "lean_source":
+        return _generic_text_credential_category(value)
+    for region in _lean_sensitive_text_regions(value):
+        finding = _generic_text_credential_category(region)
+        if finding is not None:
+            return finding
+    return None
+
+
+def find_high_confidence_credential(
+    value: Any, *, text_context: str = "generic"
+) -> str | None:
     if isinstance(value, Mapping):
         for key, item in value.items():
             if is_sensitive_field_name(key):
@@ -219,7 +300,7 @@ def find_high_confidence_credential(value: Any) -> str | None:
                 return finding
         return None
     if isinstance(value, str):
-        return _text_credential_category(value)
+        return _text_credential_category(value, text_context=text_context)
     return None
 
 
@@ -484,7 +565,12 @@ class AgentRuntime:
                 raise AgentProtocolError("JSON Agent response must be an object")
             if output_type == "lean_file" and not isinstance(output, str):
                 raise AgentProtocolError("Lean-file Agent response must be text")
-            credential_category = find_high_confidence_credential(output)
+            credential_category = find_high_confidence_credential(
+                output,
+                text_context=(
+                    "lean_source" if output_type == "lean_file" else "generic"
+                ),
+            )
             if credential_category is not None:
                 raise CredentialExposureError(
                     "Agent output contained high-confidence credential material"
@@ -503,6 +589,7 @@ class AgentRuntime:
                     "Agent backend evidence contained high-confidence credential material"
                 )
         except Exception as exc:
+            raised_exception: Exception = exc
             raw_output = getattr(exc, "raw_output", None)
             error_kind = getattr(exc, "kind", None)
             exception_finding = find_high_confidence_credential(
@@ -514,6 +601,8 @@ class AgentRuntime:
                 error_message = (
                     "Agent call contained high-confidence credential material"
                 )
+                if not isinstance(exc, CredentialExposureError):
+                    raised_exception = CredentialExposureError(error_message)
             else:
                 error_message = str(exc)
             backend_metadata = self._backend_metadata()
@@ -550,7 +639,7 @@ class AgentRuntime:
                 completed_at=utc_now(),
                 duration_seconds=round(time.perf_counter() - started, 6),
                 error={
-                    "type": type(exc).__name__,
+                    "type": type(raised_exception).__name__,
                     "message": error_message,
                     **({"kind": error_kind} if isinstance(error_kind, str) else {}),
                 },
@@ -570,6 +659,8 @@ class AgentRuntime:
                 },
             )
             atomic_write_json(call_dir / "response.json", response.to_dict())
+            if raised_exception is not exc:
+                raise raised_exception from exc
             raise
         backend_metadata = self._backend_metadata()
         self._persist_backend_evidence(call_dir, backend_metadata)

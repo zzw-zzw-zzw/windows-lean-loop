@@ -334,19 +334,23 @@ class AgentProtocolTests(unittest.TestCase):
         ):
             with self.subTest(field_name=field_name):
                 self.assertFalse(is_sensitive_field_name(field_name))
-        for safe_text in (
-            "<redacted>",
-            "  <redacted>  ",
-            "'<redacted>'",
-            '"<redacted>"',
-            "password=<redacted>",
-            "password='  <redacted>  '",
-            'password="  <redacted>  "',
-            "def token : Nat := 1",
-            "def secretLemma : token = 1 := by rfl",
+        for safe_text, text_context in (
+            ("<redacted>", "generic"),
+            ("  <redacted>  ", "generic"),
+            ("'<redacted>'", "generic"),
+            ('"<redacted>"', "generic"),
+            ("password=<redacted>", "generic"),
+            ("password='  <redacted>  '", "generic"),
+            ('password="  <redacted>  "', "generic"),
+            ("def token : Nat := 1", "lean_source"),
+            ("def secretLemma : token = 1 := by rfl", "lean_source"),
         ):
             with self.subTest(safe_text=safe_text):
-                self.assertIsNone(find_high_confidence_credential(safe_text))
+                self.assertIsNone(
+                    find_high_confidence_credential(
+                        safe_text, text_context=text_context
+                    )
+                )
         for exposed_text in (
             "password=<redacted>ACTUAL_SECRET",
             "session_token: <redacted> REAL_PASSWORD_VALUE",
@@ -357,6 +361,154 @@ class AgentProtocolTests(unittest.TestCase):
                 self.assertIsNotNone(
                     find_high_confidence_credential(exposed_text)
                 )
+
+    def test_lean_bindings_are_safe_but_comments_and_quoted_bearers_fail_closed(
+        self,
+    ) -> None:
+        legal_lean = (
+            "theorem foo (password : Nat) : True := by\n"
+            "  trivial\n\n"
+            "def foo (password : Nat) := password\n\n"
+            "structure Credentials where\n"
+            "  password : String\n\n"
+            "example : True := by\n"
+            "  let password := 1\n"
+            "  trivial\n"
+        )
+        self.assertIsNone(
+            find_high_confidence_credential(legal_lean, text_context="lean_source")
+        )
+        cases = (
+            ('-- Bearer "abcdefghijklmnop"\n', "abcdefghijklmnop"),
+            ("-- Bearer 'abcdefghijklmnop'\n", "abcdefghijklmnop"),
+            ('#check "Bearer \\"abcdefghijklmnop\\""\n', "abcdefghijklmnop"),
+            ("-- secret=ACTUAL_SECRET\n", "ACTUAL_SECRET"),
+            ("-- password=ACTUAL_SECRET\n", "ACTUAL_SECRET"),
+            ("-- def password=ACTUAL_SECRET\n", "ACTUAL_SECRET"),
+        )
+        for output, secret in cases:
+            with self.subTest(output=output), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                backend = DirectModelBackend(
+                    json_model_call=lambda config, system, user, temp: {},
+                    file_model_call=lambda config, user, temp, value=output: value,
+                )
+                runtime = AgentRuntime(
+                    workflow_root=root, run_id="run-lean-scan", backend=backend
+                )
+                with self.assertRaises(CredentialExposureError) as raised:
+                    runtime.invoke(
+                        role="prover",
+                        phase="prove",
+                        output_type="lean_file",
+                        config=_config(),
+                        system_prompt="system",
+                        user_prompt="user",
+                        temp_dir=root / "tmp",
+                    )
+                self.assertEqual(
+                    raised.exception.kind, "credential_exposure_detected"
+                )
+                call_dir = next((root / "agent-calls").iterdir())
+                response = json.loads(
+                    (call_dir / "response.json").read_text(encoding="utf-8")
+                )
+                self.assertEqual(
+                    response["error"]["kind"], "credential_exposure_detected"
+                )
+                self.assertNotIn(
+                    secret,
+                    "".join(
+                        path.read_text(encoding="utf-8")
+                        for path in call_dir.rglob("*")
+                        if path.is_file()
+                    ),
+                )
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            backend = DirectModelBackend(
+                json_model_call=lambda config, system, user, temp: {},
+                file_model_call=lambda config, user, temp: legal_lean,
+            )
+            runtime = AgentRuntime(
+                workflow_root=root, run_id="run-legal-lean", backend=backend
+            )
+            self.assertEqual(
+                runtime.invoke(
+                    role="prover",
+                    phase="prove",
+                    output_type="lean_file",
+                    config=_config(),
+                    system_prompt="system",
+                    user_prompt="user",
+                    temp_dir=root / "tmp",
+                ),
+                legal_lean,
+            )
+            call_dir = next((root / "agent-calls").iterdir())
+            response = json.loads(
+                (call_dir / "response.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(response["output"], legal_lean)
+
+    def test_exception_raw_output_credential_reclassifies_thrown_error(self) -> None:
+        secret = "ACTUAL_SECRET"
+
+        class OtherFailure(RuntimeError):
+            kind = "other_failure"
+            raw_output = f'Bearer "{secret}"'
+
+        original = OtherFailure("backend failed")
+
+        class Backend:
+            backend_id = "test-backend"
+            last_metadata = {"backend_id": backend_id}
+
+            def invoke(self, request, config, temp_dir):
+                raise original
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime = AgentRuntime(
+                workflow_root=root, run_id="run-reclassified", backend=Backend()
+            )
+            observed_kind = None
+            with self.assertRaises(CredentialExposureError) as raised:
+                try:
+                    runtime.invoke(
+                        role="planner",
+                        phase="plan",
+                        output_type="json",
+                        config=_config(),
+                        system_prompt="system",
+                        user_prompt="user",
+                        temp_dir=root / "tmp",
+                    )
+                except Exception as exc:
+                    observed_kind = getattr(exc, "kind", None)
+                    raise
+            self.assertEqual(observed_kind, "credential_exposure_detected")
+            self.assertIs(raised.exception.__cause__, original)
+            call_dir = next((root / "agent-calls").iterdir())
+            response = json.loads(
+                (call_dir / "response.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                response["error"]["kind"], "credential_exposure_detected"
+            )
+            self.assertEqual(
+                response["metadata"]["error_classification"],
+                "credential_exposure_detected",
+            )
+            self.assertNotIn(
+                secret,
+                "".join(
+                    path.read_text(encoding="utf-8")
+                    for path in call_dir.rglob("*")
+                    if path.is_file()
+                ),
+            )
 
     def test_capabilities_are_versioned(self) -> None:
         value = protocol_capabilities()
