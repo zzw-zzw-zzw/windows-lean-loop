@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import re
 import time
 import uuid
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Literal, Protocol, runtime_checkable
+from typing import Any, Callable, Literal, Mapping, Protocol, runtime_checkable
 
 from lean_loop.config import ApiConfig
 from lean_loop.jsonutil import atomic_write_json, atomic_write_text, utc_now
@@ -23,6 +24,47 @@ AGENT_ROLES = {
 }
 OUTPUT_TYPES = {"json", "lean_file"}
 DIAGNOSTIC_PREVIEW_BYTES = 65536
+_REDACTED = "<redacted>"
+_AMBIGUOUS_SENSITIVE_FIELD_NAMES = {"token", "secret"}
+_SENSITIVE_FIELD_PARTS = (
+    ("api", "key"),
+    ("auth", "token"),
+    ("session", "token"),
+    ("access", "token"),
+    ("refresh", "token"),
+    ("client", "secret"),
+    ("encrypted", "content"),
+)
+_SENSITIVE_FIELD_NAMES = {
+    "authorization",
+    "cookie",
+    "credential",
+    "password",
+}
+_CREDENTIAL_PATTERNS = (
+    (
+        "bearer_token",
+        re.compile(r"(?i)\bBearer\s+(?!<redacted>)[A-Za-z0-9._~+/=-]{8,}"),
+    ),
+    ("openai_key", re.compile(r"\bsk-[A-Za-z0-9_-]{8,}\b")),
+    ("github_token", re.compile(r"\bghp_[A-Za-z0-9]{16,}\b")),
+    (
+        "github_fine_grained_token",
+        re.compile(r"\bgithub_pat_[A-Za-z0-9_]{16,}\b"),
+    ),
+    ("slack_token", re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{10,}\b")),
+    ("aws_access_key", re.compile(r"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b")),
+    (
+        "jwt",
+        re.compile(
+            r"\beyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}"
+            r"\.[A-Za-z0-9_-]{5,}\b"
+        ),
+    ),
+)
+_ASSIGNMENT_PREFIX = re.compile(
+    r"(?P<key>[A-Za-z_][A-Za-z0-9_.-]{0,127})\s*[:=]\s*"
+)
 
 AgentRole = Literal[
     "formalizer", "planner", "prover", "reviewer", "auditor", "retriever", "explainer"
@@ -35,6 +77,70 @@ FileModelCall = Callable[[ApiConfig, str, Path], str]
 
 class AgentProtocolError(ValueError):
     pass
+
+
+class CredentialExposureError(AgentProtocolError):
+    kind = "credential_exposure_detected"
+
+
+def _normalize_field_name(value: Any) -> str:
+    text = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", str(value))
+    return re.sub(r"[^a-z0-9]+", "_", text.lower()).strip("_")
+
+
+def is_sensitive_field_name(value: Any, *, allow_ambiguous: bool = True) -> bool:
+    normalized = _normalize_field_name(value)
+    if not normalized:
+        return False
+    if normalized in _SENSITIVE_FIELD_NAMES:
+        return True
+    if allow_ambiguous and normalized in _AMBIGUOUS_SENSITIVE_FIELD_NAMES:
+        return True
+    parts = tuple(part for part in normalized.split("_") if part)
+    return any(
+        parts[index : index + len(marker)] == marker
+        for marker in _SENSITIVE_FIELD_PARTS
+        for index in range(len(parts) - len(marker) + 1)
+    )
+
+
+def _text_credential_category(value: str) -> str | None:
+    if _REDACTED in value and value.strip() == _REDACTED:
+        return None
+    for category, pattern in _CREDENTIAL_PATTERNS:
+        if pattern.search(value):
+            return category
+    for match in _ASSIGNMENT_PREFIX.finditer(value):
+        if not is_sensitive_field_name(
+            match.group("key"), allow_ambiguous=False
+        ):
+            continue
+        remainder = value[match.end() :].lstrip()
+        if remainder and not remainder.startswith(_REDACTED):
+            return "sensitive_assignment"
+    return None
+
+
+def find_high_confidence_credential(value: Any) -> str | None:
+    if isinstance(value, Mapping):
+        for key, item in value.items():
+            if is_sensitive_field_name(key):
+                if item not in (None, "", _REDACTED):
+                    return "sensitive_field"
+                continue
+            finding = find_high_confidence_credential(item)
+            if finding is not None:
+                return finding
+        return None
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            finding = find_high_confidence_credential(item)
+            if finding is not None:
+                return finding
+        return None
+    if isinstance(value, str):
+        return _text_credential_category(value)
+    return None
 
 
 @dataclass(frozen=True)
@@ -204,7 +310,6 @@ class AgentRuntime:
         stderr_text = stderr if isinstance(stderr, str) else ""
         atomic_write_text(call_dir / "stdout.txt", stdout_text)
         atomic_write_text(call_dir / "stderr.txt", stderr_text)
-        atomic_write_text(call_dir / "raw-output.txt", stdout_text or stderr_text)
         if isinstance(diagnostic_preview, str):
             atomic_write_text(
                 call_dir / "diagnostic-preview.txt", diagnostic_preview
@@ -272,6 +377,11 @@ class AgentRuntime:
                 raise AgentProtocolError("JSON Agent response must be an object")
             if output_type == "lean_file" and not isinstance(output, str):
                 raise AgentProtocolError("Lean-file Agent response must be text")
+            credential_category = find_high_confidence_credential(output)
+            if credential_category is not None:
+                raise CredentialExposureError(
+                    "Agent output contained high-confidence credential material"
+                )
         except Exception as exc:
             raw_output = getattr(exc, "raw_output", None)
             error_kind = getattr(exc, "kind", None)

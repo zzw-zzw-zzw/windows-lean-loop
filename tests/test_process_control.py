@@ -6,7 +6,11 @@ import time
 import unittest
 from pathlib import Path
 
-from lean_loop.process_control import ProcessCancelled, run_controlled_process
+from lean_loop.process_control import (
+    ProcessCancelled,
+    ProcessOutputLimitExceeded,
+    run_controlled_process,
+)
 from lean_loop.queue import QueueProcessController, QueueStore
 
 
@@ -102,6 +106,31 @@ class ControlledProcessTests(unittest.TestCase):
             row = store.get_task(task["id"])
             self.assertIn("Model reasoning", row["activity_text"])
             self.assertIsNotNone(row["activity_at"])
+
+    def test_bounded_collection_terminates_at_exact_captured_byte_limit(self) -> None:
+        limit = 4096
+        script = (
+            "import sys\n"
+            "sys.stdout.write('x' * 100000 + 'UNOBSERVED_TAIL')\n"
+            "sys.stdout.flush()\n"
+        )
+        started = time.monotonic()
+        with self.assertRaises(ProcessOutputLimitExceeded) as raised:
+            run_controlled_process(
+                [sys.executable, "-c", script],
+                timeout_seconds=10,
+                kind="bounded-output-test",
+                max_output_bytes=limit,
+            )
+        self.assertLess(time.monotonic() - started, 5)
+        self.assertEqual(raised.exception.limit_bytes, limit)
+        self.assertEqual(raised.exception.captured_bytes, limit)
+        self.assertEqual(
+            len(raised.exception.stdout.encode("utf-8"))
+            + len(raised.exception.stderr.encode("utf-8")),
+            limit,
+        )
+        self.assertNotIn("UNOBSERVED_TAIL", raised.exception.stdout)
 
 
 if __name__ == "__main__":

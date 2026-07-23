@@ -9,6 +9,7 @@ from lean_loop.agent_protocol import (
     AgentProtocolError,
     AgentRequest,
     AgentRuntime,
+    CredentialExposureError,
     DirectModelBackend,
     protocol_capabilities,
 )
@@ -220,6 +221,73 @@ class AgentProtocolTests(unittest.TestCase):
             self.assertTrue(
                 response["metadata"]["diagnostic_preview_truncated"]
             )
+
+    def test_runtime_rejects_credentials_before_response_or_workflow_output(self) -> None:
+        cases = (
+            (
+                "planner",
+                "json",
+                {"plan": "Bearer abcdefghijklmnop"},
+                "abcdefghijklmnop",
+            ),
+            (
+                "prover",
+                "lean_file",
+                "example : True := by trivial\n-- sk-ABCDEFGHIJKLMNOP\n",
+                "sk-ABCDEFGHIJKLMNOP",
+            ),
+            (
+                "reviewer",
+                "json",
+                {"verdict": "xoxb-1234567890-ABCDEFGHIJ"},
+                "xoxb-1234567890-ABCDEFGHIJ",
+            ),
+            (
+                "auditor",
+                "json",
+                {"audit": "AKIAABCDEFGHIJKLMNOP"},
+                "AKIAABCDEFGHIJKLMNOP",
+            ),
+        )
+        for role, output_type, result, secret in cases:
+            with self.subTest(role=role), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                backend = DirectModelBackend(
+                    json_model_call=lambda config, system, user, temp: result,
+                    file_model_call=lambda config, user, temp: result,
+                )
+                runtime = AgentRuntime(
+                    workflow_root=root, run_id="run-1", backend=backend
+                )
+                with self.assertRaises(CredentialExposureError) as raised:
+                    runtime.invoke(
+                        role=role,
+                        phase=str(role),
+                        output_type=output_type,
+                        config=_config(),
+                        system_prompt="system",
+                        user_prompt="user",
+                        temp_dir=root / "tmp",
+                    )
+                self.assertEqual(
+                    raised.exception.kind, "credential_exposure_detected"
+                )
+                call_dir = next((root / "agent-calls").iterdir())
+                response = json.loads(
+                    (call_dir / "response.json").read_text(encoding="utf-8")
+                )
+                self.assertEqual(response["status"], "error")
+                self.assertIsNone(response["output"])
+                self.assertEqual(
+                    response["error"]["kind"], "credential_exposure_detected"
+                )
+                archived = "".join(
+                    path.read_text(encoding="utf-8")
+                    for path in call_dir.rglob("*")
+                    if path.is_file()
+                )
+                self.assertNotIn(secret, archived)
+                self.assertFalse(any(root.rglob("candidate.lean")))
 
     def test_capabilities_are_versioned(self) -> None:
         value = protocol_capabilities()

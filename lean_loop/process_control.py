@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import os
+import queue
 import signal
 import subprocess
-import queue
 import threading
 import time
 from pathlib import Path
@@ -11,7 +11,28 @@ from typing import Callable, Mapping, Protocol, Sequence
 
 
 class ProcessCancelled(RuntimeError):
-    pass
+    def __init__(self, message: str, *, stdout: str = "", stderr: str = "") -> None:
+        super().__init__(message)
+        self.stdout = stdout
+        self.stderr = stderr
+
+
+class ProcessOutputLimitExceeded(RuntimeError):
+    def __init__(
+        self,
+        command: Sequence[str],
+        limit_bytes: int,
+        stdout: str,
+        stderr: str,
+    ) -> None:
+        super().__init__(f"Process output exceeded {limit_bytes} captured bytes")
+        self.command = tuple(command)
+        self.limit_bytes = limit_bytes
+        self.stdout = stdout
+        self.stderr = stderr
+        self.captured_bytes = len(stdout.encode("utf-8")) + len(
+            stderr.encode("utf-8")
+        )
 
 
 class ProcessControl(Protocol):
@@ -56,7 +77,14 @@ def run_controlled_process(
     control: ProcessControl | None = None,
     stdout_line_callback: Callable[[str], None] | None = None,
     env: Mapping[str, str] | None = None,
+    max_output_bytes: int | None = None,
 ) -> subprocess.CompletedProcess[str]:
+    if max_output_bytes is not None and max_output_bytes < 1:
+        raise ValueError("max_output_bytes must be positive")
+    if max_output_bytes is not None and stdout_line_callback is not None:
+        raise ValueError(
+            "max_output_bytes cannot be combined with stdout_line_callback"
+        )
     creationflags = subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
     process = subprocess.Popen(
         list(command),
@@ -88,6 +116,16 @@ def run_controlled_process(
             control=control,
             stdout_line_callback=stdout_line_callback,
         )
+    if max_output_bytes is not None:
+        return _collect_bounded_process(
+            process,
+            command=command,
+            input_text=input_text,
+            timeout_seconds=timeout_seconds,
+            kind=kind,
+            control=control,
+            max_output_bytes=max_output_bytes,
+        )
 
     started = time.monotonic()
     pending_input = input_text
@@ -97,7 +135,11 @@ def run_controlled_process(
         while True:
             if control is not None and control.cancel_requested():
                 terminate_process_tree(process)
-                raise ProcessCancelled(f"Cancelled while running {kind} (PID {process.pid})")
+                raise ProcessCancelled(
+                    f"Cancelled while running {kind} (PID {process.pid})",
+                    stdout=stdout,
+                    stderr=stderr,
+                )
             remaining = timeout_seconds - (time.monotonic() - started)
             if remaining <= 0:
                 terminate_process_tree(process)
@@ -123,6 +165,135 @@ def run_controlled_process(
         if control is not None:
             control.process_finished(process.pid)
 
+    return subprocess.CompletedProcess(list(command), process.returncode, stdout, stderr)
+
+
+def _utf8_prefix(value: str, limit_bytes: int) -> str:
+    if limit_bytes <= 0:
+        return ""
+    encoded = value.encode("utf-8")
+    if len(encoded) <= limit_bytes:
+        return value
+    return encoded[:limit_bytes].decode("utf-8", errors="ignore")
+
+
+def _collect_bounded_process(
+    process: subprocess.Popen[str],
+    *,
+    command: Sequence[str],
+    input_text: str | None,
+    timeout_seconds: int,
+    kind: str,
+    control: ProcessControl | None,
+    max_output_bytes: int,
+) -> subprocess.CompletedProcess[str]:
+    if process.stdout is None or process.stderr is None:
+        raise RuntimeError("Bounded process requires stdout and stderr pipes")
+    if input_text is not None:
+        if process.stdin is None:
+            raise RuntimeError("Bounded process requires an stdin pipe")
+        process.stdin.write(input_text)
+        process.stdin.close()
+
+    chunks: queue.Queue[tuple[str, str | None]] = queue.Queue(maxsize=16)
+    stop_readers = threading.Event()
+
+    def drain(name: str, pipe: object) -> None:
+        reader = getattr(pipe, "read")
+        try:
+            while not stop_readers.is_set():
+                chunk = reader(8192)
+                if chunk == "":
+                    break
+                while not stop_readers.is_set():
+                    try:
+                        chunks.put((name, chunk), timeout=0.1)
+                        break
+                    except queue.Full:
+                        continue
+        finally:
+            while not stop_readers.is_set():
+                try:
+                    chunks.put((name, None), timeout=0.1)
+                    break
+                except queue.Full:
+                    continue
+
+    threads = [
+        threading.Thread(target=drain, args=("stdout", process.stdout), daemon=True),
+        threading.Thread(target=drain, args=("stderr", process.stderr), daemon=True),
+    ]
+    for thread in threads:
+        thread.start()
+
+    started = time.monotonic()
+    stdout_parts: list[str] = []
+    stderr_parts: list[str] = []
+    captured_bytes = 0
+    completed_streams: set[str] = set()
+
+    def captured_streams() -> tuple[str, str]:
+        return "".join(stdout_parts), "".join(stderr_parts)
+
+    try:
+        while process.poll() is None or len(completed_streams) < 2:
+            if control is not None and control.cancel_requested():
+                terminate_process_tree(process)
+                stdout, stderr = captured_streams()
+                raise ProcessCancelled(
+                    f"Cancelled while running {kind} (PID {process.pid})",
+                    stdout=stdout,
+                    stderr=stderr,
+                )
+            elapsed = time.monotonic() - started
+            if elapsed >= timeout_seconds:
+                terminate_process_tree(process)
+                stdout, stderr = captured_streams()
+                raise subprocess.TimeoutExpired(
+                    command, timeout_seconds, stdout, stderr
+                )
+            try:
+                name, chunk = chunks.get(
+                    timeout=min(0.2, max(0.001, timeout_seconds - elapsed))
+                )
+            except queue.Empty:
+                continue
+            if chunk is None:
+                completed_streams.add(name)
+                continue
+            chunk_bytes = len(chunk.encode("utf-8"))
+            remaining = max_output_bytes - captured_bytes
+            saved_chunk = (
+                chunk if chunk_bytes <= remaining else _utf8_prefix(chunk, remaining)
+            )
+            if saved_chunk:
+                if name == "stdout":
+                    stdout_parts.append(saved_chunk)
+                else:
+                    stderr_parts.append(saved_chunk)
+                captured_bytes += len(saved_chunk.encode("utf-8"))
+            if chunk_bytes > remaining:
+                terminate_process_tree(process)
+                stdout, stderr = captured_streams()
+                raise ProcessOutputLimitExceeded(
+                    command, max_output_bytes, stdout, stderr
+                )
+        process.wait()
+    except KeyboardInterrupt:
+        terminate_process_tree(process)
+        raise
+    finally:
+        stop_readers.set()
+        if process.poll() is None:
+            terminate_process_tree(process)
+        for thread in threads:
+            thread.join(timeout=1)
+        process.stdout.close()
+        process.stderr.close()
+        if control is not None:
+            control.process_finished(process.pid)
+
+    stdout, stderr = captured_streams()
     return subprocess.CompletedProcess(list(command), process.returncode, stdout, stderr)
 
 
@@ -172,7 +343,11 @@ def _collect_streaming_process(
         while process.poll() is None or len(completed_streams) < 2:
             if control is not None and control.cancel_requested():
                 terminate_process_tree(process)
-                raise ProcessCancelled(f"Cancelled while running {kind} (PID {process.pid})")
+                raise ProcessCancelled(
+                    f"Cancelled while running {kind} (PID {process.pid})",
+                    stdout="".join(stdout_parts),
+                    stderr="".join(stderr_parts),
+                )
             elapsed = time.monotonic() - started
             if elapsed >= timeout_seconds:
                 terminate_process_tree(process)

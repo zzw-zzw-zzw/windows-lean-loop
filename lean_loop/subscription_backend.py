@@ -10,12 +10,17 @@ from collections import Counter
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
-from lean_loop.agent_protocol import AgentRequest
+from lean_loop.agent_protocol import (
+    AgentRequest,
+    find_high_confidence_credential,
+    is_sensitive_field_name,
+)
 from lean_loop.api import ApiError, extract_file_content, extract_json_object
 from lean_loop.config import ApiConfig
 from lean_loop.process_control import (
     ProcessCancelled,
     ProcessControl,
+    ProcessOutputLimitExceeded,
     run_controlled_process,
 )
 
@@ -23,6 +28,7 @@ from lean_loop.process_control import (
 SUBSCRIPTION_BACKENDS = {"codex-subscription", "claude-subscription"}
 MAX_DIAGNOSTIC_CHARS = 65536
 MAX_DIAGNOSTIC_BYTES = 65536
+CODEX_MAX_PROCESS_OUTPUT_BYTES = 2 * 1024 * 1024
 _SECRET_ENV_PARTS = (
     "API_KEY",
     "ACCESS_TOKEN",
@@ -38,23 +44,18 @@ _SECRET_ENV_PARTS = (
 _SENSITIVE_ENV_PREFIXES = ("LEAN_AGENT_", "OPENAI_", "ANTHROPIC_", "CLAUDE_CODE_")
 _EXTERNAL_OVERRIDE_ENV_PARTS = ("BASE_URL", "GATEWAY", "API_HOST", "ENDPOINT")
 _REDACTED = "<redacted>"
-_SENSITIVE_KEY_MARKERS = (
-    "api_key",
-    "token",
-    "auth_token",
-    "session_token",
-    "access_token",
-    "refresh_token",
-    "authorization",
-    "cookie",
-    "password",
-    "secret",
-    "client_secret",
-    "credential",
-    "encrypted_content",
-)
 _BEARER_REDACTION = re.compile(r"(?i)(\bBearer\s+)([^\s\"']+)")
 _SK_REDACTION = re.compile(r"\bsk-[A-Za-z0-9_-]{8,}\b")
+_STANDALONE_TOKEN_REDACTIONS = (
+    re.compile(r"\bghp_[A-Za-z0-9]{16,}\b"),
+    re.compile(r"\bgithub_pat_[A-Za-z0-9_]{16,}\b"),
+    re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{10,}\b"),
+    re.compile(r"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b"),
+    re.compile(
+        r"\beyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}"
+        r"\.[A-Za-z0-9_-]{5,}\b"
+    ),
+)
 _DOUBLE_QUOTED_FIELD_REDACTION = re.compile(
     r'(?P<prefix>(?:"(?P<quoted_key>[^"\\]{1,128})"|'
     r'(?P<bare_key>[A-Za-z_][A-Za-z0-9_.-]{0,127}))\s*[:=]\s*")'
@@ -132,6 +133,8 @@ def _redact_text(value: str) -> tuple[str, bool]:
         value,
     )
     clean = _SK_REDACTION.sub(_REDACTED, clean)
+    for pattern in _STANDALONE_TOKEN_REDACTIONS:
+        clean = pattern.sub(_REDACTED, clean)
     for pattern in (
         _DOUBLE_QUOTED_FIELD_REDACTION,
         _SINGLE_QUOTED_FIELD_REDACTION,
@@ -148,25 +151,48 @@ def _redact(value: str) -> str:
     return _redact_text(value)[0]
 
 
-def _normalize_sensitive_key(value: Any) -> str:
-    text = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", str(value))
-    return re.sub(r"[^a-z0-9]+", "_", text.lower()).strip("_")
-
-
-def _is_sensitive_key(value: Any) -> bool:
-    normalized = _normalize_sensitive_key(value)
-    return any(marker in normalized for marker in _SENSITIVE_KEY_MARKERS)
-
-
 def _redact_text_field(match: re.Match[str]) -> str:
     key = match.groupdict().get("quoted_key") or match.groupdict().get("bare_key")
-    if not _is_sensitive_key(key):
+    if not is_sensitive_field_name(key):
         return match.group(0)
     return (
         match.group("prefix")
         + _REDACTED
         + (match.groupdict().get("suffix") or "")
     )
+
+
+def _active_quote_at(value: str, position: int) -> str | None:
+    active: str | None = None
+    escaped = False
+    for char in value[:position]:
+        if escaped:
+            escaped = False
+            continue
+        if char == "\\":
+            escaped = True
+            continue
+        if active is None:
+            if char in {'"', "'"}:
+                active = char
+        elif char == active:
+            active = None
+    return active
+
+
+def _closing_quote(value: str, start: int, quote: str) -> int | None:
+    escaped = False
+    for index in range(start, len(value)):
+        char = value[index]
+        if escaped:
+            escaped = False
+            continue
+        if char == "\\":
+            escaped = True
+            continue
+        if char == quote:
+            return index
+    return None
 
 
 def _redact_unquoted_sensitive_fields(value: str) -> str:
@@ -178,29 +204,42 @@ def _redact_unquoted_sensitive_fields(value: str) -> str:
             line, ending = chunk[:-1], chunk[-1:]
         else:
             line, ending = chunk, ""
-        saved_line = line
+        saved_parts: list[str] = []
+        cursor = 0
         for match in _UNQUOTED_FIELD_PREFIX.finditer(line):
+            if match.start() < cursor:
+                continue
             key = (
                 match.group("double_quoted_key")
                 or match.group("single_quoted_key")
                 or match.group("bare_key")
             )
-            if not _is_sensitive_key(key):
+            if not is_sensitive_field_name(key, allow_ambiguous=False):
                 continue
             remainder = line[match.end() :]
             leading_space = remainder[: len(remainder) - len(remainder.lstrip(" \t"))]
+            value_start = match.end() + len(leading_space)
             field_value = remainder[len(leading_space) :]
             if field_value.startswith(
                 (f'"{_REDACTED}"', f"'{_REDACTED}'")
-            ):
+            ) or field_value.startswith(_REDACTED):
                 continue
-            saved_line = (
-                line[: match.end()]
-                + leading_space
-                + _REDACTED
+            active_quote = _active_quote_at(line, match.start())
+            value_end = (
+                _closing_quote(line, value_start, active_quote)
+                if active_quote is not None
+                else len(line)
             )
-            break
-        saved_lines.append(saved_line + ending)
+            if value_end is None:
+                value_end = len(line)
+            saved_parts.append(line[cursor:match.end()])
+            saved_parts.append(leading_space)
+            saved_parts.append(_REDACTED)
+            cursor = value_end
+            if active_quote is None:
+                break
+        saved_parts.append(line[cursor:])
+        saved_lines.append("".join(saved_parts) + ending)
     return "".join(saved_lines)
 
 
@@ -209,7 +248,7 @@ def _redact_json_value(value: Any) -> tuple[Any, bool]:
         redacted: dict[Any, Any] = {}
         changed = False
         for key, item in value.items():
-            if _is_sensitive_key(key):
+            if is_sensitive_field_name(key):
                 redacted[key] = _REDACTED
                 changed = True
             else:
@@ -288,30 +327,66 @@ def _stream_record(
     saved_stream: str,
     *,
     redaction_applied: bool,
+    complete_process_stream_observed: bool,
+    captured_stream_truncated: bool,
 ) -> dict[str, Any]:
     return {
         "process_stream": {
+            "scope": (
+                "complete_process_stream"
+                if complete_process_stream_observed
+                else "captured_prefix_only"
+            ),
             "char_count": len(process_stream),
             "byte_count": len(process_stream.encode("utf-8")),
             "sha256": _text_sha256(process_stream),
+            "complete_process_stream_observed": complete_process_stream_observed,
         },
         "saved_redacted_evidence": {
             "char_count": len(saved_stream),
             "byte_count": len(saved_stream.encode("utf-8")),
             "sha256": _text_sha256(saved_stream),
-            "truncated": False,
+            "truncated": captured_stream_truncated,
         },
-        "complete_evidence_truncated": False,
+        "complete_evidence_truncated": captured_stream_truncated,
         "redaction_applied": redaction_applied,
     }
 
 
-def _combined_diagnostic_preview(stdout: str, stderr: str) -> tuple[str, str]:
+def _combined_diagnostic_preview(stdout: str, stderr: str) -> tuple[str, bool]:
+    chunks = [stdout]
     if stdout and stderr:
-        combined = f"{stdout}\n--- stderr ---\n{stderr}"
-    else:
-        combined = stdout or stderr
-    return combined, _bounded_redacted_preview(combined)
+        chunks.append("\n--- stderr ---\n")
+    chunks.append(stderr)
+    preview_parts: list[str] = []
+    remaining_chars = MAX_DIAGNOSTIC_CHARS
+    remaining_bytes = MAX_DIAGNOSTIC_BYTES
+    truncated = False
+    for index, chunk in enumerate(chunks):
+        if not chunk:
+            continue
+        if remaining_chars <= 0 or remaining_bytes <= 0:
+            truncated = True
+            break
+        selected = chunk[:remaining_chars]
+        encoded = selected.encode("utf-8")
+        if len(encoded) > remaining_bytes:
+            selected = encoded[:remaining_bytes].decode("utf-8", errors="ignore")
+            truncated = True
+        preview_parts.append(selected)
+        used_bytes = len(selected.encode("utf-8"))
+        remaining_chars -= len(selected)
+        remaining_bytes -= used_bytes
+        if len(selected) != len(chunk):
+            truncated = True
+            break
+        if (remaining_chars <= 0 or remaining_bytes <= 0) and any(
+            chunks[remaining_index]
+            for remaining_index in range(index + 1, len(chunks))
+        ):
+            truncated = True
+            break
+    return "".join(preview_parts), truncated
 
 
 def _stream_evidence(
@@ -322,8 +397,13 @@ def _stream_evidence(
     *,
     stdout_redaction_applied: bool,
     stderr_redaction_applied: bool,
+    complete_process_stream_observed: bool = True,
+    captured_stream_truncated: bool = False,
+    output_safety_limit_bytes: int | None = None,
 ) -> tuple[dict[str, Any], str]:
-    combined, preview = _combined_diagnostic_preview(saved_stdout, saved_stderr)
+    preview, preview_truncated = _combined_diagnostic_preview(
+        saved_stdout, saved_stderr
+    )
     raw_output = saved_stdout or saved_stderr
     raw_source = (
         "saved_redacted_stdout"
@@ -335,21 +415,31 @@ def _stream_evidence(
             observed_stdout,
             saved_stdout,
             redaction_applied=stdout_redaction_applied,
+            complete_process_stream_observed=complete_process_stream_observed,
+            captured_stream_truncated=captured_stream_truncated,
         ),
         "stderr": _stream_record(
             observed_stderr,
             saved_stderr,
             redaction_applied=stderr_redaction_applied,
+            complete_process_stream_observed=complete_process_stream_observed,
+            captured_stream_truncated=captured_stream_truncated,
         ),
         "raw_output": {
             "source": raw_source,
+            "artifact_path": (
+                "stdout.txt"
+                if saved_stdout
+                else "stderr.txt" if saved_stderr else None
+            ),
+            "duplicate_raw_output_artifact_suppressed": True,
             "saved_redacted_evidence": {
                 "char_count": len(raw_output),
                 "byte_count": len(raw_output.encode("utf-8")),
                 "sha256": _text_sha256(raw_output),
-                "truncated": False,
+                "truncated": captured_stream_truncated,
             },
-            "complete_evidence_truncated": False,
+            "complete_evidence_truncated": captured_stream_truncated,
             "contains_unredacted_process_stream": False,
         },
         "diagnostic_preview": {
@@ -359,11 +449,17 @@ def _stream_evidence(
                 "byte_count": len(preview.encode("utf-8")),
                 "sha256": _text_sha256(preview),
             },
-            "truncated": preview != combined,
+            "truncated": preview_truncated or captured_stream_truncated,
             "limit_chars": MAX_DIAGNOSTIC_CHARS,
             "limit_bytes": MAX_DIAGNOSTIC_BYTES,
         },
+        "captured_process_bytes": len(observed_stdout.encode("utf-8"))
+        + len(observed_stderr.encode("utf-8")),
+        "complete_process_stream_observed": complete_process_stream_observed,
+        "captured_stream_truncated": captured_stream_truncated,
     }
+    if output_safety_limit_bytes is not None:
+        evidence["output_safety_limit_bytes"] = output_safety_limit_bytes
     return evidence, preview
 
 
@@ -647,6 +743,7 @@ class _SubscriptionBackend:
     backend_id = ""
     executable = ""
     allow_large_streams = False
+    max_process_output_bytes: int | None = None
 
     def __init__(
         self,
@@ -673,6 +770,34 @@ class _SubscriptionBackend:
     def _command(self, *arguments: str) -> list[str]:
         return [*self.command_prefix, *arguments]
 
+    def _record_large_streams(
+        self,
+        stdout: str,
+        stderr: str,
+        *,
+        complete_process_stream_observed: bool,
+        captured_stream_truncated: bool,
+        output_safety_limit_bytes: int | None = None,
+    ) -> dict[str, Any]:
+        self.last_stdout, stdout_redaction_applied = _redact_codex_stdout(stdout)
+        self.last_stderr, stderr_redaction_applied = _redact_text(stderr)
+        stream_evidence, self.last_diagnostic_preview = _stream_evidence(
+            stdout,
+            stderr,
+            self.last_stdout,
+            self.last_stderr,
+            stdout_redaction_applied=stdout_redaction_applied,
+            stderr_redaction_applied=stderr_redaction_applied,
+            complete_process_stream_observed=complete_process_stream_observed,
+            captured_stream_truncated=captured_stream_truncated,
+            output_safety_limit_bytes=output_safety_limit_bytes,
+        )
+        self.last_metadata = {
+            **self.last_metadata,
+            "stream_evidence": stream_evidence,
+        }
+        return stream_evidence
+
     def _run(
         self,
         arguments: Sequence[str],
@@ -691,17 +816,81 @@ class _SubscriptionBackend:
                 kind=kind,
                 control=self.process_control,
                 env=_safe_environment(self.base_environment),
+                max_output_bytes=self.max_process_output_bytes,
             )
+        except ProcessCancelled as exc:
+            if self.allow_large_streams:
+                self._record_large_streams(
+                    exc.stdout,
+                    exc.stderr,
+                    complete_process_stream_observed=False,
+                    captured_stream_truncated=True,
+                    output_safety_limit_bytes=self.max_process_output_bytes,
+                )
+                self.last_metadata.update(
+                    {
+                        "captured_process_bytes": len(exc.stdout.encode("utf-8"))
+                        + len(exc.stderr.encode("utf-8")),
+                        "complete_process_stream_observed": False,
+                        "terminal_state": "cancelled",
+                    }
+                )
+            raise
         except FileNotFoundError as exc:
             raise SubscriptionBackendError(
                 "cli_missing",
                 f"{self.backend_id} CLI executable was not found",
             ) from exc
+        except ProcessOutputLimitExceeded as exc:
+            if self.allow_large_streams:
+                self._record_large_streams(
+                    exc.stdout,
+                    exc.stderr,
+                    complete_process_stream_observed=False,
+                    captured_stream_truncated=True,
+                    output_safety_limit_bytes=exc.limit_bytes,
+                )
+                self.last_metadata.update(
+                    {
+                        "captured_process_bytes": exc.captured_bytes,
+                        "complete_process_stream_observed": False,
+                        "output_safety_limit_bytes": exc.limit_bytes,
+                        "terminal_state": "output_safety_limit_exceeded",
+                    }
+                )
+            raise SubscriptionBackendError(
+                "output_safety_limit_exceeded",
+                f"{self.backend_id} exceeded the process output safety limit",
+                raw_output=self.last_diagnostic_preview or "",
+                metadata=self.last_metadata,
+            ) from exc
         except subprocess.TimeoutExpired as exc:
+            stdout = exc.stdout if isinstance(exc.stdout, str) else ""
+            stderr = exc.stderr if isinstance(exc.stderr, str) else ""
+            if self.allow_large_streams:
+                self._record_large_streams(
+                    stdout,
+                    stderr,
+                    complete_process_stream_observed=False,
+                    captured_stream_truncated=True,
+                    output_safety_limit_bytes=self.max_process_output_bytes,
+                )
+                self.last_metadata.update(
+                    {
+                        "captured_process_bytes": len(stdout.encode("utf-8"))
+                        + len(stderr.encode("utf-8")),
+                        "complete_process_stream_observed": False,
+                        "terminal_state": "timeout",
+                    }
+                )
             raise SubscriptionBackendError(
                 "timeout",
                 f"{self.backend_id} timed out after {timeout_seconds} seconds",
-                raw_output=f"{exc.stdout or ''}\n{exc.stderr or ''}",
+                raw_output=(
+                    self.last_diagnostic_preview
+                    if self.allow_large_streams
+                    else f"{stdout}\n{stderr}"
+                ),
                 metadata=self.last_metadata,
             ) from exc
 
@@ -896,6 +1085,7 @@ class _SubscriptionBackend:
                 manifest = sandbox_manifest()
                 terminal = safety_violation(manifest) or "cancelled"
                 self.last_metadata = {
+                    **self.last_metadata,
                     **metadata,
                     "sandbox_manifest": manifest,
                     "terminal_state": terminal,
@@ -912,6 +1102,7 @@ class _SubscriptionBackend:
                 terminal = safety_violation(manifest)
                 if terminal is not None:
                     self.last_metadata = {
+                        **exc.metadata,
                         **metadata,
                         "sandbox_manifest": manifest,
                         "terminal_state": terminal,
@@ -926,19 +1117,12 @@ class _SubscriptionBackend:
                 self.last_metadata = dict(exc.metadata)
                 raise
             if self.allow_large_streams:
-                self.last_stdout, stdout_redaction_applied = (
-                    _redact_codex_stdout(completed.stdout)
-                )
-                self.last_stderr, stderr_redaction_applied = _redact_text(
-                    completed.stderr
-                )
-                stream_evidence, self.last_diagnostic_preview = _stream_evidence(
+                stream_evidence = self._record_large_streams(
                     completed.stdout,
                     completed.stderr,
-                    self.last_stdout,
-                    self.last_stderr,
-                    stdout_redaction_applied=stdout_redaction_applied,
-                    stderr_redaction_applied=stderr_redaction_applied,
+                    complete_process_stream_observed=True,
+                    captured_stream_truncated=False,
+                    output_safety_limit_bytes=self.max_process_output_bytes,
                 )
                 metadata = {
                     **metadata,
@@ -1055,6 +1239,7 @@ class CodexSubscriptionBackend(_SubscriptionBackend):
     backend_id = "codex-subscription"
     executable = "codex"
     allow_large_streams = True
+    max_process_output_bytes = CODEX_MAX_PROCESS_OUTPUT_BYTES
 
     def _execution_evidence(
         self,
@@ -1222,6 +1407,25 @@ class CodexSubscriptionBackend(_SubscriptionBackend):
             and isinstance(event.get("item"), dict)
             and event["item"].get("type") == "agent_message"
         ]
+        result_payloads: list[Any] = [*agent_messages]
+        for event in events:
+            item = event.get("item")
+            if not isinstance(item, Mapping):
+                continue
+            if str(item.get("type") or "") not in _CODEX_TOOL_EVENT_TYPES:
+                continue
+            for field in ("aggregated_output", "output", "result"):
+                if field in item:
+                    result_payloads.append(item[field])
+        if any(
+            find_high_confidence_credential(payload) is not None
+            for payload in result_payloads
+        ):
+            raise SubscriptionBackendError(
+                "credential_exposure_detected",
+                "Codex result stream contained high-confidence credential material",
+                raw_output=stdout,
+            )
         final_messages = [
             message
             for message in agent_messages
