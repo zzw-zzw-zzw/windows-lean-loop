@@ -147,6 +147,10 @@ class AgentProtocolTests(unittest.TestCase):
             ]
             for response in responses:
                 self.assertEqual(response["metadata"]["backend_id"], "codex-subscription")
+                self.assertNotIn("tool_events", response["metadata"])
+                self.assertTrue(
+                    response["metadata"]["tool_events_saved_separately"]
+                )
                 self.assertIsNone(response["metadata"]["actual_model"])
                 self.assertEqual(
                     response["metadata"]["actual_model_status"],
@@ -173,6 +177,49 @@ class AgentProtocolTests(unittest.TestCase):
             for call in sorted((root / "agent-calls").iterdir()):
                 self.assertTrue((call / "tool-events.json").is_file())
                 self.assertTrue((call / "sandbox-manifest.json").is_file())
+
+    def test_truncated_fallback_is_saved_only_as_diagnostic_preview(self) -> None:
+        class LargeError(RuntimeError):
+            kind = "malformed_output"
+            raw_output = "x" * 70000
+
+        class Backend:
+            backend_id = "codex-subscription"
+            last_metadata = {"backend_id": backend_id}
+
+            def invoke(self, request, config, temp_dir):
+                raise LargeError("failed")
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime = AgentRuntime(
+                workflow_root=root, run_id="run-1", backend=Backend()
+            )
+            with self.assertRaises(LargeError):
+                runtime.invoke(
+                    role="prover",
+                    phase="prove",
+                    output_type="lean_file",
+                    config=_config(),
+                    system_prompt="system",
+                    user_prompt="user",
+                    temp_dir=root / "tmp",
+                )
+
+            call_dir = next((root / "agent-calls").iterdir())
+            preview = (call_dir / "diagnostic-preview.txt").read_text(
+                encoding="utf-8"
+            )
+            response = json.loads(
+                (call_dir / "response.json").read_text(encoding="utf-8")
+            )
+            self.assertLessEqual(len(preview.encode("utf-8")), 65536)
+            self.assertFalse((call_dir / "raw-output.txt").exists())
+            self.assertFalse(response["metadata"]["raw_output_saved"])
+            self.assertTrue(response["metadata"]["diagnostic_preview_saved"])
+            self.assertTrue(
+                response["metadata"]["diagnostic_preview_truncated"]
+            )
 
     def test_capabilities_are_versioned(self) -> None:
         value = protocol_capabilities()

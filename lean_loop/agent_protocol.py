@@ -22,6 +22,7 @@ AGENT_ROLES = {
     "explainer",
 }
 OUTPUT_TYPES = {"json", "lean_file"}
+DIAGNOSTIC_PREVIEW_BYTES = 65536
 
 AgentRole = Literal[
     "formalizer", "planner", "prover", "reviewer", "auditor", "retriever", "explainer"
@@ -174,9 +175,29 @@ class AgentRuntime:
             return dict(value)
         return {"backend_id": str(getattr(self.backend, "backend_id", "unknown"))}
 
+    @staticmethod
+    def _response_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
+        compact = dict(metadata)
+        if isinstance(compact.pop("tool_events", None), list):
+            compact["tool_events_saved_separately"] = True
+        return compact
+
+    @staticmethod
+    def _stream_preview_truncated(metadata: dict[str, Any]) -> bool:
+        streams = metadata.get("stream_evidence")
+        if not isinstance(streams, dict):
+            return False
+        preview = streams.get("diagnostic_preview")
+        return (
+            bool(preview.get("truncated"))
+            if isinstance(preview, dict)
+            else False
+        )
+
     def _persist_backend_streams(self, call_dir: Path) -> bool:
         stdout = getattr(self.backend, "last_stdout", None)
         stderr = getattr(self.backend, "last_stderr", None)
+        diagnostic_preview = getattr(self.backend, "last_diagnostic_preview", None)
         if not isinstance(stdout, str) and not isinstance(stderr, str):
             return False
         stdout_text = stdout if isinstance(stdout, str) else ""
@@ -184,7 +205,21 @@ class AgentRuntime:
         atomic_write_text(call_dir / "stdout.txt", stdout_text)
         atomic_write_text(call_dir / "stderr.txt", stderr_text)
         atomic_write_text(call_dir / "raw-output.txt", stdout_text or stderr_text)
+        if isinstance(diagnostic_preview, str):
+            atomic_write_text(
+                call_dir / "diagnostic-preview.txt", diagnostic_preview
+            )
         return True
+
+    @staticmethod
+    def _bounded_diagnostic_preview(value: str) -> tuple[str, bool]:
+        encoded = value.encode("utf-8")
+        if len(encoded) <= DIAGNOSTIC_PREVIEW_BYTES:
+            return value, False
+        preview = encoded[:DIAGNOSTIC_PREVIEW_BYTES].decode(
+            "utf-8", errors="ignore"
+        )
+        return preview, True
 
     @staticmethod
     def _persist_backend_evidence(call_dir: Path, metadata: dict[str, Any]) -> None:
@@ -242,9 +277,28 @@ class AgentRuntime:
             error_kind = getattr(exc, "kind", None)
             backend_metadata = self._backend_metadata()
             self._persist_backend_evidence(call_dir, backend_metadata)
+            response_metadata = self._response_metadata(backend_metadata)
             raw_streams_saved = self._persist_backend_streams(call_dir)
+            raw_output_saved = raw_streams_saved
+            diagnostic_preview_saved = raw_streams_saved and (
+                call_dir / "diagnostic-preview.txt"
+            ).is_file()
+            diagnostic_preview_truncated = self._stream_preview_truncated(
+                backend_metadata
+            )
             if not raw_streams_saved and isinstance(raw_output, str) and raw_output:
-                atomic_write_text(call_dir / "raw-output.txt", raw_output[: 1024 * 1024])
+                diagnostic_preview, diagnostic_preview_truncated = (
+                    self._bounded_diagnostic_preview(raw_output)
+                )
+                atomic_write_text(
+                    call_dir / "diagnostic-preview.txt", diagnostic_preview
+                )
+                diagnostic_preview_saved = True
+                if not diagnostic_preview_truncated:
+                    atomic_write_text(
+                        call_dir / "raw-output.txt", diagnostic_preview
+                    )
+                    raw_output_saved = True
             response = AgentResponse(
                 request_id=request_id,
                 role=role,
@@ -261,9 +315,12 @@ class AgentRuntime:
                 },
                 metadata={
                     "model": config.model,
-                    "raw_output_saved": raw_streams_saved
-                    or bool(isinstance(raw_output, str) and raw_output),
-                    **backend_metadata,
+                    "raw_output_saved": raw_output_saved,
+                    "diagnostic_preview_saved": diagnostic_preview_saved,
+                    "diagnostic_preview_truncated": (
+                        diagnostic_preview_truncated
+                    ),
+                    **response_metadata,
                     **(
                         {"error_classification": error_kind}
                         if isinstance(error_kind, str)
@@ -275,6 +332,7 @@ class AgentRuntime:
             raise
         backend_metadata = self._backend_metadata()
         self._persist_backend_evidence(call_dir, backend_metadata)
+        response_metadata = self._response_metadata(backend_metadata)
         raw_streams_saved = self._persist_backend_streams(call_dir)
         response = AgentResponse(
             request_id=request_id,
@@ -289,7 +347,13 @@ class AgentRuntime:
                 "model": config.model,
                 "reasoning_effort": config.reasoning_effort,
                 "raw_output_saved": raw_streams_saved,
-                **backend_metadata,
+                "diagnostic_preview_saved": (
+                    call_dir / "diagnostic-preview.txt"
+                ).is_file(),
+                "diagnostic_preview_truncated": (
+                    self._stream_preview_truncated(backend_metadata)
+                ),
+                **response_metadata,
             },
         )
         atomic_write_json(call_dir / "response.json", response.to_dict())

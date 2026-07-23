@@ -22,6 +22,7 @@ from lean_loop.process_control import (
 
 SUBSCRIPTION_BACKENDS = {"codex-subscription", "claude-subscription"}
 MAX_DIAGNOSTIC_CHARS = 65536
+MAX_DIAGNOSTIC_BYTES = 65536
 _SECRET_ENV_PARTS = (
     "API_KEY",
     "ACCESS_TOKEN",
@@ -36,13 +37,39 @@ _SECRET_ENV_PARTS = (
 )
 _SENSITIVE_ENV_PREFIXES = ("LEAN_AGENT_", "OPENAI_", "ANTHROPIC_", "CLAUDE_CODE_")
 _EXTERNAL_OVERRIDE_ENV_PARTS = ("BASE_URL", "GATEWAY", "API_HOST", "ENDPOINT")
-_REDACTIONS = (
-    re.compile(r"(?i)\bBearer\s+[^\s\"']+"),
-    re.compile(r"\bsk-[A-Za-z0-9_-]{8,}\b"),
-    re.compile(
-        r'(?i)(\"?(?:api[_-]?key|access[_-]?token|refresh[_-]?token|'
-        r'authorization|cookie)\"?\s*[:=]\s*)\"?[^\s,}\"]+'
-    ),
+_REDACTED = "<redacted>"
+_SENSITIVE_KEY_MARKERS = (
+    "api_key",
+    "token",
+    "auth_token",
+    "session_token",
+    "access_token",
+    "refresh_token",
+    "authorization",
+    "cookie",
+    "password",
+    "secret",
+    "client_secret",
+    "credential",
+    "encrypted_content",
+)
+_BEARER_REDACTION = re.compile(r"(?i)(\bBearer\s+)([^\s\"']+)")
+_SK_REDACTION = re.compile(r"\bsk-[A-Za-z0-9_-]{8,}\b")
+_DOUBLE_QUOTED_FIELD_REDACTION = re.compile(
+    r'(?P<prefix>(?:"(?P<quoted_key>[^"\\]{1,128})"|'
+    r'(?P<bare_key>[A-Za-z_][A-Za-z0-9_.-]{0,127}))\s*[:=]\s*")'
+    r'(?P<value>(?:\\.|[^"\\])*)(?P<suffix>")'
+)
+_SINGLE_QUOTED_FIELD_REDACTION = re.compile(
+    r"(?P<prefix>(?:'(?P<quoted_key>[^'\\]{1,128})'|"
+    r"(?P<bare_key>[A-Za-z_][A-Za-z0-9_.-]{0,127}))\s*[:=]\s*')"
+    r"(?P<value>(?:\\.|[^'\\])*)(?P<suffix>')"
+)
+_UNQUOTED_FIELD_PREFIX = re.compile(
+    r'(?:"(?P<double_quoted_key>[^"\\]{1,128})"|'
+    r"'(?P<single_quoted_key>[^'\\]{1,128})'|"
+    r"(?P<bare_key>\b[A-Za-z_][A-Za-z0-9_.-]{0,127}\b))"
+    r"[^\S\r\n]*[:=]"
 )
 _CLAUDE_MODEL = re.compile(r"^[a-z0-9][a-z0-9._-]{0,127}$")
 CODEX_TOOL_EXECUTION_POLICY = "TOOL_ENABLED_AGENT_SANDBOX"
@@ -95,20 +122,249 @@ class SubscriptionBackendError(ApiError):
     ) -> None:
         super().__init__(message)
         self.kind = kind
-        self.raw_output = _sanitize(raw_output)
+        self.raw_output = _diagnostic_preview(raw_output)
         self.metadata = dict(metadata or {})
 
 
-def _sanitize(value: str) -> str:
-    clean = value
-    for pattern in _REDACTIONS:
+def _redact_text(value: str) -> tuple[str, bool]:
+    clean = _BEARER_REDACTION.sub(
+        lambda match: match.group(1) + _REDACTED,
+        value,
+    )
+    clean = _SK_REDACTION.sub(_REDACTED, clean)
+    for pattern in (
+        _DOUBLE_QUOTED_FIELD_REDACTION,
+        _SINGLE_QUOTED_FIELD_REDACTION,
+    ):
         clean = pattern.sub(
-            lambda match: (
-                match.group(1) + "<redacted>" if match.lastindex else "<redacted>"
-            ),
+            _redact_text_field,
             clean,
         )
-    return clean[:MAX_DIAGNOSTIC_CHARS]
+    clean = _redact_unquoted_sensitive_fields(clean)
+    return clean, clean != value
+
+
+def _redact(value: str) -> str:
+    return _redact_text(value)[0]
+
+
+def _normalize_sensitive_key(value: Any) -> str:
+    text = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", str(value))
+    return re.sub(r"[^a-z0-9]+", "_", text.lower()).strip("_")
+
+
+def _is_sensitive_key(value: Any) -> bool:
+    normalized = _normalize_sensitive_key(value)
+    return any(marker in normalized for marker in _SENSITIVE_KEY_MARKERS)
+
+
+def _redact_text_field(match: re.Match[str]) -> str:
+    key = match.groupdict().get("quoted_key") or match.groupdict().get("bare_key")
+    if not _is_sensitive_key(key):
+        return match.group(0)
+    return (
+        match.group("prefix")
+        + _REDACTED
+        + (match.groupdict().get("suffix") or "")
+    )
+
+
+def _redact_unquoted_sensitive_fields(value: str) -> str:
+    saved_lines: list[str] = []
+    for chunk in value.splitlines(keepends=True):
+        if chunk.endswith("\r\n"):
+            line, ending = chunk[:-2], "\r\n"
+        elif chunk.endswith(("\r", "\n")):
+            line, ending = chunk[:-1], chunk[-1:]
+        else:
+            line, ending = chunk, ""
+        saved_line = line
+        for match in _UNQUOTED_FIELD_PREFIX.finditer(line):
+            key = (
+                match.group("double_quoted_key")
+                or match.group("single_quoted_key")
+                or match.group("bare_key")
+            )
+            if not _is_sensitive_key(key):
+                continue
+            remainder = line[match.end() :]
+            leading_space = remainder[: len(remainder) - len(remainder.lstrip(" \t"))]
+            field_value = remainder[len(leading_space) :]
+            if field_value.startswith(
+                (f'"{_REDACTED}"', f"'{_REDACTED}'")
+            ):
+                continue
+            saved_line = (
+                line[: match.end()]
+                + leading_space
+                + _REDACTED
+            )
+            break
+        saved_lines.append(saved_line + ending)
+    return "".join(saved_lines)
+
+
+def _redact_json_value(value: Any) -> tuple[Any, bool]:
+    if isinstance(value, dict):
+        redacted: dict[Any, Any] = {}
+        changed = False
+        for key, item in value.items():
+            if _is_sensitive_key(key):
+                redacted[key] = _REDACTED
+                changed = True
+            else:
+                redacted_item, item_changed = _redact_json_value(item)
+                redacted[key] = redacted_item
+                changed = changed or item_changed
+        return redacted, changed
+    if isinstance(value, list):
+        redacted_items: list[Any] = []
+        changed = False
+        for item in value:
+            redacted_item, item_changed = _redact_json_value(item)
+            redacted_items.append(redacted_item)
+            changed = changed or item_changed
+        return redacted_items, changed
+    if isinstance(value, str):
+        return _redact_text(value)
+    return value, False
+
+
+def _redact_codex_stdout(value: str) -> tuple[str, bool]:
+    if not value:
+        return "", False
+    has_terminal_newline = value.endswith("\n")
+    lines = value.split("\n")
+    if has_terminal_newline:
+        lines.pop()
+    saved_lines: list[str] = []
+    redaction_applied = False
+    for raw_line in lines:
+        line = raw_line[:-1] if raw_line.endswith("\r") else raw_line
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            saved_line, changed = _redact_text(line)
+        else:
+            redacted_event, changed = _redact_json_value(event)
+            saved_line = json.dumps(
+                redacted_event,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+        saved_lines.append(saved_line)
+        redaction_applied = redaction_applied or changed
+    saved = "\n".join(saved_lines)
+    if has_terminal_newline:
+        saved += "\n"
+    return saved, redaction_applied
+
+
+def _diagnostic_preview(value: str) -> str:
+    clean = _redact(value)
+    return _bounded_redacted_preview(clean)
+
+
+def _bounded_redacted_preview(value: str) -> str:
+    clean = value[:MAX_DIAGNOSTIC_CHARS]
+    encoded = clean.encode("utf-8")
+    if len(encoded) <= MAX_DIAGNOSTIC_BYTES:
+        return clean
+    return encoded[:MAX_DIAGNOSTIC_BYTES].decode("utf-8", errors="ignore")
+
+
+def _sanitize(value: str) -> str:
+    """Return a bounded, redacted diagnostic string."""
+    return _diagnostic_preview(value)
+
+
+def _text_sha256(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _stream_record(
+    process_stream: str,
+    saved_stream: str,
+    *,
+    redaction_applied: bool,
+) -> dict[str, Any]:
+    return {
+        "process_stream": {
+            "char_count": len(process_stream),
+            "byte_count": len(process_stream.encode("utf-8")),
+            "sha256": _text_sha256(process_stream),
+        },
+        "saved_redacted_evidence": {
+            "char_count": len(saved_stream),
+            "byte_count": len(saved_stream.encode("utf-8")),
+            "sha256": _text_sha256(saved_stream),
+            "truncated": False,
+        },
+        "complete_evidence_truncated": False,
+        "redaction_applied": redaction_applied,
+    }
+
+
+def _combined_diagnostic_preview(stdout: str, stderr: str) -> tuple[str, str]:
+    if stdout and stderr:
+        combined = f"{stdout}\n--- stderr ---\n{stderr}"
+    else:
+        combined = stdout or stderr
+    return combined, _bounded_redacted_preview(combined)
+
+
+def _stream_evidence(
+    observed_stdout: str,
+    observed_stderr: str,
+    saved_stdout: str,
+    saved_stderr: str,
+    *,
+    stdout_redaction_applied: bool,
+    stderr_redaction_applied: bool,
+) -> tuple[dict[str, Any], str]:
+    combined, preview = _combined_diagnostic_preview(saved_stdout, saved_stderr)
+    raw_output = saved_stdout or saved_stderr
+    raw_source = (
+        "saved_redacted_stdout"
+        if saved_stdout
+        else "saved_redacted_stderr" if saved_stderr else "empty"
+    )
+    evidence = {
+        "stdout": _stream_record(
+            observed_stdout,
+            saved_stdout,
+            redaction_applied=stdout_redaction_applied,
+        ),
+        "stderr": _stream_record(
+            observed_stderr,
+            saved_stderr,
+            redaction_applied=stderr_redaction_applied,
+        ),
+        "raw_output": {
+            "source": raw_source,
+            "saved_redacted_evidence": {
+                "char_count": len(raw_output),
+                "byte_count": len(raw_output.encode("utf-8")),
+                "sha256": _text_sha256(raw_output),
+                "truncated": False,
+            },
+            "complete_evidence_truncated": False,
+            "contains_unredacted_process_stream": False,
+        },
+        "diagnostic_preview": {
+            "source": "saved_redacted_stdout_and_stderr",
+            "saved_preview": {
+                "char_count": len(preview),
+                "byte_count": len(preview.encode("utf-8")),
+                "sha256": _text_sha256(preview),
+            },
+            "truncated": preview != combined,
+            "limit_chars": MAX_DIAGNOSTIC_CHARS,
+            "limit_bytes": MAX_DIAGNOSTIC_BYTES,
+        },
+    }
+    return evidence, preview
 
 
 def _safe_environment(source: Mapping[str, str] | None = None) -> dict[str, str]:
@@ -390,6 +646,7 @@ def _matches_output_contract(text: str, output_type: str) -> bool:
 class _SubscriptionBackend:
     backend_id = ""
     executable = ""
+    allow_large_streams = False
 
     def __init__(
         self,
@@ -410,6 +667,7 @@ class _SubscriptionBackend:
         self.last_metadata: dict[str, Any] = {"backend_id": self.backend_id}
         self.last_stdout: str | None = None
         self.last_stderr: str | None = None
+        self.last_diagnostic_preview: str | None = None
         self._ready: dict[tuple[str, str], dict[str, Any]] = {}
 
     def _command(self, *arguments: str) -> list[str]:
@@ -540,7 +798,11 @@ class _SubscriptionBackend:
         }
         self.last_stdout = None
         self.last_stderr = None
+        self.last_diagnostic_preview = None
         report = self.inspect(model=config.model, reasoning_effort=reasoning)
+        self.last_stdout = None
+        self.last_stderr = None
+        self.last_diagnostic_preview = None
         metadata = {
             "backend_id": self.backend_id,
             "cli_version": report["cli_version"],
@@ -663,8 +925,28 @@ class _SubscriptionBackend:
                 exc.metadata["sandbox_manifest"] = manifest
                 self.last_metadata = dict(exc.metadata)
                 raise
-            self.last_stdout = _sanitize(completed.stdout)
-            self.last_stderr = _sanitize(completed.stderr)
+            if self.allow_large_streams:
+                self.last_stdout, stdout_redaction_applied = (
+                    _redact_codex_stdout(completed.stdout)
+                )
+                self.last_stderr, stderr_redaction_applied = _redact_text(
+                    completed.stderr
+                )
+                stream_evidence, self.last_diagnostic_preview = _stream_evidence(
+                    completed.stdout,
+                    completed.stderr,
+                    self.last_stdout,
+                    self.last_stderr,
+                    stdout_redaction_applied=stdout_redaction_applied,
+                    stderr_redaction_applied=stderr_redaction_applied,
+                )
+                metadata = {
+                    **metadata,
+                    "stream_evidence": stream_evidence,
+                }
+            else:
+                self.last_stdout = _sanitize(completed.stdout)
+                self.last_stderr = _sanitize(completed.stderr)
             execution_evidence = self._execution_evidence(
                 completed.stdout,
                 sandbox_root=cwd,
@@ -673,8 +955,11 @@ class _SubscriptionBackend:
                 execution_evidence.pop("_sandbox_boundary_violations", [])
             )
             if (
-                len(completed.stdout) > MAX_DIAGNOSTIC_CHARS
-                or len(completed.stderr) > MAX_DIAGNOSTIC_CHARS
+                not self.allow_large_streams
+                and (
+                    len(completed.stdout) > MAX_DIAGNOSTIC_CHARS
+                    or len(completed.stderr) > MAX_DIAGNOSTIC_CHARS
+                )
             ):
                 manifest = sandbox_manifest(tool_boundary_violations)
                 terminal = safety_violation(manifest) or "output_too_large"
@@ -769,6 +1054,7 @@ class _SubscriptionBackend:
 class CodexSubscriptionBackend(_SubscriptionBackend):
     backend_id = "codex-subscription"
     executable = "codex"
+    allow_large_streams = True
 
     def _execution_evidence(
         self,
