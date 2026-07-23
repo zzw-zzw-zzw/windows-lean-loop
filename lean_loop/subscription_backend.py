@@ -155,29 +155,15 @@ def _redact_text_field(match: re.Match[str]) -> str:
     key = match.groupdict().get("quoted_key") or match.groupdict().get("bare_key")
     if not is_sensitive_field_name(key):
         return match.group(0)
+    if _is_lean_declaration_key(match.string, match.start()):
+        return match.group(0)
+    if str(match.groupdict().get("value") or "").strip() == _REDACTED:
+        return match.group(0)
     return (
         match.group("prefix")
         + _REDACTED
         + (match.groupdict().get("suffix") or "")
     )
-
-
-def _active_quote_at(value: str, position: int) -> str | None:
-    active: str | None = None
-    escaped = False
-    for char in value[:position]:
-        if escaped:
-            escaped = False
-            continue
-        if char == "\\":
-            escaped = True
-            continue
-        if active is None:
-            if char in {'"', "'"}:
-                active = char
-        elif char == active:
-            active = None
-    return active
 
 
 def _closing_quote(value: str, start: int, quote: str) -> int | None:
@@ -195,6 +181,38 @@ def _closing_quote(value: str, start: int, quote: str) -> int | None:
     return None
 
 
+def _is_lean_declaration_key(value: str, position: int) -> bool:
+    local_prefix = value[max(0, position - 64) : position]
+    return bool(
+        re.search(
+            r"\b(?:abbrev|class|def|example|instance|lemma|structure|theorem)\s+$",
+            local_prefix,
+        )
+    )
+
+
+def _field_value_is_exact_redacted(
+    value: str,
+    *,
+    value_start: int,
+    active_quote: str | None,
+) -> bool:
+    if active_quote is not None:
+        value_end = _closing_quote(value, value_start, active_quote)
+        field_value = value[
+            value_start : len(value) if value_end is None else value_end
+        ]
+        return field_value.strip() == _REDACTED
+    remainder = value[value_start:]
+    if remainder.startswith(('"', "'")):
+        quote = remainder[0]
+        value_end = _closing_quote(value, value_start + 1, quote)
+        if value_end is None:
+            return False
+        return value[value_start + 1 : value_end].strip() == _REDACTED
+    return remainder.strip() == _REDACTED
+
+
 def _redact_unquoted_sensitive_fields(value: str) -> str:
     saved_lines: list[str] = []
     for chunk in value.splitlines(keepends=True):
@@ -206,7 +224,23 @@ def _redact_unquoted_sensitive_fields(value: str) -> str:
             line, ending = chunk, ""
         saved_parts: list[str] = []
         cursor = 0
+        quote_cursor = 0
+        active_quote: str | None = None
+        escaped = False
         for match in _UNQUOTED_FIELD_PREFIX.finditer(line):
+            for char in line[quote_cursor : match.start()]:
+                if escaped:
+                    escaped = False
+                    continue
+                if char == "\\":
+                    escaped = True
+                    continue
+                if active_quote is None:
+                    if char in {'"', "'"}:
+                        active_quote = char
+                elif char == active_quote:
+                    active_quote = None
+            quote_cursor = match.start()
             if match.start() < cursor:
                 continue
             key = (
@@ -216,15 +250,17 @@ def _redact_unquoted_sensitive_fields(value: str) -> str:
             )
             if not is_sensitive_field_name(key, allow_ambiguous=False):
                 continue
+            if _is_lean_declaration_key(line, match.start()):
+                continue
             remainder = line[match.end() :]
             leading_space = remainder[: len(remainder) - len(remainder.lstrip(" \t"))]
             value_start = match.end() + len(leading_space)
-            field_value = remainder[len(leading_space) :]
-            if field_value.startswith(
-                (f'"{_REDACTED}"', f"'{_REDACTED}'")
-            ) or field_value.startswith(_REDACTED):
+            if _field_value_is_exact_redacted(
+                line,
+                value_start=value_start,
+                active_quote=active_quote,
+            ):
                 continue
-            active_quote = _active_quote_at(line, match.start())
             value_end = (
                 _closing_quote(line, value_start, active_quote)
                 if active_quote is not None
@@ -328,7 +364,6 @@ def _stream_record(
     *,
     redaction_applied: bool,
     complete_process_stream_observed: bool,
-    captured_stream_truncated: bool,
 ) -> dict[str, Any]:
     return {
         "process_stream": {
@@ -346,9 +381,9 @@ def _stream_record(
             "char_count": len(saved_stream),
             "byte_count": len(saved_stream.encode("utf-8")),
             "sha256": _text_sha256(saved_stream),
-            "truncated": captured_stream_truncated,
+            "complete_captured_prefix_saved": True,
+            "saved_evidence_truncated": False,
         },
-        "complete_evidence_truncated": captured_stream_truncated,
         "redaction_applied": redaction_applied,
     }
 
@@ -398,7 +433,7 @@ def _stream_evidence(
     stdout_redaction_applied: bool,
     stderr_redaction_applied: bool,
     complete_process_stream_observed: bool = True,
-    captured_stream_truncated: bool = False,
+    collection_stop_reason: str = "completed",
     output_safety_limit_bytes: int | None = None,
 ) -> tuple[dict[str, Any], str]:
     preview, preview_truncated = _combined_diagnostic_preview(
@@ -416,30 +451,30 @@ def _stream_evidence(
             saved_stdout,
             redaction_applied=stdout_redaction_applied,
             complete_process_stream_observed=complete_process_stream_observed,
-            captured_stream_truncated=captured_stream_truncated,
         ),
         "stderr": _stream_record(
             observed_stderr,
             saved_stderr,
             redaction_applied=stderr_redaction_applied,
             complete_process_stream_observed=complete_process_stream_observed,
-            captured_stream_truncated=captured_stream_truncated,
         ),
         "raw_output": {
             "source": raw_source,
+            "artifact_paths": ["stdout.txt", "stderr.txt"],
+            "artifacts_saved": True,
             "artifact_path": (
                 "stdout.txt"
                 if saved_stdout
                 else "stderr.txt" if saved_stderr else None
             ),
             "duplicate_raw_output_artifact_suppressed": True,
+            "complete_captured_prefix_saved": True,
             "saved_redacted_evidence": {
                 "char_count": len(raw_output),
                 "byte_count": len(raw_output.encode("utf-8")),
                 "sha256": _text_sha256(raw_output),
-                "truncated": captured_stream_truncated,
+                "saved_evidence_truncated": False,
             },
-            "complete_evidence_truncated": captured_stream_truncated,
             "contains_unredacted_process_stream": False,
         },
         "diagnostic_preview": {
@@ -449,14 +484,20 @@ def _stream_evidence(
                 "byte_count": len(preview.encode("utf-8")),
                 "sha256": _text_sha256(preview),
             },
-            "truncated": preview_truncated or captured_stream_truncated,
+            "preview_truncated": preview_truncated,
+            "complete_saved_evidence_previewed": not preview_truncated,
             "limit_chars": MAX_DIAGNOSTIC_CHARS,
             "limit_bytes": MAX_DIAGNOSTIC_BYTES,
         },
         "captured_process_bytes": len(observed_stdout.encode("utf-8"))
         + len(observed_stderr.encode("utf-8")),
         "complete_process_stream_observed": complete_process_stream_observed,
-        "captured_stream_truncated": captured_stream_truncated,
+        "complete_captured_prefix_saved": True,
+        "saved_evidence_truncated": False,
+        "collection_stop_reason": collection_stop_reason,
+        "output_safety_limit_exceeded": (
+            collection_stop_reason == "output_safety_limit_exceeded"
+        ),
     }
     if output_safety_limit_bytes is not None:
         evidence["output_safety_limit_bytes"] = output_safety_limit_bytes
@@ -567,6 +608,7 @@ def _codex_tool_evidence(
     sandbox_root: Path,
     protected_root: Path | None,
 ) -> dict[str, Any]:
+    exposure_category = find_high_confidence_credential(events)
     archived: list[dict[str, Any]] = []
     boundary_violations: list[str] = []
     path_redactions = [
@@ -632,11 +674,20 @@ def _codex_tool_evidence(
             row["file_changes"] = archived_changes
         archived.append(row)
     counts = Counter(str(row["event_type"]) for row in archived)
-    return {
+    evidence = {
         "tool_events": archived,
         "tool_event_counts": dict(sorted(counts.items())),
         "_sandbox_boundary_violations": sorted(set(boundary_violations)),
     }
+    redacted_evidence, redaction_applied = _redact_json_value(evidence)
+    if not isinstance(redacted_evidence, dict):
+        raise RuntimeError("Tool evidence redaction must preserve the object shape")
+    redacted_evidence["redaction_applied_to_tool_evidence"] = bool(
+        redaction_applied or exposure_category
+    )
+    if exposure_category is not None:
+        redacted_evidence["_high_confidence_exposure_category"] = exposure_category
+    return redacted_evidence
 
 
 def _project_snapshot(root: Path | None, target: Path | None) -> dict[str, Any]:
@@ -776,7 +827,7 @@ class _SubscriptionBackend:
         stderr: str,
         *,
         complete_process_stream_observed: bool,
-        captured_stream_truncated: bool,
+        collection_stop_reason: str,
         output_safety_limit_bytes: int | None = None,
     ) -> dict[str, Any]:
         self.last_stdout, stdout_redaction_applied = _redact_codex_stdout(stdout)
@@ -789,7 +840,7 @@ class _SubscriptionBackend:
             stdout_redaction_applied=stdout_redaction_applied,
             stderr_redaction_applied=stderr_redaction_applied,
             complete_process_stream_observed=complete_process_stream_observed,
-            captured_stream_truncated=captured_stream_truncated,
+            collection_stop_reason=collection_stop_reason,
             output_safety_limit_bytes=output_safety_limit_bytes,
         )
         self.last_metadata = {
@@ -824,7 +875,7 @@ class _SubscriptionBackend:
                     exc.stdout,
                     exc.stderr,
                     complete_process_stream_observed=False,
-                    captured_stream_truncated=True,
+                    collection_stop_reason="cancelled",
                     output_safety_limit_bytes=self.max_process_output_bytes,
                 )
                 self.last_metadata.update(
@@ -847,7 +898,7 @@ class _SubscriptionBackend:
                     exc.stdout,
                     exc.stderr,
                     complete_process_stream_observed=False,
-                    captured_stream_truncated=True,
+                    collection_stop_reason="output_safety_limit_exceeded",
                     output_safety_limit_bytes=exc.limit_bytes,
                 )
                 self.last_metadata.update(
@@ -872,7 +923,7 @@ class _SubscriptionBackend:
                     stdout,
                     stderr,
                     complete_process_stream_observed=False,
-                    captured_stream_truncated=True,
+                    collection_stop_reason="timeout",
                     output_safety_limit_bytes=self.max_process_output_bytes,
                 )
                 self.last_metadata.update(
@@ -1056,9 +1107,24 @@ class _SubscriptionBackend:
                     for field in _SANDBOX_SCOPE_METADATA_FIELDS
                     if field in report
                 })
-                return manifest
+                exposure_category = find_high_confidence_credential(manifest)
+                redacted_manifest, redaction_applied = _redact_json_value(manifest)
+                if not isinstance(redacted_manifest, dict):
+                    raise RuntimeError(
+                        "Sandbox manifest redaction must preserve the object shape"
+                    )
+                redacted_manifest["redaction_applied_to_sandbox_manifest"] = bool(
+                    redaction_applied or exposure_category
+                )
+                if exposure_category is not None:
+                    redacted_manifest[
+                        "_high_confidence_exposure_category"
+                    ] = exposure_category
+                return redacted_manifest
 
             def safety_violation(manifest: Mapping[str, Any]) -> str | None:
+                if manifest.get("_high_confidence_exposure_category"):
+                    return "credential_exposure_detected"
                 if not manifest.get("protected_state_unchanged"):
                     return "side_effect_detected"
                 if manifest.get("sandbox_boundary_violations"):
@@ -1121,7 +1187,7 @@ class _SubscriptionBackend:
                     completed.stdout,
                     completed.stderr,
                     complete_process_stream_observed=True,
-                    captured_stream_truncated=False,
+                    collection_stop_reason="completed",
                     output_safety_limit_bytes=self.max_process_output_bytes,
                 )
                 metadata = {
@@ -1138,6 +1204,27 @@ class _SubscriptionBackend:
             tool_boundary_violations = list(
                 execution_evidence.pop("_sandbox_boundary_violations", [])
             )
+            execution_exposure_category = execution_evidence.pop(
+                "_high_confidence_exposure_category", None
+            )
+            if execution_exposure_category is not None:
+                manifest = sandbox_manifest(tool_boundary_violations)
+                self.last_metadata = {
+                    **metadata,
+                    **execution_evidence,
+                    "sandbox_manifest": manifest,
+                    "terminal_state": "credential_exposure_detected",
+                    "exit_code": completed.returncode,
+                }
+                raise SubscriptionBackendError(
+                    "credential_exposure_detected",
+                    (
+                        f"{self.backend_id} tool stream contained "
+                        "high-confidence credential material"
+                    ),
+                    raw_output=f"{completed.stdout}\n{completed.stderr}",
+                    metadata=self.last_metadata,
+                )
             if (
                 not self.allow_large_streams
                 and (
@@ -1407,20 +1494,7 @@ class CodexSubscriptionBackend(_SubscriptionBackend):
             and isinstance(event.get("item"), dict)
             and event["item"].get("type") == "agent_message"
         ]
-        result_payloads: list[Any] = [*agent_messages]
-        for event in events:
-            item = event.get("item")
-            if not isinstance(item, Mapping):
-                continue
-            if str(item.get("type") or "") not in _CODEX_TOOL_EVENT_TYPES:
-                continue
-            for field in ("aggregated_output", "output", "result"):
-                if field in item:
-                    result_payloads.append(item[field])
-        if any(
-            find_high_confidence_credential(payload) is not None
-            for payload in result_payloads
-        ):
+        if find_high_confidence_credential(events) is not None:
             raise SubscriptionBackendError(
                 "credential_exposure_detected",
                 "Codex result stream contained high-confidence credential material",

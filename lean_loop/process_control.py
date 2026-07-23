@@ -86,6 +86,7 @@ def run_controlled_process(
             "max_output_bytes cannot be combined with stdout_line_callback"
         )
     creationflags = subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
+    process_started_at = time.monotonic()
     process = subprocess.Popen(
         list(command),
         cwd=cwd,
@@ -125,6 +126,7 @@ def run_controlled_process(
             kind=kind,
             control=control,
             max_output_bytes=max_output_bytes,
+            process_started_at=process_started_at,
         )
 
     started = time.monotonic()
@@ -186,17 +188,17 @@ def _collect_bounded_process(
     kind: str,
     control: ProcessControl | None,
     max_output_bytes: int,
+    process_started_at: float,
 ) -> subprocess.CompletedProcess[str]:
     if process.stdout is None or process.stderr is None:
         raise RuntimeError("Bounded process requires stdout and stderr pipes")
     if input_text is not None:
         if process.stdin is None:
             raise RuntimeError("Bounded process requires an stdin pipe")
-        process.stdin.write(input_text)
-        process.stdin.close()
 
     chunks: queue.Queue[tuple[str, str | None]] = queue.Queue(maxsize=16)
     stop_readers = threading.Event()
+    feeder_errors: list[BaseException] = []
 
     def drain(name: str, pipe: object) -> None:
         reader = getattr(pipe, "read")
@@ -219,14 +221,41 @@ def _collect_bounded_process(
                 except queue.Full:
                     continue
 
-    threads = [
+    reader_threads = [
         threading.Thread(target=drain, args=("stdout", process.stdout), daemon=True),
         threading.Thread(target=drain, args=("stderr", process.stderr), daemon=True),
     ]
-    for thread in threads:
+    for thread in reader_threads:
         thread.start()
 
-    started = time.monotonic()
+    feeder_thread: threading.Thread | None = None
+    if input_text is not None:
+        stdin = process.stdin
+        if stdin is None:
+            raise RuntimeError("Bounded process requires an stdin pipe")
+
+        def feed_stdin() -> None:
+            try:
+                for offset in range(0, len(input_text), 8192):
+                    stdin.write(input_text[offset : offset + 8192])
+                    stdin.flush()
+            except (BrokenPipeError, OSError, ValueError):
+                pass
+            except BaseException as exc:
+                feeder_errors.append(exc)
+            finally:
+                try:
+                    stdin.close()
+                except (BrokenPipeError, OSError, ValueError):
+                    pass
+
+        feeder_thread = threading.Thread(
+            target=feed_stdin,
+            name=f"process-stdin-{process.pid}",
+            daemon=True,
+        )
+        feeder_thread.start()
+
     stdout_parts: list[str] = []
     stderr_parts: list[str] = []
     captured_bytes = 0
@@ -237,6 +266,9 @@ def _collect_bounded_process(
 
     try:
         while process.poll() is None or len(completed_streams) < 2:
+            if feeder_errors:
+                terminate_process_tree(process)
+                raise RuntimeError("Failed to stream process stdin") from feeder_errors[0]
             if control is not None and control.cancel_requested():
                 terminate_process_tree(process)
                 stdout, stderr = captured_streams()
@@ -245,7 +277,7 @@ def _collect_bounded_process(
                     stdout=stdout,
                     stderr=stderr,
                 )
-            elapsed = time.monotonic() - started
+            elapsed = time.monotonic() - process_started_at
             if elapsed >= timeout_seconds:
                 terminate_process_tree(process)
                 stdout, stderr = captured_streams()
@@ -286,14 +318,18 @@ def _collect_bounded_process(
         stop_readers.set()
         if process.poll() is None:
             terminate_process_tree(process)
-        for thread in threads:
-            thread.join(timeout=1)
+        if feeder_thread is not None:
+            feeder_thread.join()
+        for thread in reader_threads:
+            thread.join()
         process.stdout.close()
         process.stderr.close()
         if control is not None:
             control.process_finished(process.pid)
 
     stdout, stderr = captured_streams()
+    if feeder_errors:
+        raise RuntimeError("Failed to stream process stdin") from feeder_errors[0]
     return subprocess.CompletedProcess(list(command), process.returncode, stdout, stderr)
 
 

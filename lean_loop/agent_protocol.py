@@ -41,11 +41,17 @@ _SENSITIVE_FIELD_NAMES = {
     "credential",
     "password",
 }
+_SENSITIVE_FIELD_SEGMENTS = {
+    "authorization",
+    "cookie",
+    "credential",
+    "password",
+    "secret",
+}
+_BEARER_CREDENTIAL = re.compile(
+    r"(?i)\bBearer\s+(?P<value>[A-Za-z0-9._~+/=<>\-]{1,})"
+)
 _CREDENTIAL_PATTERNS = (
-    (
-        "bearer_token",
-        re.compile(r"(?i)\bBearer\s+(?!<redacted>)[A-Za-z0-9._~+/=-]{8,}"),
-    ),
     ("openai_key", re.compile(r"\bsk-[A-Za-z0-9_-]{8,}\b")),
     ("github_token", re.compile(r"\bghp_[A-Za-z0-9]{16,}\b")),
     (
@@ -94,9 +100,11 @@ def is_sensitive_field_name(value: Any, *, allow_ambiguous: bool = True) -> bool
         return False
     if normalized in _SENSITIVE_FIELD_NAMES:
         return True
-    if allow_ambiguous and normalized in _AMBIGUOUS_SENSITIVE_FIELD_NAMES:
-        return True
+    if normalized in _AMBIGUOUS_SENSITIVE_FIELD_NAMES:
+        return allow_ambiguous
     parts = tuple(part for part in normalized.split("_") if part)
+    if any(part in _SENSITIVE_FIELD_SEGMENTS for part in parts):
+        return True
     return any(
         parts[index : index + len(marker)] == marker
         for marker in _SENSITIVE_FIELD_PARTS
@@ -104,20 +112,92 @@ def is_sensitive_field_name(value: Any, *, allow_ambiguous: bool = True) -> bool
     )
 
 
+def _is_exact_redacted_value(value: Any) -> bool:
+    if not isinstance(value, str):
+        return False
+    normalized = value.strip()
+    if len(normalized) >= 2 and normalized[0] == normalized[-1]:
+        if normalized[0] in {'"', "'"}:
+            normalized = normalized[1:-1].strip()
+    return normalized == _REDACTED
+
+
+def _closing_quote(value: str, start: int, quote: str) -> int | None:
+    escaped = False
+    for index in range(start, len(value)):
+        char = value[index]
+        if escaped:
+            escaped = False
+            continue
+        if char == "\\":
+            escaped = True
+            continue
+        if char == quote:
+            return index
+    return None
+
+
+def _is_lean_declaration_key(value: str, position: int) -> bool:
+    local_prefix = value[max(0, position - 64) : position]
+    return bool(
+        re.search(
+            r"\b(?:abbrev|class|def|example|instance|lemma|structure|theorem)\s+$",
+            local_prefix,
+        )
+    )
+
+
 def _text_credential_category(value: str) -> str | None:
-    if _REDACTED in value and value.strip() == _REDACTED:
+    if _is_exact_redacted_value(value):
         return None
+    for match in _BEARER_CREDENTIAL.finditer(value):
+        if not _is_exact_redacted_value(match.group("value")):
+            return "bearer_token"
     for category, pattern in _CREDENTIAL_PATTERNS:
         if pattern.search(value):
             return category
-    for match in _ASSIGNMENT_PREFIX.finditer(value):
-        if not is_sensitive_field_name(
-            match.group("key"), allow_ambiguous=False
-        ):
-            continue
-        remainder = value[match.end() :].lstrip()
-        if remainder and not remainder.startswith(_REDACTED):
-            return "sensitive_assignment"
+    for line in value.splitlines() or [value]:
+        quote_cursor = 0
+        active_quote: str | None = None
+        escaped = False
+        for match in _ASSIGNMENT_PREFIX.finditer(line):
+            for char in line[quote_cursor : match.start()]:
+                if escaped:
+                    escaped = False
+                    continue
+                if char == "\\":
+                    escaped = True
+                    continue
+                if active_quote is None:
+                    if char in {'"', "'"}:
+                        active_quote = char
+                elif char == active_quote:
+                    active_quote = None
+            quote_cursor = match.start()
+            if not is_sensitive_field_name(
+                match.group("key"), allow_ambiguous=False
+            ):
+                continue
+            if _is_lean_declaration_key(line, match.start()):
+                continue
+            value_start = match.end()
+            while value_start < len(line) and line[value_start] in " \t":
+                value_start += 1
+            if active_quote is not None:
+                value_end = _closing_quote(line, value_start, active_quote)
+                field_value = line[
+                    value_start : len(line) if value_end is None else value_end
+                ]
+            elif value_start < len(line) and line[value_start] in {'"', "'"}:
+                quote = line[value_start]
+                value_end = _closing_quote(line, value_start + 1, quote)
+                field_value = line[
+                    value_start + 1 : len(line) if value_end is None else value_end
+                ]
+            else:
+                field_value = line[value_start:]
+            if field_value.strip() and not _is_exact_redacted_value(field_value):
+                return "sensitive_assignment"
     return None
 
 
@@ -125,7 +205,7 @@ def find_high_confidence_credential(value: Any) -> str | None:
     if isinstance(value, Mapping):
         for key, item in value.items():
             if is_sensitive_field_name(key):
-                if item not in (None, "", _REDACTED):
+                if item not in (None, "") and not _is_exact_redacted_value(item):
                     return "sensitive_field"
                 continue
             finding = find_high_confidence_credential(item)
@@ -278,7 +358,14 @@ class AgentRuntime:
     def _backend_metadata(self) -> dict[str, Any]:
         value = getattr(self.backend, "last_metadata", None)
         if isinstance(value, dict):
-            return dict(value)
+            finding = find_high_confidence_credential(value)
+            if finding is None:
+                return dict(value)
+            return {
+                "backend_id": str(getattr(self.backend, "backend_id", "unknown")),
+                "metadata_redaction_applied": True,
+                "metadata_exposure_category": finding,
+            }
         return {"backend_id": str(getattr(self.backend, "backend_id", "unknown"))}
 
     @staticmethod
@@ -288,6 +375,19 @@ class AgentRuntime:
             compact["tool_events_saved_separately"] = True
         return compact
 
+    def _backend_streams_preprocessed(self) -> bool:
+        metadata = getattr(self.backend, "last_metadata", None)
+        if not isinstance(metadata, dict):
+            return False
+        streams = metadata.get("stream_evidence")
+        if not isinstance(streams, dict):
+            return False
+        raw_output = streams.get("raw_output")
+        return (
+            isinstance(raw_output, dict)
+            and raw_output.get("contains_unredacted_process_stream") is False
+        )
+
     @staticmethod
     def _stream_preview_truncated(metadata: dict[str, Any]) -> bool:
         streams = metadata.get("stream_evidence")
@@ -295,7 +395,7 @@ class AgentRuntime:
             return False
         preview = streams.get("diagnostic_preview")
         return (
-            bool(preview.get("truncated"))
+            bool(preview.get("preview_truncated"))
             if isinstance(preview, dict)
             else False
         )
@@ -308,6 +408,11 @@ class AgentRuntime:
             return False
         stdout_text = stdout if isinstance(stdout, str) else ""
         stderr_text = stderr if isinstance(stderr, str) else ""
+        if (
+            not self._backend_streams_preprocessed()
+            and find_high_confidence_credential((stdout_text, stderr_text)) is not None
+        ):
+            return False
         atomic_write_text(call_dir / "stdout.txt", stdout_text)
         atomic_write_text(call_dir / "stderr.txt", stderr_text)
         if isinstance(diagnostic_preview, str):
@@ -328,6 +433,8 @@ class AgentRuntime:
 
     @staticmethod
     def _persist_backend_evidence(call_dir: Path, metadata: dict[str, Any]) -> None:
+        if find_high_confidence_credential(metadata) is not None:
+            return
         tool_events = metadata.get("tool_events")
         if isinstance(tool_events, list):
             atomic_write_json(call_dir / "tool-events.json", {"events": tool_events})
@@ -382,9 +489,33 @@ class AgentRuntime:
                 raise CredentialExposureError(
                     "Agent output contained high-confidence credential material"
                 )
+            backend_material: tuple[Any, ...] = (
+                getattr(self.backend, "last_metadata", None),
+            )
+            if not self._backend_streams_preprocessed():
+                backend_material += (
+                    getattr(self.backend, "last_stdout", None),
+                    getattr(self.backend, "last_stderr", None),
+                    getattr(self.backend, "last_diagnostic_preview", None),
+                )
+            if find_high_confidence_credential(backend_material) is not None:
+                raise CredentialExposureError(
+                    "Agent backend evidence contained high-confidence credential material"
+                )
         except Exception as exc:
             raw_output = getattr(exc, "raw_output", None)
             error_kind = getattr(exc, "kind", None)
+            exception_finding = find_high_confidence_credential(
+                (str(exc), raw_output if isinstance(raw_output, str) else "")
+            )
+            if exception_finding is not None:
+                error_kind = CredentialExposureError.kind
+                raw_output = None
+                error_message = (
+                    "Agent call contained high-confidence credential material"
+                )
+            else:
+                error_message = str(exc)
             backend_metadata = self._backend_metadata()
             self._persist_backend_evidence(call_dir, backend_metadata)
             response_metadata = self._response_metadata(backend_metadata)
@@ -420,7 +551,7 @@ class AgentRuntime:
                 duration_seconds=round(time.perf_counter() - started, 6),
                 error={
                     "type": type(exc).__name__,
-                    "message": str(exc),
+                    "message": error_message,
                     **({"kind": error_kind} if isinstance(error_kind, str) else {}),
                 },
                 metadata={

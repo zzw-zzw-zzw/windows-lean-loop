@@ -11,6 +11,8 @@ from lean_loop.agent_protocol import (
     AgentRuntime,
     CredentialExposureError,
     DirectModelBackend,
+    find_high_confidence_credential,
+    is_sensitive_field_name,
     protocol_capabilities,
 )
 from lean_loop.config import ApiConfig
@@ -248,6 +250,24 @@ class AgentProtocolTests(unittest.TestCase):
                 {"audit": "AKIAABCDEFGHIJKLMNOP"},
                 "AKIAABCDEFGHIJKLMNOP",
             ),
+            (
+                "planner",
+                "json",
+                {"plan": "password=<redacted>ACTUAL_SECRET"},
+                "ACTUAL_SECRET",
+            ),
+            (
+                "reviewer",
+                "json",
+                {"verdict": "session_token: <redacted> REAL_PASSWORD_VALUE"},
+                "REAL_PASSWORD_VALUE",
+            ),
+            (
+                "prover",
+                "lean_file",
+                'example : True := by trivial\n-- password="<redacted>ACTUAL_SECRET"\n',
+                "ACTUAL_SECRET",
+            ),
         )
         for role, output_type, result, secret in cases:
             with self.subTest(role=role), tempfile.TemporaryDirectory() as directory:
@@ -288,6 +308,55 @@ class AgentProtocolTests(unittest.TestCase):
                 )
                 self.assertNotIn(secret, archived)
                 self.assertFalse(any(root.rglob("candidate.lean")))
+
+    def test_sensitive_field_segments_and_exact_redacted_values(self) -> None:
+        sensitive_fields = (
+            "db_password",
+            "user_password_hash",
+            "authorization_header",
+            "cookie_value",
+            "credential_blob",
+            "aws_secret_access_key",
+            "nested_session_token",
+            "client_secret_blob",
+            "encrypted_content",
+        )
+        for field_name in sensitive_fields:
+            with self.subTest(field_name=field_name):
+                self.assertTrue(is_sensitive_field_name(field_name))
+                self.assertIsNotNone(
+                    find_high_confidence_credential({field_name: "actual-value"})
+                )
+        for field_name in (
+            "input_tokens",
+            "output_tokens",
+            "reasoning_output_tokens",
+        ):
+            with self.subTest(field_name=field_name):
+                self.assertFalse(is_sensitive_field_name(field_name))
+        for safe_text in (
+            "<redacted>",
+            "  <redacted>  ",
+            "'<redacted>'",
+            '"<redacted>"',
+            "password=<redacted>",
+            "password='  <redacted>  '",
+            'password="  <redacted>  "',
+            "def token : Nat := 1",
+            "def secretLemma : token = 1 := by rfl",
+        ):
+            with self.subTest(safe_text=safe_text):
+                self.assertIsNone(find_high_confidence_credential(safe_text))
+        for exposed_text in (
+            "password=<redacted>ACTUAL_SECRET",
+            "session_token: <redacted> REAL_PASSWORD_VALUE",
+            'password="<redacted>ACTUAL_SECRET"',
+            "Bearer <redacted>ACTUAL_SECRET",
+        ):
+            with self.subTest(exposed_text=exposed_text):
+                self.assertIsNotNone(
+                    find_high_confidence_credential(exposed_text)
+                )
 
     def test_capabilities_are_versioned(self) -> None:
         value = protocol_capabilities()
