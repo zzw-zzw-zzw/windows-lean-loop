@@ -69,12 +69,21 @@ class WorkflowPaths:
     def attempt_dir(self, attempt: int) -> Path:
         return self.attempts / f"{attempt:03d}"
 
-    def checkpoint_dir(self, step_index: int, step_id: str) -> Path:
+    def checkpoint_dir(
+        self,
+        step_index: int,
+        step_id: str,
+        *,
+        attempt: int,
+        generation: int,
+    ) -> Path:
         safe_id = "".join(
             character if character.isalnum() or character in {"-", "_"} else "-"
             for character in step_id
         ).strip("-") or f"step-{step_index}"
-        return self.checkpoints / f"{step_index:03d}-{safe_id}"
+        return self.checkpoints / (
+            f"g{generation:03d}-s{step_index:03d}-{safe_id}-a{attempt:03d}"
+        )
 
 
 class WorkflowStore:
