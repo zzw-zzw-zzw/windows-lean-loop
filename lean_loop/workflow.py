@@ -1221,8 +1221,24 @@ def run_structured_workflow(
             working_source = target.read_text(encoding="utf-8")
             working_base_attempt: int | None = None
             archived_base_attempt: int | None = None
-            if prior_attempts:
-                archived_base_attempt = int(prior_attempts[-1])
+            for prior_attempt in reversed(prior_attempts):
+                prior_attempt_number = int(prior_attempt)
+                prior_attempt_row = next(
+                    (
+                        row
+                        for row in attempt_rows
+                        if int(row.get("attempt") or 0) == prior_attempt_number
+                    ),
+                    None,
+                )
+                if prior_attempt_row is None:
+                    raise ValueError(
+                        "Resume attempt is missing from the workflow manifest: "
+                        f"{prior_attempt_number}"
+                    )
+                if prior_attempt_row.get("candidate_sha256"):
+                    archived_base_attempt = prior_attempt_number
+                    break
             if archived_base_attempt is not None:
                 working_source, working_source_sha = _archived_candidate_source(
                     store, attempt_rows, archived_base_attempt

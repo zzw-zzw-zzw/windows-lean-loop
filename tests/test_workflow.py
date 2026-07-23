@@ -1696,7 +1696,176 @@ class StructuredWorkflowTests(unittest.TestCase):
                 json.dumps(guidance, ensure_ascii=False, indent=2),
                 backend.prover_prompts[1],
             )
+            self.assertIn(
+                "example : True := by exact missing", backend.prover_prompts[1]
+            )
             self.assertFalse((resumed.state_dir / "reviews" / "001.json").exists())
+            manifest = json.loads(
+                (resumed.state_dir / "run.json").read_text(encoding="utf-8")
+            )
+            self.assertIsNone(manifest["attempts"][1]["base_attempt"])
+            events = (resumed.state_dir / "events.jsonl").read_text(encoding="utf-8")
+            self.assertNotIn('"event": "working_candidate_restored"', events)
+
+    def test_codex_protocol_resume_uses_latest_real_candidate_and_guidance(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            project, target = self._project(
+                Path(directory), "example : True := by exact original_missing\n"
+            )
+
+            def checker(project: Path, target: Path, timeout: int, lake: str) -> LeanCheck:
+                ok = "by trivial" in target.read_text(encoding="utf-8")
+                return LeanCheck(ok, 0 if ok else 1, "" if ok else "missing", ())
+
+            config = ApiConfig(
+                api_base="",
+                api_key="",
+                model="gpt-5.6-sol",
+                mode="subscription",
+                timeout_seconds=10,
+                curl_executable="",
+                reasoning_effort="high",
+            )
+            backend = _CodexWorkflowBackend(
+                [
+                    "example : True := by exact candidate_marker\n",
+                    None,
+                    "example : True := by trivial\n",
+                ]
+            )
+            first = run_structured_workflow(
+                project=project,
+                target=target,
+                task="fix proof",
+                plan_config=config,
+                prove_config=config,
+                review_config=config,
+                max_attempts=2,
+                max_attempts_per_step=2,
+                lean_timeout_seconds=10,
+                lake_executable="lake",
+                lean_checker=checker,
+                agent_backend=backend,
+                agent_backend_id="codex-subscription",
+            )
+            first_manifest = json.loads(
+                (first.state_dir / "run.json").read_text(encoding="utf-8")
+            )
+            guidance = first_manifest["final_review"]
+            self.assertFalse(first.ok)
+            self.assertIsNotNone(first_manifest["attempts"][0]["candidate_sha256"])
+            self.assertIsNone(first_manifest["attempts"][1]["candidate_sha256"])
+            self.assertFalse((first.state_dir / "reviews" / "002.json").exists())
+
+            resumed = run_structured_workflow(
+                project=project,
+                target=target,
+                task="fix proof",
+                plan_config=config,
+                prove_config=config,
+                review_config=config,
+                max_attempts=3,
+                max_attempts_per_step=3,
+                lean_timeout_seconds=10,
+                lake_executable="lake",
+                resume_run_id=first.run_id,
+                lean_checker=checker,
+                agent_backend=backend,
+                agent_backend_id="codex-subscription",
+            )
+
+            self.assertTrue(resumed.ok)
+            self.assertIn("candidate_marker", backend.prover_prompts[2])
+            self.assertIn(
+                json.dumps(guidance, ensure_ascii=False, indent=2),
+                backend.prover_prompts[2],
+            )
+            manifest = json.loads(
+                (resumed.state_dir / "run.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(manifest["attempts"][2]["base_attempt"], 1)
+            events = [
+                json.loads(line)
+                for line in (resumed.state_dir / "events.jsonl")
+                .read_text(encoding="utf-8")
+                .splitlines()
+            ]
+            self.assertTrue(
+                any(
+                    event.get("event") == "working_candidate_restored"
+                    and event.get("attempt") == 1
+                    for event in events
+                )
+            )
+
+    def test_codex_protocol_resume_fails_closed_for_invalid_candidate_identity(self) -> None:
+        for mutation, expected_error in (
+            ("missing", "Resume candidate is missing"),
+            ("hash-mismatch", "Resume candidate hash mismatch"),
+        ):
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as directory:
+                project, target = self._project(
+                    Path(directory), "example : True := by exact original_missing\n"
+                )
+
+                def checker(
+                    project: Path, target: Path, timeout: int, lake: str
+                ) -> LeanCheck:
+                    return LeanCheck(False, 1, "missing", ())
+
+                config = ApiConfig(
+                    api_base="",
+                    api_key="",
+                    model="gpt-5.6-sol",
+                    mode="subscription",
+                    timeout_seconds=10,
+                    curl_executable="",
+                    reasoning_effort="high",
+                )
+                first = run_structured_workflow(
+                    project=project,
+                    target=target,
+                    task="fix proof",
+                    plan_config=config,
+                    prove_config=config,
+                    review_config=config,
+                    max_attempts=2,
+                    max_attempts_per_step=2,
+                    lean_timeout_seconds=10,
+                    lake_executable="lake",
+                    lean_checker=checker,
+                    agent_backend=_CodexWorkflowBackend(
+                        ["example : True := by exact candidate_marker\n", None]
+                    ),
+                    agent_backend_id="codex-subscription",
+                )
+                candidate = first.state_dir / "attempts" / "001" / "candidate.lean"
+                if mutation == "missing":
+                    candidate.unlink()
+                else:
+                    candidate.write_text(
+                        "example : True := by exact tampered\n", encoding="utf-8"
+                    )
+
+                with self.assertRaisesRegex(ValueError, expected_error):
+                    run_structured_workflow(
+                        project=project,
+                        target=target,
+                        task="fix proof",
+                        plan_config=config,
+                        prove_config=config,
+                        review_config=config,
+                        max_attempts=3,
+                        max_attempts_per_step=3,
+                        lean_timeout_seconds=10,
+                        lake_executable="lake",
+                        resume_run_id=first.run_id,
+                        lean_checker=checker,
+                        agent_backend=_CodexWorkflowBackend(
+                            ["example : True := by trivial\n"]
+                        ),
+                        agent_backend_id="codex-subscription",
+                    )
 
     def test_codex_pure_protocol_failures_report_no_valid_candidate(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
