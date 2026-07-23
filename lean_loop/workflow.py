@@ -2059,14 +2059,19 @@ def run_structured_workflow(
             )
             current_sha = safe_sha
         else:
-            if attempt_rows:
-                failed_candidate = store.paths.attempt_dir(
-                    int(attempt_rows[-1]["attempt"])
-                ) / "candidate.lean"
-                if failed_candidate.is_file():
-                    atomic_write_text(
-                        target, failed_candidate.read_text(encoding="utf-8")
-                    )
+            failed_candidate_attempt = next(
+                (
+                    int(row.get("attempt") or 0)
+                    for row in reversed(attempt_rows)
+                    if row.get("candidate_sha256")
+                ),
+                None,
+            )
+            if failed_candidate_attempt is not None:
+                failed_candidate, _ = _archived_candidate_source(
+                    store, attempt_rows, failed_candidate_attempt
+                )
+                atomic_write_text(target, failed_candidate)
             current_sha = sha256_text(target.read_text(encoding="utf-8"))
         failed_step_indexes = {
             int(row["index"])
@@ -2078,6 +2083,20 @@ def run_structured_workflow(
             for row in attempt_rows
             if int(row.get("step_index") or 0) in failed_step_indexes
         ]
+        has_protocol_failure = any(
+            row.get("failure_stage") == "prover_output_protocol"
+            for row in failure_attempt_rows
+        )
+        has_lean_validation_failure = any(
+            row.get("candidate_sha256") and row.get("check_ok") is False
+            for row in failure_attempt_rows
+        )
+        has_reviewer_rejection = any(
+            row.get("candidate_sha256")
+            and row.get("check_ok") is True
+            and row.get("review_verdict") != "accept"
+            for row in failure_attempt_rows
+        )
         if all_steps_succeeded:
             failure_error = "Global final audit did not accept the complete proof."
         elif failure_attempt_rows and all(
@@ -2089,13 +2108,30 @@ def run_structured_workflow(
                 "Prover output did not produce a valid Lean candidate within the "
                 "configured candidate budgets."
             )
-        elif any(
-            row.get("failure_stage") == "prover_output_protocol"
-            for row in failure_attempt_rows
-        ) and any(row.get("candidate_sha256") for row in failure_attempt_rows):
+        elif (
+            has_protocol_failure
+            and has_lean_validation_failure
+            and has_reviewer_rejection
+        ):
+            failure_error = (
+                "Candidate budgets were exhausted after Lean candidate validation "
+                "failures, Reviewer rejection of Lean-valid candidates, and Prover "
+                "output protocol failures."
+            )
+        elif has_protocol_failure and has_lean_validation_failure:
             failure_error = (
                 "Candidate budgets were exhausted after both Lean candidate validation "
                 "failures and Prover output protocol failures."
+            )
+        elif has_protocol_failure and has_reviewer_rejection:
+            failure_error = (
+                "Candidate budgets were exhausted after both Reviewer rejection of "
+                "Lean-valid candidates and Prover output protocol failures."
+            )
+        elif has_protocol_failure:
+            failure_error = (
+                "Candidate budgets were exhausted after Prover output protocol failures "
+                "and other recorded attempt failures."
             )
         else:
             failure_error = "Lean did not pass within the configured candidate budgets."
