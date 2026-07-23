@@ -1714,8 +1714,15 @@ class StructuredWorkflowTests(unittest.TestCase):
             )
 
             def checker(project: Path, target: Path, timeout: int, lake: str) -> LeanCheck:
-                ok = "by trivial" in target.read_text(encoding="utf-8")
-                return LeanCheck(ok, 0 if ok else 1, "" if ok else "missing", ())
+                source = target.read_text(encoding="utf-8")
+                ok = "by trivial" in source
+                if ok:
+                    diagnostics = ""
+                elif "candidate_marker" in source:
+                    diagnostics = "CANDIDATE_DIAGNOSTIC"
+                else:
+                    diagnostics = "ORIGINAL_DIAGNOSTIC"
+                return LeanCheck(ok, 0 if ok else 1, diagnostics, ())
 
             config = ApiConfig(
                 api_base="",
@@ -1776,6 +1783,8 @@ class StructuredWorkflowTests(unittest.TestCase):
 
             self.assertTrue(resumed.ok)
             self.assertIn("candidate_marker", backend.prover_prompts[2])
+            self.assertIn("CANDIDATE_DIAGNOSTIC", backend.prover_prompts[2])
+            self.assertNotIn("ORIGINAL_DIAGNOSTIC", backend.prover_prompts[2])
             self.assertIn(
                 json.dumps(guidance, ensure_ascii=False, indent=2),
                 backend.prover_prompts[2],
@@ -1798,10 +1807,12 @@ class StructuredWorkflowTests(unittest.TestCase):
                 )
             )
 
-    def test_codex_protocol_resume_fails_closed_for_invalid_candidate_identity(self) -> None:
+    def test_codex_protocol_resume_fails_closed_for_invalid_candidate_artifacts(self) -> None:
         for mutation, expected_error in (
             ("missing", "Resume candidate is missing"),
             ("hash-mismatch", "Resume candidate hash mismatch"),
+            ("missing-check", "Resume candidate check is missing"),
+            ("malformed-check", "Resume candidate check is invalid"),
         ):
             with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as directory:
                 project, target = self._project(
@@ -1840,12 +1851,17 @@ class StructuredWorkflowTests(unittest.TestCase):
                     agent_backend_id="codex-subscription",
                 )
                 candidate = first.state_dir / "attempts" / "001" / "candidate.lean"
+                candidate_check = first.state_dir / "attempts" / "001" / "check.json"
                 if mutation == "missing":
                     candidate.unlink()
-                else:
+                elif mutation == "hash-mismatch":
                     candidate.write_text(
                         "example : True := by exact tampered\n", encoding="utf-8"
                     )
+                elif mutation == "missing-check":
+                    candidate_check.unlink()
+                else:
+                    candidate_check.write_text("{malformed\n", encoding="utf-8")
 
                 with self.assertRaisesRegex(ValueError, expected_error):
                     run_structured_workflow(

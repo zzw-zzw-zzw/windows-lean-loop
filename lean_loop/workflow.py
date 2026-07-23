@@ -248,6 +248,19 @@ def _archived_candidate_source(
     return source, source_sha
 
 
+def _archived_candidate_check(store: WorkflowStore, attempt: int) -> LeanCheck:
+    check_path = store.paths.attempt_dir(attempt) / "check.json"
+    if not check_path.is_file():
+        raise ValueError(f"Resume candidate check is missing: {check_path}")
+    try:
+        value = read_json(check_path)
+        if not isinstance(value, dict):
+            raise TypeError("candidate check must be a JSON object")
+        return _check_from_json(value)
+    except (OSError, TypeError, ValueError) as exc:
+        raise ValueError(f"Resume candidate check is invalid: {check_path}") from exc
+
+
 def _accepted_attempt_row(
     attempt_rows: list[dict[str, Any]],
     step_attempts: list[int],
@@ -495,7 +508,7 @@ def _resume_replan_reason(
         check_path = store.paths.attempt_dir(number) / "check.json"
         if not check_path.is_file():
             return None
-        output = str(read_json(check_path).get("output") or "")
+        output = _archived_candidate_check(store, number).output
         diagnostics.append(" ".join(output.split()))
     if diagnostics[0] and diagnostics[0] == diagnostics[1]:
         return "repeated_diagnostics"
@@ -1243,6 +1256,7 @@ def run_structured_workflow(
                 working_source, working_source_sha = _archived_candidate_source(
                     store, attempt_rows, archived_base_attempt
                 )
+                last_check = _archived_candidate_check(store, archived_base_attempt)
                 working_base_attempt = archived_base_attempt
                 store.event(
                     "working_candidate_restored",
