@@ -1808,11 +1808,74 @@ class StructuredWorkflowTests(unittest.TestCase):
             )
 
     def test_codex_protocol_resume_fails_closed_for_invalid_candidate_artifacts(self) -> None:
+        invalid_check_values = {
+            "empty-check": {},
+            "missing-ok": {
+                "returncode": 1,
+                "output": "x",
+                "command": [],
+            },
+            "missing-returncode": {
+                "ok": False,
+                "output": "x",
+                "command": [],
+            },
+            "missing-output": {
+                "ok": False,
+                "returncode": 1,
+                "command": [],
+            },
+            "missing-command": {
+                "ok": False,
+                "returncode": 1,
+                "output": "x",
+            },
+            "string-ok": {
+                "ok": "false",
+                "returncode": 1,
+                "output": "x",
+                "command": [],
+            },
+            "string-returncode": {
+                "ok": False,
+                "returncode": "1",
+                "output": "x",
+                "command": [],
+            },
+            "bool-returncode": {
+                "ok": False,
+                "returncode": True,
+                "output": "x",
+                "command": [],
+            },
+            "list-output": {
+                "ok": False,
+                "returncode": 1,
+                "output": [],
+                "command": [],
+            },
+            "string-command": {
+                "ok": False,
+                "returncode": 1,
+                "output": "x",
+                "command": "lake",
+            },
+            "non-string-command-element": {
+                "ok": False,
+                "returncode": 1,
+                "output": "x",
+                "command": ["lake", 1],
+            },
+        }
         for mutation, expected_error in (
             ("missing", "Resume candidate is missing"),
             ("hash-mismatch", "Resume candidate hash mismatch"),
             ("missing-check", "Resume candidate check is missing"),
             ("malformed-check", "Resume candidate check is invalid"),
+            *(
+                (mutation, "Resume candidate check is invalid")
+                for mutation in invalid_check_values
+            ),
         ):
             with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as directory:
                 project, target = self._project(
@@ -1860,8 +1923,13 @@ class StructuredWorkflowTests(unittest.TestCase):
                     )
                 elif mutation == "missing-check":
                     candidate_check.unlink()
-                else:
+                elif mutation == "malformed-check":
                     candidate_check.write_text("{malformed\n", encoding="utf-8")
+                else:
+                    candidate_check.write_text(
+                        json.dumps(invalid_check_values[mutation]) + "\n",
+                        encoding="utf-8",
+                    )
 
                 with self.assertRaisesRegex(ValueError, expected_error):
                     run_structured_workflow(

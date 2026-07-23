@@ -256,6 +256,20 @@ def _archived_candidate_check(store: WorkflowStore, attempt: int) -> LeanCheck:
         value = read_json(check_path)
         if not isinstance(value, dict):
             raise TypeError("candidate check must be a JSON object")
+        required_fields = {"ok", "returncode", "output", "command"}
+        if not required_fields.issubset(value):
+            raise TypeError("candidate check is missing required fields")
+        if type(value["ok"]) is not bool:
+            raise TypeError("candidate check ok must be a boolean")
+        if type(value["returncode"]) is not int:
+            raise TypeError("candidate check returncode must be an integer")
+        if type(value["output"]) is not str:
+            raise TypeError("candidate check output must be a string")
+        command = value["command"]
+        if type(command) is not list or any(
+            type(part) is not str for part in command
+        ):
+            raise TypeError("candidate check command must be a string list")
         return _check_from_json(value)
     except (OSError, TypeError, ValueError) as exc:
         raise ValueError(f"Resume candidate check is invalid: {check_path}") from exc
