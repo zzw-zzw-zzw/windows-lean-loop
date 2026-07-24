@@ -21,14 +21,23 @@ from lean_loop.race import LaneExecutionResult, RaceResult, run_prover_race
 from lean_loop.workflow import WorkflowResult, run_structured_workflow
 
 
-ACTIVE_STATES = {"planning", "proving", "lean_checking", "reviewing", "auditing", "explaining"}
+ACTIVE_STATES = {
+    "planning",
+    "proving",
+    "local_repairing",
+    "lean_checking",
+    "reviewing",
+    "auditing",
+    "explaining",
+}
 TERMINAL_STATES = {"succeeded", "failed", "cancelled"}
 ALL_STATES = {"queued", "blocked", *ACTIVE_STATES, *TERMINAL_STATES}
 ALLOWED_TRANSITIONS = {
     "queued": {"planning", "blocked", "cancelled"},
     "blocked": {"queued", "cancelled"},
     "planning": {"lean_checking", "proving", "failed", "cancelled"},
-    "proving": {"lean_checking", "failed", "cancelled"},
+    "proving": {"local_repairing", "lean_checking", "failed", "cancelled"},
+    "local_repairing": {"lean_checking", "failed", "cancelled"},
     "lean_checking": {"planning", "proving", "reviewing", "auditing", "failed", "cancelled"},
     "reviewing": {"proving", "lean_checking", "auditing", "explaining", "succeeded", "failed", "cancelled"},
     "auditing": {"proving", "explaining", "succeeded", "failed", "cancelled"},

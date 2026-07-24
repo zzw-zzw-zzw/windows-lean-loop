@@ -4,6 +4,7 @@ import json
 import os
 import re
 import shutil
+import textwrap
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -27,6 +28,19 @@ _QUOTED_IDENTIFIER_RE = re.compile(
 )
 _IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_'.]*$")
 MAX_PROMPT_EVIDENCE_CHARS = 32_000
+_DECLARATION_MODIFIERS = r"(?:(?:private|protected|noncomputable|unsafe|partial)\s+)*"
+_STRUCTURAL_COMMANDS = (
+    r"import|theorem|lemma|def|example|abbrev|opaque|axiom|constant|"
+    r"structure|class|inductive|instance|namespace|section|mutual|end|"
+    r"universe|variable|open|attribute|syntax|macro|elab"
+)
+_FORBIDDEN_LOCAL_SNIPPET_RE = re.compile(
+    rf"(?im)(?:\b(?:sorryAx|sorry|admit)\b|^\s*{_DECLARATION_MODIFIERS}"
+    rf"(?:{_STRUCTURAL_COMMANDS})\b)"
+)
+_STRUCTURAL_SOURCE_LINE_RE = re.compile(
+    rf"^\s*{_DECLARATION_MODIFIERS}(?:{_STRUCTURAL_COMMANDS})\b"
+)
 
 
 @dataclass(frozen=True)
@@ -38,6 +52,9 @@ class LspSettings:
     call_timeout_seconds: int = 60
     remote_search: bool = True
     max_search_terms: int = 3
+    local_repair: bool = True
+    local_max_rounds: int = 2
+    local_max_candidates: int = 6
 
     @classmethod
     def from_values(cls, values: dict[str, Any]) -> "LspSettings":
@@ -68,6 +85,14 @@ class LspSettings:
                 values.get("lsp_max_search_terms")
                 or os.environ.get("LEAN_AGENT_LSP_MAX_SEARCH_TERMS", "3")
             )
+            local_max_rounds = int(
+                values.get("lsp_local_max_rounds")
+                or os.environ.get("LEAN_AGENT_LSP_LOCAL_MAX_ROUNDS", "2")
+            )
+            local_max_candidates = int(
+                values.get("lsp_local_max_candidates")
+                or os.environ.get("LEAN_AGENT_LSP_LOCAL_MAX_CANDIDATES", "6")
+            )
         except (TypeError, ValueError) as exc:
             raise ValueError("LSP timeout and search limits must be integers") from exc
         remote_value = values.get("lsp_remote_search")
@@ -75,6 +100,15 @@ class LspSettings:
             bool(remote_value)
             if remote_value is not None
             else os.environ.get("LEAN_AGENT_LSP_REMOTE_SEARCH", "true")
+            .strip()
+            .lower()
+            in {"true", "1", "yes"}
+        )
+        local_repair_value = values.get("lsp_local_repair")
+        local_repair = (
+            bool(local_repair_value)
+            if local_repair_value is not None
+            else os.environ.get("LEAN_AGENT_LSP_LOCAL_REPAIR", "true")
             .strip()
             .lower()
             in {"true", "1", "yes"}
@@ -87,6 +121,10 @@ class LspSettings:
             raise ValueError("LSP timeouts must be positive")
         if not 1 <= max_search_terms <= 10:
             raise ValueError("LSP max search terms must be between 1 and 10")
+        if not 1 <= local_max_rounds <= 5:
+            raise ValueError("LSP local repair rounds must be between 1 and 5")
+        if not 2 <= local_max_candidates <= 12:
+            raise ValueError("LSP local repair candidates must be between 2 and 12")
         if mode == "http":
             parsed = urlparse(url)
             if parsed.scheme not in {"http", "https"} or not parsed.netloc:
@@ -103,6 +141,9 @@ class LspSettings:
             call_timeout_seconds=call_timeout,
             remote_search=remote_search,
             max_search_terms=max_search_terms,
+            local_repair=local_repair,
+            local_max_rounds=local_max_rounds,
+            local_max_candidates=local_max_candidates,
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -189,6 +230,113 @@ def _hover_positions(
         if len(positions) >= 2:
             break
     return positions
+
+
+def validate_local_repair_proposal(
+    value: dict[str, Any], *, max_candidates: int
+) -> dict[str, Any]:
+    raw = value.get("snippets")
+    if not isinstance(raw, list):
+        raise ValueError("Local repair JSON requires a snippets array")
+    snippets: list[str] = []
+    for item in raw:
+        if not isinstance(item, str):
+            continue
+        snippet = textwrap.dedent(item).strip()
+        if (
+            not snippet
+            or len(snippet) > 4_000
+            or "```" in snippet
+            or _FORBIDDEN_LOCAL_SNIPPET_RE.search(snippet)
+            or snippet in snippets
+        ):
+            continue
+        snippets.append(snippet)
+        if len(snippets) >= max_candidates:
+            break
+    if len(snippets) < 2:
+        raise ValueError("Local repair requires at least two safe, distinct snippets")
+    reason = value.get("reason")
+    return {
+        "snippets": snippets,
+        "reason": reason.strip() if isinstance(reason, str) else "",
+    }
+
+
+def _local_attempt_items(value: dict[str, Any]) -> list[Any]:
+    payload: Any = value
+    if isinstance(payload.get("result"), dict):
+        payload = payload["result"]
+    items = payload.get("items") if isinstance(payload, dict) else None
+    return items if isinstance(items, list) else []
+
+
+def _has_open_goal(value: dict[str, Any] | None) -> bool:
+    if not isinstance(value, dict):
+        return False
+    payload: Any = value.get("result")
+    if not isinstance(payload, dict):
+        payload = value
+    status = str(payload.get("status") or "").lower()
+    if status in {"goals", "open"}:
+        return True
+    for key in ("goals", "goals_before", "goals_after"):
+        goals = payload.get(key)
+        if isinstance(goals, list) and len(goals) > 0:
+            return True
+    return False
+
+
+def select_local_attempt(value: dict[str, Any]) -> dict[str, Any] | None:
+    items = _local_attempt_items(value)
+    ranked: list[tuple[int, dict[str, Any]]] = []
+    for index, row in enumerate(items):
+        if not isinstance(row, dict) or row.get("timed_out") is True:
+            continue
+        diagnostics = row.get("diagnostics")
+        diagnostics = diagnostics if isinstance(diagnostics, list) else []
+        has_error = any(
+            isinstance(item, dict)
+            and str(item.get("severity") or "").lower() == "error"
+            for item in diagnostics
+        )
+        has_unsolved = any(
+            isinstance(item, dict)
+            and "unsolvedGoals" in (item.get("lean_tags") or [])
+            for item in diagnostics
+        )
+        if has_error or has_unsolved:
+            continue
+        proof_status = str(row.get("proof_status") or "").lower()
+        goals = row.get("goals")
+        complete = "completed" in proof_status or goals == []
+        if complete:
+            ranked.append((index, row))
+    return min(ranked, default=(0, None))[1]
+
+
+def apply_line_local_snippet(
+    source: str,
+    *,
+    line: int,
+    expected_line: str,
+    snippet: str,
+) -> str:
+    lines = source.splitlines()
+    if not 1 <= line <= len(lines):
+        raise ValueError("Local repair line is outside the candidate")
+    current = lines[line - 1]
+    if current != expected_line:
+        raise ValueError("Local repair base line changed after LSP analysis")
+    if _STRUCTURAL_SOURCE_LINE_RE.match(current):
+        raise ValueError("Local repair cannot replace a structural Lean line")
+    indent = current[: len(current) - len(current.lstrip())]
+    normalized = textwrap.dedent(snippet).strip()
+    if not normalized or _FORBIDDEN_LOCAL_SNIPPET_RE.search(normalized):
+        raise ValueError("Local repair snippet is empty or structurally unsafe")
+    replacement = [indent + row if row else "" for row in normalized.splitlines()]
+    updated = [*lines[: line - 1], *replacement, *lines[line:]]
+    return "\n".join(updated) + ("\n" if source.endswith("\n") else "")
 
 
 class LspEvidenceCollector:
@@ -445,6 +593,126 @@ class LspEvidenceCollector:
         if searches:
             evidence["search"] = searches
         return evidence
+
+    def local_repair_context(
+        self,
+        *,
+        file_path: Path,
+        source: str,
+    ) -> dict[str, Any]:
+        """Return one bounded, line-local repair target without modifying the file."""
+        status = self.start()
+        result: dict[str, Any] = {"session": status, "status": "unavailable"}
+        if status["status"] != "ready":
+            return result
+        if "lean_multi_attempt" not in self.available_tools:
+            result["reason"] = "lean_multi_attempt_not_available"
+            return result
+        try:
+            relative = file_path.resolve().relative_to(self.project).as_posix()
+        except ValueError:
+            result["reason"] = "file_outside_project"
+            return result
+        diagnostics = self._call(
+            result,
+            "lean_diagnostic_messages",
+            {
+                "file_path": relative,
+                "interactive": False,
+                "timeout_s": float(max(1, self.settings.call_timeout_seconds - 5)),
+            },
+        )
+        result["diagnostics"] = diagnostics or {}
+        if diagnostics is None:
+            result["reason"] = "diagnostics_unavailable"
+            return result
+        items: Any = diagnostics
+        if isinstance(items, dict) and isinstance(items.get("result"), dict):
+            items = items["result"]
+        diagnostics_payload = items if isinstance(items, dict) else {}
+        if isinstance(items, dict):
+            items = items.get("items")
+        errors = [
+            row
+            for row in items or []
+            if isinstance(row, dict)
+            and str(row.get("severity") or "").lower() == "error"
+            and isinstance(row.get("line"), int)
+        ]
+        if not errors:
+            if diagnostics_payload.get("timed_out") is True:
+                result["reason"] = "diagnostics_timed_out"
+                return result
+            if diagnostics_payload.get("partial") is True:
+                result["reason"] = "diagnostics_incomplete"
+                return result
+            result["status"] = "no_error"
+            return result
+        first = errors[0]
+        line = int(first["line"])
+        column = max(1, int(first.get("column") or 1))
+        lines = source.splitlines()
+        if not 1 <= line <= len(lines):
+            result["reason"] = "diagnostic_position_out_of_range"
+            return result
+        if _STRUCTURAL_SOURCE_LINE_RE.match(lines[line - 1]):
+            result["status"] = "unsupported"
+            result["reason"] = "diagnostic_is_on_a_structural_line"
+            return result
+        goal = self._call(
+            result,
+            "lean_goal",
+            {
+                "file_path": relative,
+                "line": line,
+                "column": column,
+                "format": "structured",
+                "timeout_s": float(max(1, self.settings.call_timeout_seconds - 5)),
+            },
+        )
+        result["goal"] = goal or {}
+        if not _has_open_goal(goal):
+            result["status"] = "unsupported"
+            result["reason"] = "diagnostic_has_no_open_proof_goal"
+            return result
+        actions = self._call(
+            result,
+            "lean_code_actions",
+            {"file_path": str(file_path.resolve()), "line": line},
+        )
+        result.update(
+            {
+                "status": "target",
+                "line": line,
+                "column": column,
+                "source_line": lines[line - 1],
+                "diagnostic": first,
+                "code_actions": actions or {},
+            }
+        )
+        return result
+
+    def try_local_snippets(
+        self,
+        *,
+        file_path: Path,
+        line: int,
+        column: int | None = None,
+        snippets: list[str],
+    ) -> dict[str, Any]:
+        status = self.start()
+        if status["status"] != "ready" or self.client is None:
+            return {"items": [], "session": status}
+        relative = file_path.resolve().relative_to(self.project).as_posix()
+        arguments: dict[str, Any] = {
+            "file_path": relative,
+            "line": line,
+            "snippets": snippets[: self.settings.local_max_candidates],
+        }
+        if column is not None:
+            arguments["column"] = column
+        value = self.client.call_tool("lean_multi_attempt", arguments)
+        return value
 
     def close(self) -> None:
         client = self.client

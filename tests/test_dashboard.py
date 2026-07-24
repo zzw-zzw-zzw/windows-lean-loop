@@ -222,6 +222,9 @@ class DashboardTests(unittest.TestCase):
                             "max_output_tokens": 8192,
                             "api_timeout_retries": 1,
                             "stream_responses": True,
+                            "lsp_local_repair": True,
+                            "lsp_local_max_rounds": 3,
+                            "lsp_local_max_candidates": 8,
                         },
                         "api_key": "dashboard-secret",
                     },
@@ -230,6 +233,15 @@ class DashboardTests(unittest.TestCase):
                 self.assertTrue(configured["configuration"]["api_key_configured"])
                 self.assertEqual(
                     configured["configuration"]["api_transport"], "python"
+                )
+                self.assertTrue(
+                    configured["configuration"]["lsp_local_repair"]
+                )
+                self.assertEqual(
+                    configured["configuration"]["lsp_local_max_rounds"], 3
+                )
+                self.assertEqual(
+                    configured["configuration"]["lsp_local_max_candidates"], 8
                 )
                 self.assertNotIn("dashboard-secret", json.dumps(configured))
                 deepseek = self._post(

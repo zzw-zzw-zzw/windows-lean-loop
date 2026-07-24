@@ -10,12 +10,205 @@ from lean_loop.lsp_tools import (
     LspEvidenceCollector,
     LspSettings,
     _hover_positions,
+    apply_line_local_snippet,
+    select_local_attempt,
+    validate_local_repair_proposal,
 )
 from lean_loop.mcp_client import McpError, StdioMcpClient
 from lean_loop.mathlib_search import retrieval_prompt_block
 
 
 class LspToolsTests(unittest.TestCase):
+    def test_local_repair_context_does_not_treat_timed_out_diagnostics_as_clean(self) -> None:
+        class FakeClient:
+            def call_tool(self, name, arguments, *, timeout_seconds=None):
+                del arguments, timeout_seconds
+                if name == "lean_diagnostic_messages":
+                    return {
+                        "result": {
+                            "partial": True,
+                            "timed_out": True,
+                            "items": [],
+                        }
+                    }
+                raise AssertionError(f"Unexpected tool: {name}")
+
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory)
+            source = "example : True := by\n  trivial\n"
+            path = project / "Main.lean"
+            path.write_text(source, encoding="utf-8")
+            collector = LspEvidenceCollector(
+                project=project,
+                settings=LspSettings(mode="stdio"),
+            )
+            collector.client = FakeClient()
+            collector.available_tools = {
+                "lean_diagnostic_messages",
+                "lean_goal",
+                "lean_code_actions",
+                "lean_multi_attempt",
+            }
+            context = collector.local_repair_context(
+                file_path=path,
+                source=source,
+            )
+
+        self.assertEqual(context["status"], "unavailable")
+        self.assertEqual(context["reason"], "diagnostics_timed_out")
+
+    def test_local_repair_context_requires_an_open_proof_goal(self) -> None:
+        class FakeClient:
+            def call_tool(self, name, arguments, *, timeout_seconds=None):
+                del arguments, timeout_seconds
+                if name == "lean_diagnostic_messages":
+                    return {
+                        "result": {
+                            "partial": False,
+                            "timed_out": False,
+                            "items": [{
+                                "severity": "error",
+                                "message": "bad declaration continuation",
+                                "line": 2,
+                                "column": 3,
+                            }],
+                        }
+                    }
+                if name == "lean_goal":
+                    return {
+                        "result": {
+                            "status": "no_goal_at_position",
+                            "goals": None,
+                        }
+                    }
+                raise AssertionError(f"Unexpected tool: {name}")
+
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory)
+            source = "theorem demo\n    : True := by\n  trivial\n"
+            path = project / "Main.lean"
+            path.write_text(source, encoding="utf-8")
+            collector = LspEvidenceCollector(
+                project=project,
+                settings=LspSettings(mode="stdio"),
+            )
+            collector.client = FakeClient()
+            collector.available_tools = {
+                "lean_diagnostic_messages",
+                "lean_goal",
+                "lean_code_actions",
+                "lean_multi_attempt",
+            }
+            context = collector.local_repair_context(
+                file_path=path,
+                source=source,
+            )
+
+        self.assertEqual(context["status"], "unsupported")
+        self.assertEqual(
+            context["reason"], "diagnostic_has_no_open_proof_goal"
+        )
+
+    def test_local_repair_proposal_filters_unsafe_and_duplicate_snippets(self) -> None:
+        value = validate_local_repair_proposal(
+            {
+                "snippets": [
+                    "exact True.intro",
+                    "exact True.intro",
+                    "sorry",
+                    "trivial",
+                ],
+                "reason": "two safe choices",
+            },
+            max_candidates=6,
+        )
+        self.assertEqual(value["snippets"], ["exact True.intro", "trivial"])
+
+    def test_local_attempt_selection_prefers_completed_safe_result(self) -> None:
+        selected = select_local_attempt(
+            {
+                "items": [
+                    {
+                        "snippet": "apply And.intro",
+                        "goals": ["case left => True"],
+                        "diagnostics": [],
+                    },
+                    {
+                        "snippet": "trivial",
+                        "goals": [],
+                        "diagnostics": [],
+                        "proof_status": "Completed",
+                    },
+                    {
+                        "snippet": "exact missing",
+                        "goals": [],
+                        "diagnostics": [{"severity": "error"}],
+                    },
+                ]
+            }
+        )
+        self.assertEqual(selected["snippet"], "trivial")
+
+    def test_local_attempt_requires_explicit_completion_and_accepts_nested_result(self) -> None:
+        self.assertIsNone(
+            select_local_attempt(
+                {
+                    "items": [
+                        {
+                            "snippet": "apply And.intro",
+                            "diagnostics": [],
+                            "goals": ["case left => True"],
+                        }
+                    ]
+                }
+            )
+        )
+        selected = select_local_attempt(
+            {
+                "result": {
+                    "items": [
+                        {
+                            "snippet": "trivial",
+                            "diagnostics": [],
+                            "goals": [],
+                        }
+                    ]
+                }
+            }
+        )
+        self.assertEqual(selected["snippet"], "trivial")
+
+    def test_line_local_patch_preserves_indentation_and_rejects_structure(self) -> None:
+        source = "example : True := by\n  exact missing\n"
+        updated = apply_line_local_snippet(
+            source,
+            line=2,
+            expected_line="  exact missing",
+            snippet="first\ntrivial",
+        )
+        self.assertEqual(updated, "example : True := by\n  first\n  trivial\n")
+        with self.assertRaisesRegex(ValueError, "structural"):
+            apply_line_local_snippet(
+                source,
+                line=1,
+                expected_line="example : True := by",
+                snippet="trivial",
+            )
+        for structural in (
+            "private theorem hidden : True := by",
+            "noncomputable section",
+            "instance : Inhabited Nat where",
+        ):
+            with self.subTest(structural=structural), self.assertRaisesRegex(
+                ValueError, "structural"
+            ):
+                apply_line_local_snippet(
+                    structural + "\n  trivial\n",
+                    line=1,
+                    expected_line=structural,
+                    snippet="trivial",
+                )
+
     def test_stdio_client_initializes_lists_tools_and_calls_tool(self) -> None:
         server = (
             "import json, sys\n"

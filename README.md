@@ -368,7 +368,28 @@ $env:LEAN_AGENT_LSP_COMMAND = "C:\Users\you\.local\bin\lean-lsp-mcp.exe"
 $env:LEAN_AGENT_LSP_STARTUP_TIMEOUT = "240"
 $env:LEAN_AGENT_LSP_CALL_TIMEOUT = "90"
 $env:LEAN_AGENT_LSP_REMOTE_SEARCH = "true"
+$env:LEAN_AGENT_LSP_LOCAL_REPAIR = "true"
+$env:LEAN_AGENT_LSP_LOCAL_MAX_ROUNDS = "2"
+$env:LEAN_AGENT_LSP_LOCAL_MAX_CANDIDATES = "6"
 ```
+
+When local repair is enabled, each full-file Prover candidate may use a
+separate bounded local budget. The workflow asks the Local Repair Prover for
+several tactic snippets at one LSP diagnostic, tests all snippets with
+`lean_multi_attempt` as whole-line replacements, and applies only an explicitly
+completed result to the archived candidate. Omitting the diagnostic column for
+this test also allows MCP to use its faster REPL path for single-line tactics.
+MCP never edits the authoritative target. The repaired
+candidate must still pass the normal full-file Lean check, source/import
+audits, Reviewer, checkpoint transaction, and final global audit. API errors,
+malformed local JSON, unavailable MCP tools, and unverified snippets fall back
+to the existing full-file workflow without consuming another full candidate.
+
+Local evidence and decisions are stored under
+`attempts/<attempt>/local-repair/`. Immutable `base.lean` and `selected.lean`
+round snapshots remain available for inspection, while MCP reuses one
+non-authoritative `working.lean` path so Lean LSP can retain incremental state.
+The per-attempt `candidate.lean` remains the only candidate used by Resume.
 
 Verify the service without calling the model API:
 

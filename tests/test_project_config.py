@@ -54,6 +54,9 @@ class ProjectConfigTests(unittest.TestCase):
                         "max_output_tokens": 12000,
                         "api_timeout_retries": 2,
                         "stream_responses": True,
+                        "lsp_local_repair": True,
+                        "lsp_local_max_rounds": 3,
+                        "lsp_local_max_candidates": 8,
                     },
                     api_key="secret-test-key",
                 )
@@ -71,6 +74,10 @@ class ProjectConfigTests(unittest.TestCase):
                 self.assertEqual(config.api_timeout_retries, 2)
                 self.assertEqual(config.api_transport, "python")
                 self.assertTrue(config.stream_responses)
+                config_view = project_config_view(project)
+                self.assertTrue(config_view["lsp_local_repair"])
+                self.assertEqual(config_view["lsp_local_max_rounds"], 3)
+                self.assertEqual(config_view["lsp_local_max_candidates"], 8)
 
     def test_can_clear_persisted_key(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

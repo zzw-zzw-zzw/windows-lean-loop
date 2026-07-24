@@ -170,6 +170,9 @@
         <label class="field"><span>LSP 工具超时（秒）</span><input id="configLspCallTimeout" type="number" min="1" required></label>
         <label class="field"><span>每轮 LSP 检索词</span><input id="configLspMaxTerms" type="number" min="1" max="10" required></label>
         <label class="check-field"><input id="configLspRemoteSearch" type="checkbox" checked><span>本地检索无结果时限量调用线上 Loogle</span></label>
+        <label class="check-field"><input id="configLspLocalRepair" type="checkbox" checked><span>对单个 proof error 启用局部候选验证</span></label>
+        <label class="field"><span>每个完整候选的局部轮次</span><input id="configLspLocalRounds" type="number" min="1" max="5" required></label>
+        <label class="field"><span>每轮局部候选数</span><input id="configLspLocalCandidates" type="number" min="2" max="12" required></label>
       </div>
       <div class="key-status" id="configKeyStatus"></div>
       <label class="check-field"><input id="configDisableStorage" type="checkbox" checked><span>禁用响应存储（store=false）</span></label>

@@ -79,7 +79,7 @@ function renderSnapshot(snapshot) {
   state.controlToken = snapshot.control_token || state.controlToken;
   $("projectPath").textContent = snapshot.project;
   const counts = snapshot.counts || {};
-  const activeStates = ["planning", "proving", "lean_checking", "reviewing", "auditing", "explaining"];
+  const activeStates = ["planning", "proving", "local_repairing", "lean_checking", "reviewing", "auditing", "explaining"];
   $("countActive").textContent = activeStates.reduce((sum, key) => sum + (counts[key] || 0), 0);
   $("countQueued").textContent = (counts.queued || 0) + (counts.blocked || 0);
   $("countSucceeded").textContent = counts.succeeded || 0;
@@ -500,7 +500,10 @@ function populateConfigForm(providerId = "default") {
   $("configLspCallTimeout").value = projectConfig.lsp_call_timeout_seconds || 60;
   $("configLspMaxTerms").value = projectConfig.lsp_max_search_terms || 3;
   $("configLspRemoteSearch").checked = projectConfig.lsp_remote_search !== false;
-  for (const id of ["configLspMode", "configLspCommand", "configLspUrl", "configLspStartupTimeout", "configLspCallTimeout", "configLspMaxTerms", "configLspRemoteSearch"]) {
+  $("configLspLocalRepair").checked = projectConfig.lsp_local_repair !== false;
+  $("configLspLocalRounds").value = projectConfig.lsp_local_max_rounds || 2;
+  $("configLspLocalCandidates").value = projectConfig.lsp_local_max_candidates || 6;
+  for (const id of ["configLspMode", "configLspCommand", "configLspUrl", "configLspStartupTimeout", "configLspCallTimeout", "configLspMaxTerms", "configLspRemoteSearch", "configLspLocalRepair", "configLspLocalRounds", "configLspLocalCandidates"]) {
     $(id).disabled = providerId !== "default";
   }
   const status = $("configKeyStatus");
@@ -539,6 +542,9 @@ async function saveConfiguration(event) {
         lsp_call_timeout_seconds: Number($("configLspCallTimeout").value),
         lsp_max_search_terms: Number($("configLspMaxTerms").value),
         lsp_remote_search: $("configLspRemoteSearch").checked,
+        lsp_local_repair: $("configLspLocalRepair").checked,
+        lsp_local_max_rounds: Number($("configLspLocalRounds").value),
+        lsp_local_max_candidates: Number($("configLspLocalCandidates").value),
       });
     }
     const result = await controlRequest("/api/config", {

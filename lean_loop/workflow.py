@@ -26,16 +26,24 @@ from lean_loop.mathlib_search import (
 )
 from lean_loop.prompts import (
     GOAL_SYSTEM_PROMPT,
+    LOCAL_REPAIR_SYSTEM_PROMPT,
     PLAN_SYSTEM_PROMPT,
     PROVER_SYSTEM_PROMPT,
     REVIEW_SYSTEM_PROMPT,
     build_goal_prompt,
+    build_local_repair_prompt,
     build_plan_prompt,
     build_review_prompt,
     build_user_prompt,
 )
 from lean_loop.process_control import ProcessCancelled, ProcessControl
-from lean_loop.lsp_tools import LspEvidenceCollector, LspSettings
+from lean_loop.lsp_tools import (
+    LspEvidenceCollector,
+    LspSettings,
+    apply_line_local_snippet,
+    select_local_attempt,
+    validate_local_repair_proposal,
+)
 from lean_loop.project_config import load_project_config
 from lean_loop.state import WorkflowStore
 from lean_loop.timings import TimingRecorder
@@ -759,6 +767,176 @@ def _write_final_import_reduction(
         final_import_reduction=_final_import_reduction_summary(artifact),
         current_sha256=artifact["selected_source_sha256"],
     )
+
+
+def _run_lsp_local_repairs(
+    *,
+    candidate: str,
+    attempt_dir: Path,
+    relative_file: str,
+    task: str,
+    active_step_json: str,
+    attempt: int,
+    step_id: str,
+    lsp_collector: LspEvidenceCollector,
+    lsp_settings: LspSettings,
+    agent_runtime: AgentRuntime,
+    prove_config: ApiConfig,
+    timings: TimingRecorder,
+    store: WorkflowStore,
+    phase_callback: PhaseCallback | None,
+) -> tuple[str, list[dict[str, Any]]]:
+    if not lsp_settings.local_repair or lsp_settings.mode == "off":
+        return candidate, []
+    local_root = attempt_dir / "local-repair"
+    local_root.mkdir(parents=True, exist_ok=True)
+    working_path = local_root / "working.lean"
+    current = candidate
+    atomic_write_text(working_path, current)
+    rows: list[dict[str, Any]] = []
+    prior_results = ""
+    for round_number in range(1, lsp_settings.local_max_rounds + 1):
+        round_dir = local_root / f"{round_number:03d}"
+        round_dir.mkdir(exist_ok=False)
+        base_path = round_dir / "base.lean"
+        atomic_write_text(base_path, current)
+        atomic_write_text(working_path, current)
+        if phase_callback is not None:
+            phase_callback("local_repairing", attempt)
+        store.event(
+            "local_repair_round_started",
+            attempt=attempt,
+            step_id=step_id,
+            round=round_number,
+            base_sha256=sha256_text(current),
+        )
+        row: dict[str, Any] = {
+            "round": round_number,
+            "base_sha256": sha256_text(current),
+            "status": "started",
+            "artifacts": {
+                "base": str(base_path),
+                "working": str(working_path),
+            },
+        }
+        try:
+            with timings.measure("local_repair_context", attempt):
+                context = lsp_collector.local_repair_context(
+                    file_path=working_path,
+                    source=current,
+                )
+            atomic_write_json(round_dir / "context.json", context)
+            row["artifacts"]["context"] = str(round_dir / "context.json")
+            row["target"] = {
+                "line": context.get("line"),
+                "column": context.get("column"),
+                "source_line": context.get("source_line"),
+            }
+            if context.get("status") != "target":
+                row["status"] = str(context.get("status") or "unavailable")
+                row["reason"] = str(context.get("reason") or "no_local_target")
+                rows.append(row)
+                break
+            prompt = build_local_repair_prompt(
+                relative_file=relative_file,
+                task=task,
+                active_step=active_step_json,
+                candidate=current,
+                context=json.dumps(context, ensure_ascii=False, indent=2),
+                prior_results=prior_results,
+                max_candidates=lsp_settings.local_max_candidates,
+            )
+            with timings.measure("local_repair_api", attempt):
+                proposal_value = agent_runtime.invoke(
+                    role="prover",
+                    phase="local_repair",
+                    output_type="json",
+                    config=prove_config,
+                    system_prompt=LOCAL_REPAIR_SYSTEM_PROMPT,
+                    user_prompt=prompt,
+                    temp_dir=round_dir,
+                    attempt=attempt,
+                    step_id=step_id,
+                    context={
+                        "local_round": round_number,
+                        "target_file": relative_file,
+                        "target_line": context["line"],
+                        "target_column": context["column"],
+                    },
+                )
+            if not isinstance(proposal_value, dict):
+                raise ValueError("Local Repair Prover did not return JSON")
+            proposal = validate_local_repair_proposal(
+                proposal_value,
+                max_candidates=lsp_settings.local_max_candidates,
+            )
+            atomic_write_json(round_dir / "proposal.json", proposal)
+            row["artifacts"]["proposal"] = str(round_dir / "proposal.json")
+            with timings.measure("local_multi_attempt", attempt):
+                multi_result = lsp_collector.try_local_snippets(
+                    file_path=working_path,
+                    line=int(context["line"]),
+                    # Omit the diagnostic column: this repair replaces one
+                    # complete tactic line and can use MCP's fast REPL path.
+                    column=None,
+                    snippets=list(proposal["snippets"]),
+                )
+            atomic_write_json(round_dir / "multi-attempt.json", multi_result)
+            row["artifacts"]["multi_attempt"] = str(
+                round_dir / "multi-attempt.json"
+            )
+            selected = select_local_attempt(multi_result)
+            if selected is None:
+                row["status"] = "no_verified_snippet"
+                rows.append(row)
+                prior_results = json.dumps(
+                    multi_result, ensure_ascii=False, indent=2
+                )
+                continue
+            selected_snippet = str(selected.get("snippet") or "")
+            if selected_snippet not in proposal["snippets"]:
+                raise ValueError(
+                    "LSP selected a snippet that was not in the submitted candidate set"
+                )
+            updated = apply_line_local_snippet(
+                current,
+                line=int(context["line"]),
+                expected_line=str(context["source_line"]),
+                snippet=selected_snippet,
+            )
+            selected_path = round_dir / "selected.lean"
+            atomic_write_text(selected_path, updated)
+            atomic_write_text(working_path, updated)
+            atomic_write_json(round_dir / "selected.json", selected)
+            row["status"] = "applied_to_candidate"
+            row["selected_snippet"] = selected_snippet
+            row["result_sha256"] = sha256_text(updated)
+            row["artifacts"]["selected"] = str(selected_path)
+            rows.append(row)
+            current = updated
+            prior_results = json.dumps(selected, ensure_ascii=False, indent=2)
+            store.event(
+                "local_repair_snippet_selected",
+                attempt=attempt,
+                step_id=step_id,
+                round=round_number,
+                line=context["line"],
+                result_sha256=sha256_text(updated),
+            )
+        except ProcessCancelled:
+            raise
+        except Exception as exc:
+            row["status"] = "error"
+            row["error"] = f"{type(exc).__name__}: {exc}"
+            atomic_write_json(round_dir / "error.json", row)
+            row["artifacts"]["error"] = str(round_dir / "error.json")
+            rows.append(row)
+            break
+    atomic_write_json(
+        local_root / "summary.json",
+        {"working_file": str(working_path), "rounds": rows},
+    )
+    return current, rows
 
 
 def run_structured_workflow(
@@ -1932,6 +2110,52 @@ def run_structured_workflow(
                         "reason": "candidate_has_no_broad_import",
                     }
                 retrieval = candidate_retrieval
+                pre_local_audit = audit_source(
+                    original_source,
+                    candidate,
+                    protect_existing_statements=protect_existing_statements,
+                    protected_declarations=protected_declarations,
+                    required_declaration=step_required_declaration,
+                    required_declaration_names=step_required_names,
+                )
+                pre_local_import_validation = validate_mathlib_imports(
+                    project, candidate
+                )
+                local_repair_rows: list[dict[str, Any]] = []
+                if (
+                    lsp_settings.mode != "off"
+                    and lsp_settings.local_repair
+                    and pre_local_audit["ok"]
+                    and pre_local_import_validation["ok"]
+                ):
+                    atomic_write_text(attempt_dir / "candidate.pre-local.lean", candidate)
+                    candidate, local_repair_rows = _run_lsp_local_repairs(
+                        candidate=candidate,
+                        attempt_dir=attempt_dir,
+                        relative_file=relative.as_posix(),
+                        task=task,
+                        active_step_json=active_step_json,
+                        attempt=attempt,
+                        step_id=str(active_step["id"]),
+                        lsp_collector=lsp_collector,
+                        lsp_settings=lsp_settings,
+                        agent_runtime=agent_runtime,
+                        prove_config=prove_config,
+                        timings=timings,
+                        store=store,
+                        phase_callback=phase_callback,
+                    )
+                retrieval["local_repair"] = {
+                    "enabled": lsp_settings.mode != "off"
+                    and lsp_settings.local_repair,
+                    "rounds": local_repair_rows,
+                    "skipped": (
+                        None
+                        if pre_local_audit["ok"]
+                        and pre_local_import_validation["ok"]
+                        else "pre_local_audit_or_import_validation_failed"
+                    ),
+                }
                 source_audit = audit_source(
                     original_source,
                     candidate,
@@ -2073,12 +2297,22 @@ def run_structured_workflow(
                     "returncode": last_check.returncode,
                     "review_verdict": last_review["verdict"],
                     "prover_error": str(prover_error) if prover_error else None,
+                    "local_repair_rounds": local_repair_rows,
                     "artifacts": {
                         "candidate": str(attempt_dir / "candidate.lean"),
                         "check": str(attempt_dir / "check.json"),
                         "retrieval": str(attempt_dir / "retrieval.json"),
                         "audit": str(attempt_dir / "audit.json"),
                         "review": str(review_path),
+                        **(
+                            {
+                                "local_repair": str(
+                                    attempt_dir / "local-repair" / "summary.json"
+                                )
+                            }
+                            if (attempt_dir / "local-repair" / "summary.json").is_file()
+                            else {}
+                        ),
                     },
                 }
                 attempt_rows.append(attempt_row)
@@ -2777,4 +3011,3 @@ def run_structured_workflow(
         )
         store.event("workflow_crashed", error=f"{type(exc).__name__}: {exc}")
         raise
-    build_goal_prompt,

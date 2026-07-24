@@ -33,6 +33,9 @@ CONFIG_KEYS = {
     "lsp_call_timeout_seconds",
     "lsp_remote_search",
     "lsp_max_search_terms",
+    "lsp_local_repair",
+    "lsp_local_max_rounds",
+    "lsp_local_max_candidates",
 }
 EFFORTS = {"low", "medium", "high", "xhigh"}
 PROVIDER_KINDS = {"openai-compatible", "deepseek"}
@@ -202,6 +205,8 @@ def _validated_config(value: dict[str, Any]) -> dict[str, Any]:
         ("lsp_startup_timeout_seconds", 1),
         ("lsp_call_timeout_seconds", 1),
         ("lsp_max_search_terms", 1),
+        ("lsp_local_max_rounds", 1),
+        ("lsp_local_max_candidates", 2),
     ):
         if key in value:
             try:
@@ -212,10 +217,15 @@ def _validated_config(value: dict[str, Any]) -> dict[str, Any]:
                 raise ProjectConfigError(f"{key} must be at least {minimum}")
     if result.get("lsp_max_search_terms", 1) > 10:
         raise ProjectConfigError("lsp_max_search_terms must be at most 10")
+    if result.get("lsp_local_max_rounds", 1) > 5:
+        raise ProjectConfigError("lsp_local_max_rounds must be at most 5")
+    if result.get("lsp_local_max_candidates", 2) > 12:
+        raise ProjectConfigError("lsp_local_max_candidates must be at most 12")
     for key in (
         "disable_response_storage",
         "stream_responses",
         "lsp_remote_search",
+        "lsp_local_repair",
     ):
         if key in value:
             result[key] = bool(value[key])
@@ -428,6 +438,16 @@ def project_config_view(project: Path) -> dict[str, Any]:
         in {"true", "1", "yes"},
         "lsp_max_search_terms": int(
             os.environ.get("LEAN_AGENT_LSP_MAX_SEARCH_TERMS", "3")
+        ),
+        "lsp_local_repair": os.environ.get(
+            "LEAN_AGENT_LSP_LOCAL_REPAIR", "true"
+        ).strip().lower()
+        in {"true", "1", "yes"},
+        "lsp_local_max_rounds": int(
+            os.environ.get("LEAN_AGENT_LSP_LOCAL_MAX_ROUNDS", "2")
+        ),
+        "lsp_local_max_candidates": int(
+            os.environ.get("LEAN_AGENT_LSP_LOCAL_MAX_CANDIDATES", "6")
         ),
     }
     effective = {**defaults, **stored}

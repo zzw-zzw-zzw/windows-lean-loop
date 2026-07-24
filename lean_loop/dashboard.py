@@ -35,7 +35,15 @@ from lean_loop.state import list_workflows
 ASSET_ROOT = Path(__file__).with_name("dashboard_assets")
 MAX_TEXT_BYTES = 1024 * 1024
 MAX_REQUEST_BYTES = 64 * 1024
-ACTIVE_STATES = {"planning", "proving", "lean_checking", "reviewing", "auditing", "explaining"}
+ACTIVE_STATES = {
+    "planning",
+    "proving",
+    "local_repairing",
+    "lean_checking",
+    "reviewing",
+    "auditing",
+    "explaining",
+}
 
 
 def _lean_files(project: Path) -> list[str]:
