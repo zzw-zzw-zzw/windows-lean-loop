@@ -102,6 +102,22 @@ not recommend an identifier or import contradicted by that evidence.
 deterministic external blocker has independently been verified."""
 
 
+LOCAL_REPAIR_SYSTEM_PROMPT = """You are the Local Repair Prover inside a
+controlled Lean 4 workflow. The orchestrator has selected one failing tactic
+line or one `:= by ...` proof tail in an archived candidate file. Propose
+several alternative proof/tactic snippets for exactly that target. For a
+`proof_tail` target, return `by ...` or a tactic; the orchestrator preserves the
+expression before `:=`. Do not return a complete file, imports, declarations,
+namespaces, `sorry`, `admit`, axioms, or Markdown fences. Use the supplied goal,
+diagnostic, code actions, and exact source context. Return only one JSON object:
+{
+  "snippets": ["first tactic", "second tactic", "third tactic"],
+  "reason": "brief distinction between the alternatives"
+}
+Each snippet is independently tested by Lean LSP. Prefer 3-6 materially distinct
+small tactics. A snippet may contain multiple tactic lines when needed."""
+
+
 EXPLANATION_SYSTEM_PROMPT = """You are the Explanation Agent in a controlled
 Lean 4 workflow. The supplied candidate has already passed Lean. Explain the
 mathematics represented by that checked artifact; do not edit code, propose a
@@ -197,6 +213,43 @@ Current complete file:
 --- end lean source ---
 
 Return the complete corrected file as the JSON field \"content\"."""
+
+
+def build_local_repair_prompt(
+    *,
+    relative_file: str,
+    task: str,
+    active_step: str,
+    candidate: str,
+    context: str,
+    prior_results: str,
+    max_candidates: int,
+) -> str:
+    return f"""Target file: {relative_file}
+Task: {task}
+Maximum snippets: {max_candidates}
+
+Active Plan step:
+--- active step ---
+{active_step}
+--- end active step ---
+
+Lean LSP selected local repair context:
+--- local context ---
+{context}
+--- end local context ---
+
+Results from the previous local round, if any:
+--- prior local results ---
+{prior_results or 'No previous local round.'}
+--- end prior local results ---
+
+Bounded, line-numbered candidate window (read-only context):
+--- lean source ---
+{candidate}
+--- end lean source ---
+
+Return the local repair JSON now."""
 
 
 def build_plan_prompt(

@@ -809,7 +809,8 @@ def retrieval_prompt_block(retrieval: dict[str, object]) -> str:
     hits = retrieval.get("hits", [])
     module_checks = retrieval.get("module_checks", [])
     import_suggestions = retrieval.get("import_suggestions", [])
-    if not hits and not module_checks and not import_suggestions:
+    lsp_evidence = retrieval.get("lsp")
+    if not hits and not module_checks and not import_suggestions and not lsp_evidence:
         return "No local Mathlib matches were found for this attempt."
     lines = ["Local Mathlib evidence (read-only, exact local files):"]
     for hit in hits:
@@ -832,4 +833,14 @@ def retrieval_prompt_block(retrieval: dict[str, object]) -> str:
                     f"- import {suggestion.get('module')} covers "
                     f"{suggestion.get('queries')} confidence={suggestion.get('confidence')}"
                 )
+    if isinstance(lsp_evidence, dict):
+        rendered = json.dumps(lsp_evidence, ensure_ascii=False, indent=2)
+        if len(rendered) > 32_000:
+            rendered = rendered[:32_000] + "\n... [LSP evidence truncated]"
+        lines.extend(
+            [
+                "Lean LSP evidence (advisory; the deterministic lake check remains authoritative):",
+                rendered,
+            ]
+        )
     return "\n".join(lines)

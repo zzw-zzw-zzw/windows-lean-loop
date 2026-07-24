@@ -10,6 +10,7 @@ from lean_loop.audit import audit_source as real_audit_source
 from lean_loop.config import ApiConfig
 from lean_loop.jsonutil import sha256_text
 from lean_loop.lean import LeanCheck, check_lean
+from lean_loop.lsp_tools import LspSettings
 from lean_loop.mathlib_search import (
     has_broad_import,
     optimize_broad_imports,
@@ -792,29 +793,438 @@ class StructuredWorkflowTests(unittest.TestCase):
                 self.assertIn("first_candidate_marker", prompt)
                 return "example : True := by trivial\n"
 
-            result = run_structured_workflow(
-                project=project,
-                target=target,
-                task="prove the example",
-                plan_config=_config(),
-                prove_config=_config(),
-                review_config=_config(),
-                max_attempts=2,
-                max_attempts_per_step=2,
-                lean_timeout_seconds=10,
-                lake_executable="lake",
-                json_model_call=json_model,
-                file_model_call=file_model,
-                lean_checker=checker,
-            )
+            class FakeLspCollector:
+                def __init__(self, **kwargs):
+                    del kwargs
+                    self.closed = False
+
+                def collect(self, *, source, **kwargs):
+                    del kwargs
+                    return {
+                        "session": {"status": "ready"},
+                        "marker": "failed_candidate_lsp"
+                        if "first_candidate_marker" in source
+                        else "other_lsp",
+                    }
+
+                def status(self):
+                    return {"status": "ready", "pid": 1234}
+
+                def close(self):
+                    self.closed = True
+
+            with patch(
+                "lean_loop.workflow.LspSettings.from_values",
+                return_value=LspSettings(mode="stdio"),
+            ), patch(
+                "lean_loop.workflow.LspEvidenceCollector", FakeLspCollector
+            ):
+                result = run_structured_workflow(
+                    project=project,
+                    target=target,
+                    task="prove the example",
+                    plan_config=_config(),
+                    prove_config=_config(),
+                    review_config=_config(),
+                    max_attempts=2,
+                    max_attempts_per_step=2,
+                    lean_timeout_seconds=10,
+                    lake_executable="lake",
+                    json_model_call=json_model,
+                    file_model_call=file_model,
+                    lean_checker=checker,
+                )
 
             self.assertTrue(result.ok)
             self.assertEqual(len(prover_prompts), 2)
+            self.assertIn("failed_candidate_lsp", prover_prompts[1])
             manifest = json.loads((result.state_dir / "run.json").read_text(encoding="utf-8"))
             self.assertIsNone(manifest["attempts"][0]["base_attempt"])
             self.assertEqual(manifest["attempts"][1]["base_attempt"], 1)
             events = (result.state_dir / "events.jsonl").read_text(encoding="utf-8")
             self.assertIn('"event": "failed_candidate_kept_as_working_source"', events)
+
+    def test_lsp_local_repair_promotes_verified_snippet_without_extra_attempt(self) -> None:
+        original = "example : True := by\n  exact original_missing\n"
+        broken = "example : True := by\n  exact candidate_missing\n"
+        with tempfile.TemporaryDirectory() as directory:
+            project, target = self._project(Path(directory), original)
+            local_prompts: list[str] = []
+            local_paths: list[Path] = []
+
+            def checker(project: Path, target: Path, timeout: int, lake: str) -> LeanCheck:
+                del project, timeout, lake
+                source = target.read_text(encoding="utf-8")
+                ok = "trivial" in source
+                return LeanCheck(ok, 0 if ok else 1, "" if ok else "missing", ())
+
+            def json_model(config, system, user, temp):
+                del config, temp
+                if "Local Repair Prover" in system:
+                    local_prompts.append(user)
+                    return {
+                        "snippets": ["trivial", "exact True.intro"],
+                        "reason": "both close the local goal",
+                    }
+                if "Planner" in system:
+                    return {
+                        "summary": "repair locally",
+                        "steps": [{
+                            "id": "repair",
+                            "goal": "prove True",
+                            "success_criteria": "Lean passes",
+                            "search_terms": [],
+                        }],
+                        "preserve": [],
+                        "risks": [],
+                    }
+                return {
+                    "verdict": "accept" if "Lean check success: true" in user else "retry",
+                    "summary": "review",
+                    "failure_analysis": [],
+                    "next_actions": [],
+                    "search_terms": [],
+                }
+
+            class FakeLspCollector:
+                def __init__(self, **kwargs):
+                    del kwargs
+
+                def collect(self, **kwargs):
+                    del kwargs
+                    return {"session": {"status": "ready"}}
+
+                def local_repair_context(self, *, file_path, source, **kwargs):
+                    del kwargs
+                    local_paths.append(Path(file_path))
+                    if "trivial" in source:
+                        return {
+                            "session": {"status": "ready"},
+                            "status": "no_error",
+                            "diagnostics": {"items": []},
+                        }
+                    return {
+                        "session": {"status": "ready"},
+                        "status": "target",
+                        "line": 2,
+                        "column": 3,
+                        "source_line": "  exact candidate_missing",
+                        "diagnostic": {
+                            "severity": "error", "message": "unknown", "line": 2, "column": 3
+                        },
+                        "baseline_diagnostics": [{
+                            "severity": "error", "message": "unknown", "line": 2, "column": 3
+                        }],
+                        "target_kind": "tactic_line",
+                        "goal": {"goals": [{"goal": "True"}]},
+                        "code_actions": {"actions": []},
+                    }
+
+                def try_local_snippets(self, **kwargs):
+                    local_paths.append(Path(kwargs["file_path"]))
+                    if kwargs["column"] is not None:
+                        raise AssertionError("Whole-line repair must omit column")
+                    if len(kwargs["snippets"]) != 1:
+                        raise AssertionError("Local candidates must be tried incrementally")
+                    if kwargs["timeout_seconds"] <= 0:
+                        raise AssertionError("Local validation needs an explicit timeout")
+                    self.assert_not_formal_target(kwargs["file_path"])
+                    return {
+                        "items": [
+                            {
+                                "snippet": kwargs["snippets"][0],
+                                "goals": [],
+                                "diagnostics": [],
+                                "proof_status": "Completed",
+                            },
+                        ]
+                    }
+
+                @staticmethod
+                def assert_not_formal_target(path):
+                    if Path(path).resolve() == target.resolve():
+                        raise AssertionError("Local repair touched the formal target")
+
+                def status(self):
+                    return {"status": "ready", "pid": 1234}
+
+                def close(self):
+                    pass
+
+            with patch(
+                "lean_loop.workflow.LspSettings.from_values",
+                return_value=LspSettings(
+                    mode="stdio",
+                    local_repair=True,
+                    local_max_rounds=2,
+                    local_max_candidates=4,
+                ),
+            ), patch(
+                "lean_loop.workflow.LspEvidenceCollector", FakeLspCollector
+            ):
+                result = run_structured_workflow(
+                    project=project,
+                    target=target,
+                    task="prove the example",
+                    plan_config=_config(),
+                    prove_config=_config(),
+                    review_config=_config(),
+                    max_attempts=1,
+                    max_attempts_per_step=1,
+                    lean_timeout_seconds=10,
+                    lake_executable="lake",
+                    json_model_call=json_model,
+                    file_model_call=lambda config, prompt, temp: broken,
+                    lean_checker=checker,
+                )
+
+            self.assertTrue(result.ok)
+            self.assertEqual(result.attempts, 1)
+            self.assertEqual(len(local_prompts), 1)
+            self.assertEqual({path.resolve() for path in local_paths}, {
+                (result.state_dir / "attempts" / "001" / "local-repair" / "working.lean").resolve()
+            })
+            self.assertIn("trivial", target.read_text(encoding="utf-8"))
+            attempt_dir = result.state_dir / "attempts" / "001"
+            self.assertEqual(
+                (attempt_dir / "candidate.pre-local.lean").read_text(encoding="utf-8"),
+                broken,
+            )
+            summary = json.loads(
+                (attempt_dir / "local-repair" / "summary.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(summary["rounds"][0]["status"], "applied_to_candidate")
+            self.assertEqual(summary["rounds"][1]["status"], "no_error")
+
+    def test_lsp_local_repair_failures_preserve_full_candidate(self) -> None:
+        original = "example : True := by\n  exact original_missing\n"
+        broken = "example : True := by\n  exact candidate_missing\n"
+        cases = {
+            "malformed_proposal": {
+                "proposal": {"snippets": ["trivial"]},
+                "multi": {"items": []},
+                "source_line": "  exact candidate_missing",
+                "expected_status": "error",
+            },
+            "no_verified_snippet": {
+                "proposal": {"snippets": ["trivial", "exact True.intro"]},
+                "multi": {
+                    "items": [{
+                        "snippet": "trivial",
+                        "goals": ["True"],
+                        "diagnostics": [{
+                            "severity": "error",
+                            "message": "unexpected token",
+                            "line": 2,
+                            "column": 3,
+                        }],
+                    }]
+                },
+                "source_line": "  exact candidate_missing",
+                "expected_status": "no_verified_snippet",
+            },
+            "stale_diagnostic_line": {
+                "proposal": {"snippets": ["trivial", "exact True.intro"]},
+                "multi": {
+                    "items": [{
+                        "snippet": "trivial",
+                        "goals": [],
+                        "diagnostics": [],
+                        "proof_status": "Completed",
+                    }]
+                },
+                "source_line": "  exact stale_missing",
+                "expected_status": "error",
+            },
+        }
+        for name, case in cases.items():
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
+                project, target = self._project(Path(directory), original)
+
+                def checker(project: Path, target: Path, timeout: int, lake: str) -> LeanCheck:
+                    del project, timeout, lake
+                    source = target.read_text(encoding="utf-8")
+                    return LeanCheck(False, 1, f"missing in {source.strip()}", ())
+
+                def json_model(config, system, user, temp):
+                    del config, user, temp
+                    if "Local Repair Prover" in system:
+                        return case["proposal"]
+                    if "Planner" in system:
+                        return {
+                            "summary": "repair",
+                            "steps": [{
+                                "id": "repair",
+                                "goal": "prove True",
+                                "success_criteria": "Lean passes",
+                                "search_terms": [],
+                            }],
+                            "preserve": [],
+                            "risks": [],
+                        }
+                    return {
+                        "verdict": "retry",
+                        "summary": "not checked",
+                        "failure_analysis": ["Lean failed"],
+                        "next_actions": [],
+                        "search_terms": [],
+                    }
+
+                class FakeLspCollector:
+                    def __init__(self, **kwargs):
+                        del kwargs
+
+                    def collect(self, **kwargs):
+                        del kwargs
+                        return {"session": {"status": "ready"}}
+
+                    def local_repair_context(self, **kwargs):
+                        del kwargs
+                        return {
+                            "status": "target",
+                            "line": 2,
+                            "column": 3,
+                            "source_line": case["source_line"],
+                            "diagnostic": {
+                                "severity": "error", "message": "missing", "line": 2, "column": 3
+                            },
+                            "baseline_diagnostics": [{
+                                "severity": "error", "message": "missing", "line": 2, "column": 3
+                            }],
+                            "target_kind": "tactic_line",
+                            "goal": {"goals": [{"goal": "True"}]},
+                            "code_actions": {},
+                        }
+
+                    def try_local_snippets(self, **kwargs):
+                        self.assert_archived(kwargs["file_path"])
+                        return case["multi"]
+
+                    @staticmethod
+                    def assert_archived(path):
+                        if Path(path).resolve() == target.resolve():
+                            raise AssertionError("MCP received the authoritative target")
+
+                    def status(self):
+                        return {"status": "ready", "pid": 1234}
+
+                    def close(self):
+                        pass
+
+                with patch(
+                    "lean_loop.workflow.LspSettings.from_values",
+                    return_value=LspSettings(
+                        mode="stdio",
+                        local_repair=True,
+                        local_max_rounds=1,
+                        local_max_candidates=4,
+                    ),
+                ), patch("lean_loop.workflow.LspEvidenceCollector", FakeLspCollector):
+                    result = run_structured_workflow(
+                        project=project,
+                        target=target,
+                        task="prove the example",
+                        plan_config=_config(),
+                        prove_config=_config(),
+                        review_config=_config(),
+                        max_attempts=1,
+                        max_attempts_per_step=1,
+                        lean_timeout_seconds=10,
+                        lake_executable="lake",
+                        json_model_call=json_model,
+                        file_model_call=lambda config, prompt, temp: broken,
+                        lean_checker=checker,
+                    )
+
+                self.assertFalse(result.ok)
+                self.assertEqual(target.read_text(encoding="utf-8"), original)
+                attempt_dir = result.state_dir / "attempts" / "001"
+                self.assertEqual(
+                    (attempt_dir / "candidate.lean").read_text(encoding="utf-8"),
+                    broken,
+                )
+                summary = json.loads(
+                    (attempt_dir / "local-repair" / "summary.json").read_text(
+                        encoding="utf-8"
+                    )
+                )
+                self.assertEqual(
+                    summary["rounds"][0]["status"], case["expected_status"]
+                )
+
+    def test_lsp_local_repair_cancellation_propagates_and_restores_target(self) -> None:
+        original = "example : True := by\n  exact original_missing\n"
+        with tempfile.TemporaryDirectory() as directory:
+            project, target = self._project(Path(directory), original)
+
+            class CancellingLspCollector:
+                def __init__(self, **kwargs):
+                    del kwargs
+
+                def collect(self, **kwargs):
+                    del kwargs
+                    return {"session": {"status": "ready"}}
+
+                def local_repair_context(self, **kwargs):
+                    del kwargs
+                    raise ProcessCancelled("cancel local repair")
+
+                def status(self):
+                    return {"status": "ready", "pid": 1234}
+
+                def close(self):
+                    pass
+
+            def json_model(config, system, user, temp):
+                del config, user, temp
+                if "Planner" in system:
+                    return {
+                        "summary": "repair",
+                        "steps": [{
+                            "id": "repair",
+                            "goal": "prove True",
+                            "success_criteria": "Lean passes",
+                            "search_terms": [],
+                        }],
+                        "preserve": [],
+                        "risks": [],
+                    }
+                raise AssertionError("Local repair cancellation should stop the workflow")
+
+            with patch(
+                "lean_loop.workflow.LspSettings.from_values",
+                return_value=LspSettings(mode="stdio", local_repair=True),
+            ), patch(
+                "lean_loop.workflow.LspEvidenceCollector", CancellingLspCollector
+            ), self.assertRaisesRegex(ProcessCancelled, "cancel local repair"):
+                run_structured_workflow(
+                    project=project,
+                    target=target,
+                    task="prove the example",
+                    plan_config=_config(),
+                    prove_config=_config(),
+                    review_config=_config(),
+                    max_attempts=1,
+                    max_attempts_per_step=1,
+                    lean_timeout_seconds=10,
+                    lake_executable="lake",
+                    json_model_call=json_model,
+                    file_model_call=lambda config, prompt, temp: (
+                        "example : True := by\n  exact candidate_missing\n"
+                    ),
+                    lean_checker=lambda project, target, timeout, lake: LeanCheck(
+                        False, 1, "missing", ()
+                    ),
+                )
+
+            self.assertEqual(target.read_text(encoding="utf-8"), original)
+            manifest_path = next(
+                (project / ".lean-agent" / "workflows").glob("*/run.json")
+            )
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            self.assertEqual(manifest["status"], "cancelled")
 
     def test_resume_uses_last_failed_candidate_without_exposing_it_on_disk(self) -> None:
         original = "example : True := by exact original_missing\n"

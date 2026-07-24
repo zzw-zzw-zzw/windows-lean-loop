@@ -344,6 +344,85 @@ python -m lean_loop queue add `
   --lean-timeout 120
 ```
 
+## Lean LSP MCP integration
+
+The optional MCP layer gives Planner, Prover, and Reviewer incremental Lean
+evidence: diagnostics, proof goals, hover signatures, local declaration search,
+and a bounded fallback to online Loogle. It never decides success and never
+writes the authoritative target file. The existing transaction, checkpoint,
+placeholder audit, declaration protection, and final `lake env lean` check remain
+authoritative.
+
+Install it on Windows:
+
+```powershell
+winget install --id astral-sh.uv -e
+uv tool install lean-lsp-mcp
+```
+
+Enable it for a project in the Dashboard configuration, or set:
+
+```powershell
+$env:LEAN_AGENT_LSP_MODE = "stdio"
+$env:LEAN_AGENT_LSP_COMMAND = "C:\Users\you\.local\bin\lean-lsp-mcp.exe"
+$env:LEAN_AGENT_LSP_RG = "C:\Tools\ripgrep\rg.exe" # optional; auto-discovered otherwise
+$env:LEAN_AGENT_LSP_STARTUP_TIMEOUT = "240"
+$env:LEAN_AGENT_LSP_CALL_TIMEOUT = "90"
+$env:LEAN_AGENT_LSP_EVIDENCE_BUDGET = "60"
+$env:LEAN_AGENT_LSP_REMOTE_SEARCH = "true"
+$env:LEAN_AGENT_LSP_LOCAL_REPAIR = "true"
+$env:LEAN_AGENT_LSP_LOCAL_MAX_ROUNDS = "2"
+$env:LEAN_AGENT_LSP_LOCAL_MAX_CANDIDATES = "4"
+$env:LEAN_AGENT_LSP_LOCAL_VALIDATION_TIMEOUT = "75"
+$env:LEAN_AGENT_LSP_LOCAL_TOTAL_BUDGET = "240"
+$env:LEAN_AGENT_LSP_LOCAL_REASONING_EFFORT = "low"
+```
+
+When local repair is enabled, each full-file Prover candidate may use a
+separate bounded local budget. The workflow asks the Local Repair Prover for
+several tactic snippets at one LSP diagnostic and tests them one at a time with
+`lean_multi_attempt`, stopping at the first safe improvement. A result is safe
+when the selected target diagnostic disappears and no new hard diagnostic is
+introduced; remaining outer proof goals are allowed and become the next local
+repair target. Complete results rank above partial progress. The workflow
+classifies independent tactic lines separately from `:= by ...` proof tails and
+constructs an exact whole-line replacement before validation. Unsupported
+declaration or expression continuation lines fall back to the full-file Prover.
+Omitting the diagnostic column allows MCP to use its faster REPL path when it is
+compatible with the replacement.
+MCP never edits the authoritative target. The repaired
+candidate must still pass the normal full-file Lean check, source/import
+audits, Reviewer, checkpoint transaction, and final global audit. API errors,
+malformed local JSON, unavailable MCP tools, and unverified snippets fall back
+to the existing full-file workflow without consuming another full candidate.
+Repeated target/source/diagnostic triples stop immediately. Ordinary evidence
+collection, one local validation, and the whole local-repair phase have separate
+configurable budgets. The local model defaults to low reasoning effort and sees
+only a bounded source window. `rg.exe` is discovered independently of the
+Dashboard process PATH and its directory is injected into the MCP child.
+
+Local evidence and decisions are stored under
+`attempts/<attempt>/local-repair/`. Immutable `base.lean` and `selected.lean`
+round snapshots remain available for inspection, while MCP reuses one
+non-authoritative `working.lean` path so Lean LSP can retain incremental state.
+The per-attempt `candidate.lean` remains the only candidate used by Resume.
+
+Verify the service without calling the model API:
+
+```powershell
+python -m lean_loop lsp-check `
+  --project D:\my_math_project `
+  --file MyMathProject.lean `
+  --mcp-command C:\Users\you\.local\bin\lean-lsp-mcp.exe `
+  --query Real.pi_gt_three `
+  --total-timeout 180
+```
+
+Use `--no-remote-search` to test only local LSP search. Online Loogle is
+advisory and rate-limited; its failure is recorded in workflow evidence and
+does not fail a proof. Windows local Loogle is not required; use WSL only if
+you later need the local Loogle index.
+
 命令会输出任务 ID。第二个任务可以等待第一个任务成功后再运行：
 
 ```powershell

@@ -79,7 +79,7 @@ function renderSnapshot(snapshot) {
   state.controlToken = snapshot.control_token || state.controlToken;
   $("projectPath").textContent = snapshot.project;
   const counts = snapshot.counts || {};
-  const activeStates = ["planning", "proving", "lean_checking", "reviewing", "auditing", "explaining"];
+  const activeStates = ["planning", "proving", "local_repairing", "lean_checking", "reviewing", "auditing", "explaining"];
   $("countActive").textContent = activeStates.reduce((sum, key) => sum + (counts[key] || 0), 0);
   $("countQueued").textContent = (counts.queued || 0) + (counts.blocked || 0);
   $("countSucceeded").textContent = counts.succeeded || 0;
@@ -470,6 +470,7 @@ async function startWorker() {
 
 function populateConfigForm(providerId = "default") {
   const providers = state.snapshot?.providers || { default: state.snapshot?.configuration || {} };
+  const projectConfig = state.snapshot?.configuration || {};
   const isNew = providerId === "__new__";
   const config = isNew ? {} : providers[providerId] || {};
   $("configProviderSelect").innerHTML = [
@@ -492,6 +493,24 @@ function populateConfigForm(providerId = "default") {
   $("configClearKey").checked = false;
   $("configDisableStorage").checked = config.disable_response_storage !== false;
   $("configStreaming").checked = config.stream_responses !== false;
+  $("configLspMode").value = projectConfig.lsp_mode || "off";
+  $("configLspCommand").value = projectConfig.lsp_command || "lean-lsp-mcp";
+  $("configLspRgPath").value = projectConfig.lsp_rg_path || "";
+  $("configLspUrl").value = projectConfig.lsp_url || "http://127.0.0.1:8000/mcp";
+  $("configLspStartupTimeout").value = projectConfig.lsp_startup_timeout_seconds || 180;
+  $("configLspCallTimeout").value = projectConfig.lsp_call_timeout_seconds || 60;
+  $("configLspEvidenceBudget").value = projectConfig.lsp_evidence_budget_seconds || 60;
+  $("configLspMaxTerms").value = projectConfig.lsp_max_search_terms || 3;
+  $("configLspRemoteSearch").checked = projectConfig.lsp_remote_search !== false;
+  $("configLspLocalRepair").checked = projectConfig.lsp_local_repair !== false;
+  $("configLspLocalRounds").value = projectConfig.lsp_local_max_rounds || 2;
+  $("configLspLocalCandidates").value = projectConfig.lsp_local_max_candidates || 4;
+  $("configLspLocalValidationTimeout").value = projectConfig.lsp_local_validation_timeout_seconds || 75;
+  $("configLspLocalTotalBudget").value = projectConfig.lsp_local_total_budget_seconds || 240;
+  $("configLspLocalReasoning").value = projectConfig.lsp_local_reasoning_effort || "low";
+  for (const id of ["configLspMode", "configLspCommand", "configLspRgPath", "configLspUrl", "configLspStartupTimeout", "configLspCallTimeout", "configLspEvidenceBudget", "configLspMaxTerms", "configLspRemoteSearch", "configLspLocalRepair", "configLspLocalRounds", "configLspLocalCandidates", "configLspLocalValidationTimeout", "configLspLocalTotalBudget", "configLspLocalReasoning"]) {
+    $(id).disabled = providerId !== "default";
+  }
   const status = $("configKeyStatus");
   status.textContent = config.api_key_configured
     ? `API Key 已配置，来源：${config.api_key_source === "project" ? "项目加密存储" : "环境变量"}`
@@ -504,22 +523,43 @@ async function saveConfiguration(event) {
   const button = $("saveConfigButton");
   button.disabled = true;
   try {
+    const providerId = $("configProviderId").value.trim() || "default";
+    const configuration = {
+      provider_kind: $("configProviderKind").value,
+      api_base: $("configApiBase").value.trim(),
+      model: $("configModel").value.trim(),
+      api_mode: $("configApiMode").value,
+      api_transport: $("configApiTransport").value,
+      reasoning_effort: $("configReasoning").value,
+      timeout_seconds: Number($("configTimeout").value),
+      api_timeout_retries: Number($("configRetries").value),
+      max_output_tokens: Number($("configMaxOutput").value),
+      lake: $("configLake").value.trim(),
+      disable_response_storage: $("configDisableStorage").checked,
+      stream_responses: $("configStreaming").checked,
+    };
+    if (providerId === "default") {
+      Object.assign(configuration, {
+        lsp_mode: $("configLspMode").value,
+        lsp_command: $("configLspCommand").value.trim() || "lean-lsp-mcp",
+        lsp_rg_path: $("configLspRgPath").value.trim(),
+        lsp_url: $("configLspUrl").value.trim() || "http://127.0.0.1:8000/mcp",
+        lsp_startup_timeout_seconds: Number($("configLspStartupTimeout").value),
+        lsp_call_timeout_seconds: Number($("configLspCallTimeout").value),
+        lsp_evidence_budget_seconds: Number($("configLspEvidenceBudget").value),
+        lsp_max_search_terms: Number($("configLspMaxTerms").value),
+        lsp_remote_search: $("configLspRemoteSearch").checked,
+        lsp_local_repair: $("configLspLocalRepair").checked,
+        lsp_local_max_rounds: Number($("configLspLocalRounds").value),
+        lsp_local_max_candidates: Number($("configLspLocalCandidates").value),
+        lsp_local_validation_timeout_seconds: Number($("configLspLocalValidationTimeout").value),
+        lsp_local_total_budget_seconds: Number($("configLspLocalTotalBudget").value),
+        lsp_local_reasoning_effort: $("configLspLocalReasoning").value,
+      });
+    }
     const result = await controlRequest("/api/config", {
-      provider_id: $("configProviderId").value.trim() || "default",
-      configuration: {
-        provider_kind: $("configProviderKind").value,
-        api_base: $("configApiBase").value.trim(),
-        model: $("configModel").value.trim(),
-        api_mode: $("configApiMode").value,
-        api_transport: $("configApiTransport").value,
-        reasoning_effort: $("configReasoning").value,
-        timeout_seconds: Number($("configTimeout").value),
-        api_timeout_retries: Number($("configRetries").value),
-        max_output_tokens: Number($("configMaxOutput").value),
-        lake: $("configLake").value.trim(),
-        disable_response_storage: $("configDisableStorage").checked,
-        stream_responses: $("configStreaming").checked,
-      },
+      provider_id: providerId,
+      configuration,
       api_key: $("configApiKey").value || null,
       clear_api_key: $("configClearKey").checked,
     });

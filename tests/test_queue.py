@@ -207,6 +207,7 @@ class QueueStoreTests(unittest.TestCase):
             self.assertIsNone(reopened.claim_next(os.getpid()))
 
             reopened.transition(first["id"], "proving")
+            reopened.transition(first["id"], "local_repairing")
             reopened.transition(first["id"], "lean_checking")
             reopened.transition(first["id"], "reviewing")
             reopened.transition(first["id"], "succeeded", worker_pid=None)
