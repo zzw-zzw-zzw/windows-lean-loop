@@ -55,6 +55,7 @@ D:\my_math_project      Lean/Mathlib 项目
 ## 安装
 
 需要 Windows 10/11、Python 3.11 或更高版本、Elan/Lean 4，以及一个可以由 Lake 编译的 Lean/Mathlib 项目。
+使用 `proof-first` 或 `broad` 前，目标项目必须能直接编译 `import Mathlib`；下游 Mathlib 项目推荐先在项目根目录运行官方 `lake exe cache get` 获取预编译缓存。
 
 ```powershell
 git clone https://github.com/zzw-zzw-zzw/windows-lean-loop.git D:\lean_agent_cli
@@ -179,10 +180,27 @@ python -m lean_loop mathlib-index benchmark --project D:\my_math_project --query
 启动 Lean 前被拒绝，并附带当前本地版本中的相近模块。Lean 检查完成后会立即使用本轮
 最新诊断重新检索，再把证据交给 Reviewer，避免 Reviewer 使用检查前的旧证据。
 
-Import 策略支持 `auto`、`proof-first`、`precise` 和 `broad`。新文件的 `auto` 默认采用
-proof-first：先允许 `import Mathlib` 验证证明，成功后再尝试缩小 import；缩小失败时保留
-已经通过 Lean 的宽 import 版本。已有声明的修复任务默认继续在检查前尝试精确 import。
-每次候选的 `retrieval.json` 会记录 `import_optimization`、`probe_ok` 和返回码。
+Import 策略有 `auto`、`proof-first`、`precise` 和 `broad` 四种。新 run 的 `auto` 一律解析为
+`precise`，因此默认关闭 proof-first；显式 `precise` 同样保持精确 import 流程，只有用户判断题目困难并显式选择
+`proof-first` 时才启用宽导入证明阶段。resume 在 raw policy 未变时保留合法的历史 effective policy，旧 manifest 缺少该字段时，
+历史 `auto` 按旧的 source-based 规则解析并记录事件，显式历史策略保持不变。只有 raw policy 改变才会
+replan。`broad` 工作源只补缺失的独立 `import Mathlib`，不改写既有 import、顺序或声明；`auto`/
+`precise` 不进入宽导入证明阶段，`proof-first` 可在终端缩减时替换任意独立宽 import，显式 `broad` 则最终保留它。
+
+精确 import 使用共享优化器的 `selected_modules` 与 `added_modules`：无高置信建议时两者为空且不生成候选；
+已被现有精确 import 覆盖时生成只移除宽 import 的候选；否则只添加去重后的缺失模块并移除宽 import。所有
+`Mathlib.*` 精确 import 均会严格校验，本地证据不能替代该校验。
+
+在所有 Plan 步骤通过 Lean 和 Reviewer 后，`proof-first` 仅以 Plan 词和最终宽工作源词进行一次新的确定性
+retrieval（`max_imports=12`），并对最多一个候选依次执行 source audit、import validation 和一次 Lean probe。
+这是 best-effort：无建议、任一检查失败或普通异常都会继续使用最后的宽工作源；不会新增模型调用、attempt、
+候选预算或组合/全局最小化搜索。只有显式 `proof-first` 会生成 `final-import-reduction.json`；它记录尝试/变更/effective policy、精确查询和
+建议、`selected_modules`、`added_modules`、宽/候选/选定 SHA-256、audit、validation、Lean probe、选定源与
+fallback reason；manifest 仅保存其摘要和路径。
+
+宽 import checkpoint 始终保持安全源。缩减成功时 target、final audit 和 manifest current SHA 指向选定的最终源；
+fallback 或 cancel 时 target/current SHA 恢复至安全宽 checkpoint。全局拒绝仍保留 final audit 已审计源的 SHA，
+同时按既有拒绝语义恢复 target/current SHA 与 checkpoint。
 
 ## 稳定 Agent 协议
 

@@ -4,6 +4,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from lean_loop.mathlib_index import build_mathlib_index, index_status, search_index
+from lean_loop import mathlib_search
 from lean_loop.mathlib_search import (
     collect_retrieval,
     diagnostic_queries,
@@ -120,6 +121,202 @@ class MathlibSearchTests(unittest.TestCase):
             self.assertIn("import Mathlib.Analysis.Bounds", optimized)
             self.assertNotIn("import Mathlib\n", optimized)
 
+    def test_ensure_broad_mathlib_import_preserves_header_and_crlf(self) -> None:
+        self.assertTrue(hasattr(mathlib_search, "ensure_broad_mathlib_import"))
+        if not hasattr(mathlib_search, "ensure_broad_mathlib_import"):
+            return
+        source = (
+            "prelude\r\n"
+            "-- imports stay in their original order\r\n"
+            "import Demo.Basic\r\n"
+            "import Mathlib.Algebra.Group.Basic\r\n"
+            "\r\n"
+            "theorem kept : True := by trivial\r\n"
+        )
+        expected = (
+            "prelude\r\n"
+            "-- imports stay in their original order\r\n"
+            "import Demo.Basic\r\n"
+            "import Mathlib.Algebra.Group.Basic\r\n"
+            "import Mathlib\r\n"
+            "\r\n"
+            "theorem kept : True := by trivial\r\n"
+        )
+
+        broadened = mathlib_search.ensure_broad_mathlib_import(source)
+
+        self.assertEqual(broadened, expected)
+        self.assertEqual(mathlib_search.ensure_broad_mathlib_import(broadened), expected)
+
+    def test_ensure_broad_mathlib_import_follows_prelude_without_imports(self) -> None:
+        self.assertTrue(hasattr(mathlib_search, "ensure_broad_mathlib_import"))
+        if not hasattr(mathlib_search, "ensure_broad_mathlib_import"):
+            return
+        source = "prelude\n-- keep this comment\ntheorem kept : True := by trivial\n"
+
+        self.assertEqual(
+            mathlib_search.ensure_broad_mathlib_import(source),
+            "prelude\nimport Mathlib\n-- keep this comment\n"
+            "theorem kept : True := by trivial\n",
+        )
+
+    def test_block_comment_import_is_not_a_real_broad_import(self) -> None:
+        source = (
+            "/-\n"
+            "import Mathlib\n"
+            "-/\n"
+            "\n"
+            "import Mathlib.Logic.Basic\n"
+            "\n"
+            "example : True := by trivial\n"
+        )
+
+        self.assertFalse(mathlib_search.has_broad_import(source))
+        broadened = mathlib_search.ensure_broad_mathlib_import(source)
+        self.assertEqual(
+            broadened,
+            (
+                "/-\n"
+                "import Mathlib\n"
+                "-/\n"
+                "\n"
+                "import Mathlib.Logic.Basic\n"
+                "import Mathlib\n"
+                "\n"
+                "example : True := by trivial\n"
+            ),
+        )
+        self.assertTrue(mathlib_search.has_broad_import(broadened))
+
+    def test_reduction_preserves_import_text_inside_nested_block_comments(self) -> None:
+        comment = (
+            "/- outer\n"
+            "  /- nested\n"
+            "  import Mathlib\n"
+            "  -/\n"
+            "-/\n"
+        )
+        source = comment + "example : True := by trivial\n"
+        broadened = mathlib_search.ensure_broad_mathlib_import(source)
+
+        optimized, metadata = optimize_broad_imports(
+            broadened,
+            {
+                "import_suggestions": [
+                    {"module": "Mathlib.Logic.Basic", "confidence": "high"}
+                ]
+            },
+        )
+
+        self.assertTrue(metadata["changed"])
+        self.assertTrue(optimized.startswith(comment))
+        self.assertIn("  import Mathlib\n", optimized)
+        self.assertIn("import Mathlib.Logic.Basic\n", optimized)
+        self.assertFalse(mathlib_search.has_broad_import(optimized))
+
+    def test_unterminated_header_comment_fails_closed(self) -> None:
+        source = "/-\nimport Mathlib\n"
+
+        self.assertFalse(mathlib_search.has_broad_import(source))
+        with self.assertRaisesRegex(ValueError, "Cannot safely classify"):
+            mathlib_search.ensure_broad_mathlib_import(source)
+        optimized, metadata = optimize_broad_imports(
+            source,
+            {
+                "import_suggestions": [
+                    {"module": "Mathlib.Logic.Basic", "confidence": "high"}
+                ]
+            },
+        )
+        self.assertEqual(optimized, source)
+        self.assertEqual(metadata["reason"], "unterminated_import_header_comment")
+
+    def test_optimize_broad_imports_reports_selected_and_only_adds_missing(self) -> None:
+        source = (
+            "import Demo.Basic\r\n"
+            "import Mathlib.Logic.Basic\r\n"
+            "import Mathlib\r\n"
+            "-- declaration comment\r\n"
+            "example : True := by trivial\r\n"
+        )
+        retrieval = {
+            "import_suggestions": [
+                {"module": "Mathlib.Logic.Basic", "confidence": "high"},
+                {"module": "Mathlib.Analysis.Bounds", "confidence": "high"},
+                {"module": "Mathlib.Logic.Basic", "confidence": "high"},
+            ]
+        }
+
+        optimized, metadata = optimize_broad_imports(source, retrieval)
+
+        self.assertIn("selected_modules", metadata)
+        self.assertIn("added_modules", metadata)
+        if "selected_modules" not in metadata or "added_modules" not in metadata:
+            return
+        self.assertEqual(
+            metadata["selected_modules"],
+            ["Mathlib.Logic.Basic", "Mathlib.Analysis.Bounds"],
+        )
+        self.assertEqual(metadata["added_modules"], ["Mathlib.Analysis.Bounds"])
+        self.assertEqual(optimized.count("import Mathlib.Logic.Basic"), 1)
+        self.assertEqual(optimized.count("import Mathlib.Analysis.Bounds"), 1)
+        self.assertNotIn("import Mathlib\r\n", optimized)
+        self.assertIn("import Demo.Basic\r\n", optimized)
+        self.assertNotIn("\n", optimized.replace("\r\n", ""))
+
+    def test_optimize_broad_imports_supports_remove_only_and_no_suggestion(self) -> None:
+        source = (
+            "import Mathlib.Logic.Basic\n"
+            "import Mathlib\n"
+            "example : True := by trivial\n"
+        )
+        remove_only, remove_metadata = optimize_broad_imports(
+            source,
+            {"import_suggestions": [
+                {"module": "Mathlib.Logic.Basic", "confidence": "high"}
+            ]},
+        )
+        unchanged, empty_metadata = optimize_broad_imports(
+            source,
+            {"import_suggestions": [
+                {"module": "Mathlib.Analysis.Bounds", "confidence": "candidate"}
+            ]},
+        )
+
+        self.assertEqual(
+            remove_only,
+            "import Mathlib.Logic.Basic\nexample : True := by trivial\n",
+        )
+        self.assertEqual(remove_metadata["selected_modules"], ["Mathlib.Logic.Basic"])
+        self.assertEqual(remove_metadata["added_modules"], [])
+        self.assertTrue(remove_metadata["changed"])
+        self.assertEqual(unchanged, source)
+        self.assertEqual(empty_metadata["selected_modules"], [])
+        self.assertEqual(empty_metadata["added_modules"], [])
+
+    def test_optimize_broad_imports_truncates_stably_to_first_twelve(self) -> None:
+        modules = [f"Mathlib.Test.Module{index:02d}" for index in range(1, 14)]
+        source = "import Mathlib\nexample : True := by trivial\n"
+
+        optimized, metadata = optimize_broad_imports(
+            source,
+            {
+                "import_suggestions": [
+                    {"module": module, "confidence": "high"}
+                    for module in modules
+                ]
+            },
+        )
+
+        self.assertEqual(metadata["selected_modules"], modules[:12])
+        self.assertEqual(metadata["added_modules"], modules[:12])
+        self.assertEqual(
+            optimized,
+            "".join(f"import {module}\n" for module in modules[:12])
+            + "example : True := by trivial\n",
+        )
+        self.assertNotIn(modules[12], optimized)
+
     def test_invalid_mathlib_import_reports_similar_local_module(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             project = self._project(Path(directory))
@@ -140,6 +337,7 @@ class MathlibSearchTests(unittest.TestCase):
 
             validation = validate_mathlib_imports(
                 project,
+                "import Mathlib\n"
                 "import Mathlib.Analysis.NormedSpace.FiniteDimension\n",
             )
 

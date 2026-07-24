@@ -32,6 +32,9 @@ _MISSING_MODULE_RE = re.compile(
 _IDENTIFIER_RE = re.compile(r"\b[A-Za-z_][A-Za-z0-9_']*(?:\.[A-Za-z_][A-Za-z0-9_']*)*\b")
 _TASK_IDENTIFIER_RE = re.compile(r"`([^`]+)`|\b[A-Za-z_][A-Za-z0-9_']*(?:\.[A-Za-z_][A-Za-z0-9_']*)*\b")
 _IMPORT_LINE_RE = re.compile(r"^\s*import\s+([A-Za-z0-9_.]+)\s*$")
+_PRELUDE_LINE_RE = re.compile(r"^\s*prelude\s*$")
+_MAX_IMPORT_HEADER_LINES = 4096
+_MAX_IMPORT_HEADER_CHARS = 262_144
 
 _LEAN_NOISE = {
     "abbrev", "axiom", "by", "class", "constant", "def", "deriving", "else",
@@ -55,6 +58,157 @@ class SearchHit:
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
+
+
+@dataclass(frozen=True)
+class _HeaderImport:
+    line_index: int
+    module: str
+    start: int
+    end: int
+
+
+@dataclass(frozen=True)
+class _ImportHeader:
+    valid: bool
+    imports: tuple[_HeaderImport, ...]
+    prelude_index: int | None
+    declaration_index: int
+    reason: str | None = None
+
+
+def _code_outside_comments(line: str, block_depth: int) -> tuple[str, int, bool]:
+    """Mask Lean comments while preserving character offsets and nesting."""
+    code = list(line)
+    index = 0
+    malformed = False
+    while index < len(line):
+        pair = line[index:index + 2]
+        if block_depth:
+            code[index] = " "
+            if pair == "/-":
+                if index + 1 < len(code):
+                    code[index + 1] = " "
+                block_depth += 1
+                index += 2
+                continue
+            if pair == "-/":
+                if index + 1 < len(code):
+                    code[index + 1] = " "
+                block_depth -= 1
+                index += 2
+                continue
+            index += 1
+            continue
+        if pair == "--":
+            for comment_index in range(index, len(code)):
+                if line[comment_index] not in "\r\n":
+                    code[comment_index] = " "
+            break
+        if pair == "/-":
+            code[index] = " "
+            if index + 1 < len(code):
+                code[index + 1] = " "
+            block_depth = 1
+            index += 2
+            continue
+        if pair == "-/":
+            malformed = True
+            break
+        index += 1
+    return "".join(code), block_depth, malformed
+
+
+def _scan_import_header(source: str) -> _ImportHeader:
+    """Recognize only real ``prelude``/``import`` commands before declarations."""
+    lines = source.splitlines(keepends=True)
+    imports: list[_HeaderImport] = []
+    prelude_index: int | None = None
+    block_depth = 0
+    scanned_chars = 0
+
+    for line_index, line in enumerate(lines):
+        if (
+            line_index >= _MAX_IMPORT_HEADER_LINES
+            or scanned_chars + len(line) > _MAX_IMPORT_HEADER_CHARS
+        ):
+            return _ImportHeader(
+                False,
+                tuple(imports),
+                prelude_index,
+                line_index,
+                "import_header_scan_limit_exceeded",
+            )
+        scanned_chars += len(line)
+        code, block_depth, malformed = _code_outside_comments(line, block_depth)
+        if malformed:
+            return _ImportHeader(
+                False,
+                tuple(imports),
+                prelude_index,
+                line_index,
+                "malformed_import_header_comment",
+            )
+        stripped = code.strip()
+        if not stripped:
+            continue
+
+        if _PRELUDE_LINE_RE.fullmatch(code):
+            if prelude_index is not None or imports or block_depth:
+                return _ImportHeader(
+                    False,
+                    tuple(imports),
+                    prelude_index,
+                    line_index,
+                    "unclassifiable_prelude_header",
+                )
+            prelude_index = line_index
+            continue
+
+        match = _IMPORT_LINE_RE.fullmatch(code)
+        if match:
+            start = next(
+                index for index, character in enumerate(code)
+                if not character.isspace()
+            )
+            end = max(
+                index for index, character in enumerate(code)
+                if not character.isspace()
+            ) + 1
+            if block_depth or line[start:end] != code[start:end]:
+                return _ImportHeader(
+                    False,
+                    tuple(imports),
+                    prelude_index,
+                    line_index,
+                    "unclassifiable_import_command",
+                )
+            imports.append(
+                _HeaderImport(line_index, match.group(1), start, end)
+            )
+            continue
+
+        if re.match(r"^(?:import|prelude)\b", stripped):
+            return _ImportHeader(
+                False,
+                tuple(imports),
+                prelude_index,
+                line_index,
+                "unclassifiable_import_header",
+            )
+        return _ImportHeader(
+            True, tuple(imports), prelude_index, line_index
+        )
+
+    if block_depth:
+        return _ImportHeader(
+            False,
+            tuple(imports),
+            prelude_index,
+            len(lines),
+            "unterminated_import_header_comment",
+        )
+    return _ImportHeader(True, tuple(imports), prelude_index, len(lines))
 
 
 def _module_for(root: Path, path: Path) -> str:
@@ -298,6 +452,46 @@ def source_search_terms(
     return ordered[:max_terms]
 
 
+def _newline_style(source: str) -> str:
+    if "\r\n" in source:
+        return "\r\n"
+    if "\n" in source:
+        return "\n"
+    if "\r" in source:
+        return "\r"
+    return "\n"
+
+
+def ensure_broad_mathlib_import(source: str) -> str:
+    """Add one standalone ``import Mathlib`` to the existing Lean header."""
+    header = _scan_import_header(source)
+    if not header.valid:
+        raise ValueError(
+            f"Cannot safely classify Lean import header: {header.reason}"
+        )
+    if any(command.module == "Mathlib" for command in header.imports):
+        return source
+
+    lines = source.splitlines(keepends=True)
+    if header.imports:
+        insertion_index = header.imports[-1].line_index + 1
+    else:
+        insertion_index = (
+            header.prelude_index + 1
+            if header.prelude_index is not None
+            else header.declaration_index
+        )
+
+    newline = _newline_style(source)
+    if insertion_index > 0 and not lines[insertion_index - 1].endswith(("\n", "\r")):
+        lines[insertion_index - 1] += newline
+    has_following_source = insertion_index < len(lines)
+    preserve_trailing_newline = source.endswith(("\n", "\r"))
+    ending = newline if has_following_source or preserve_trailing_newline else ""
+    lines.insert(insertion_index, f"import Mathlib{ending}")
+    return "".join(lines)
+
+
 def optimize_broad_imports(
     source: str,
     retrieval: dict[str, object],
@@ -310,16 +504,8 @@ def optimize_broad_imports(
     keep the original source when the probe fails. Low-confidence or Init
     modules are intentionally ignored because they are poor replacement roots.
     """
-    lines = source.splitlines(keepends=True)
-    broad_indexes = [
-        index for index, line in enumerate(lines)
-        if _IMPORT_LINE_RE.match(line) and line.strip() == "import Mathlib"
-    ]
-    if not broad_indexes:
-        return source, {"changed": False, "reason": "no_broad_import"}
-
     suggestions = retrieval.get("import_suggestions", [])
-    modules: list[str] = []
+    selected_modules: list[str] = []
     if isinstance(suggestions, list):
         for row in suggestions:
             if not isinstance(row, dict):
@@ -330,40 +516,96 @@ def optimize_broad_imports(
                 or module == "Mathlib"
                 or module.startswith("Mathlib.Init")
                 or str(row.get("confidence", "")) != "high"
-                or module in modules
+                or module in selected_modules
             ):
                 continue
-            modules.append(module)
-            if len(modules) >= max_imports:
+            selected_modules.append(module)
+            if len(selected_modules) >= max_imports:
                 break
-    if not modules:
+
+    header = _scan_import_header(source)
+    if not header.valid:
+        return source, {
+            "changed": False,
+            "reason": header.reason or "unclassifiable_import_header",
+            "selected_modules": selected_modules,
+            "added_modules": [],
+        }
+
+    lines = source.splitlines(keepends=True)
+    broad_imports = [
+        command for command in header.imports if command.module == "Mathlib"
+    ]
+    existing_modules = {
+        command.module
+        for command in header.imports
+        if command.module != "Mathlib"
+    }
+    added_modules = [
+        module for module in selected_modules if module not in existing_modules
+    ]
+    if not broad_imports:
+        return source, {
+            "changed": False,
+            "reason": "no_broad_import",
+            "selected_modules": selected_modules,
+            "added_modules": added_modules,
+        }
+    if not selected_modules:
         return source, {
             "changed": False,
             "reason": "no_high_confidence_imports",
-            "broad_import_count": len(broad_indexes),
+            "broad_import_count": len(broad_imports),
+            "selected_modules": [],
+            "added_modules": [],
         }
 
-    replacement = "".join(f"import {module}\n" for module in modules)
-    first = broad_indexes[0]
-    lines[first] = replacement
-    # Remove duplicate broad imports if a malformed file had more than one.
-    for index in reversed(broad_indexes[1:]):
-        del lines[index]
-    optimized = "".join(lines)
+    first = broad_imports[0]
+    replacement = _newline_style(source).join(
+        f"import {module}" for module in added_modules
+    )
+    edits = {
+        command.line_index: (
+            command,
+            replacement if command == first else "",
+        )
+        for command in broad_imports
+    }
+    optimized_lines: list[str] = []
+    for line_index, line in enumerate(lines):
+        edit = edits.get(line_index)
+        if edit is None:
+            optimized_lines.append(line)
+            continue
+        command, command_replacement = edit
+        updated = (
+            line[:command.start]
+            + command_replacement
+            + line[command.end:]
+        )
+        if command_replacement or updated.strip():
+            optimized_lines.append(updated)
+    optimized = "".join(optimized_lines)
     return optimized, {
         "changed": optimized != source,
-        "reason": "high_confidence_index_evidence",
+        "reason": (
+            "high_confidence_index_evidence"
+            if added_modules
+            else "high_confidence_remove_only"
+        ),
         "replaced": "import Mathlib",
-        "modules": modules,
-        "broad_import_count": len(broad_indexes),
+        "modules": selected_modules,
+        "selected_modules": selected_modules,
+        "added_modules": added_modules,
+        "broad_import_count": len(broad_imports),
     }
 
 
 def has_broad_import(source: str) -> bool:
     """Return whether the source contains a standalone ``import Mathlib``."""
-    return any(
-        _IMPORT_LINE_RE.match(line) and line.strip() == "import Mathlib"
-        for line in source.splitlines()
+    header = _scan_import_header(source)
+    return header.valid and any(
+        command.module == "Mathlib" for command in header.imports
     )
 
 
