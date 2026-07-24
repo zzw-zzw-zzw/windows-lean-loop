@@ -199,13 +199,20 @@ def _historical_effective_import_policy(
     return legacy_effective, True
 
 
-def _check_to_json(check: LeanCheck) -> dict[str, Any]:
-    return {
+def _check_to_json(
+    check: LeanCheck,
+    *,
+    source_sha256: str | None = None,
+) -> dict[str, Any]:
+    value = {
         "ok": check.ok,
         "returncode": check.returncode,
         "output": check.output,
         "command": list(check.command),
     }
+    if source_sha256 is not None:
+        value["source_sha256"] = source_sha256
+    return value
 
 
 def _check_from_json(value: dict[str, Any]) -> LeanCheck:
@@ -222,8 +229,11 @@ def _checkpoint_state(
     manifest: dict[str, Any],
     original_source: str,
     fallback_check: LeanCheck,
-) -> tuple[str, LeanCheck, str, str | None]:
-    def load_checkpoint(checkpoint_value: Any) -> tuple[str, LeanCheck, str, str]:
+    fallback_check_source_sha: str | None,
+) -> tuple[str, LeanCheck, str, str | None, str | None]:
+    def load_checkpoint(
+        checkpoint_value: Any,
+    ) -> tuple[str, LeanCheck, str, str, str]:
         checkpoint = Path(str(checkpoint_value))
         source_path = checkpoint / "source.lean"
         check_path = checkpoint / "check.json"
@@ -235,7 +245,17 @@ def _checkpoint_state(
         source_sha = sha256_text(source)
         if source_sha != metadata.get("candidate_sha256"):
             raise ValueError(f"Resume checkpoint hash mismatch: {checkpoint}")
-        return source, _check_from_json(read_json(check_path)), source_sha, str(checkpoint)
+        check_value = read_json(check_path)
+        check_source_sha = check_value.get("source_sha256")
+        if check_source_sha is not None and check_source_sha != source_sha:
+            raise ValueError(f"Resume checkpoint check hash mismatch: {checkpoint}")
+        return (
+            source,
+            _check_from_json(check_value),
+            source_sha,
+            str(checkpoint),
+            source_sha,
+        )
 
     for step in reversed(list(manifest.get("steps") or [])):
         if not isinstance(step, dict):
@@ -247,7 +267,13 @@ def _checkpoint_state(
     restored_checkpoint = manifest.get("restored_to_checkpoint")
     if restored_checkpoint:
         return load_checkpoint(restored_checkpoint)
-    return original_source, fallback_check, sha256_text(original_source), None
+    return (
+        original_source,
+        fallback_check,
+        sha256_text(original_source),
+        None,
+        fallback_check_source_sha,
+    )
 
 
 def _archived_candidate_source(
@@ -346,7 +372,10 @@ def _persist_step_checkpoint(
     )
     checkpoint_dir.mkdir(parents=True, exist_ok=False)
     atomic_write_text(checkpoint_dir / "source.lean", candidate)
-    atomic_write_json(checkpoint_dir / "check.json", _check_to_json(check))
+    atomic_write_json(
+        checkpoint_dir / "check.json",
+        _check_to_json(check, source_sha256=candidate_sha),
+    )
     atomic_write_json(checkpoint_dir / "review.json", review)
     atomic_write_json(checkpoint_dir / "retrieval.json", retrieval)
     atomic_write_json(
@@ -825,7 +854,9 @@ def run_structured_workflow(
     if backend_identity is not None:
         settings["backend_identity"] = backend_identity
     resuming = resume_run_id is not None
-    resume_safe_state: tuple[str, LeanCheck, str, str | None] | None = None
+    resume_safe_state: (
+        tuple[str, LeanCheck, str, str | None, str | None] | None
+    ) = None
     resume_replan_reason: str | None = None
     if resuming:
         store = WorkflowStore.open(project, str(resume_run_id))
@@ -838,9 +869,17 @@ def run_structured_workflow(
         original_sha = sha256_text(original_source)
         if original_sha != previous.get("original_sha256"):
             raise ValueError("Original workflow source hash no longer matches its manifest")
-        previous_initial = _check_from_json(dict(previous.get("initial_check") or {}))
+        previous_initial_value = dict(previous.get("initial_check") or {})
+        previous_initial = _check_from_json(previous_initial_value)
+        previous_initial_source_sha = previous_initial_value.get("source_sha256")
+        if previous_initial_source_sha is not None:
+            previous_initial_source_sha = str(previous_initial_source_sha)
         resume_safe_state = _checkpoint_state(
-            store, previous, original_source, previous_initial
+            store,
+            previous,
+            original_source,
+            previous_initial,
+            previous_initial_source_sha,
         )
         if sha256_text(target.read_text(encoding="utf-8")) != resume_safe_state[2]:
             raise ValueError(
@@ -1018,9 +1057,12 @@ def run_structured_workflow(
         raise
     check_name = "resume-check.json" if resuming else "initial-check.json"
     retrieval_name = "resume-retrieval.json" if resuming else "initial-retrieval.json"
-    atomic_write_json(store.paths.root / check_name, _check_to_json(initial_check))
+    initial_check_value = _check_to_json(
+        initial_check, source_sha256=preflight_current_sha
+    )
+    atomic_write_json(store.paths.root / check_name, initial_check_value)
     atomic_write_json(store.paths.root / retrieval_name, initial_retrieval)
-    store.update(initial_check=_check_to_json(initial_check))
+    store.update(initial_check=initial_check_value)
 
     formal_goal: dict[str, Any] | None = None
     formal_goal_created = False
@@ -1148,13 +1190,19 @@ def run_structured_workflow(
         "search_terms": [],
     }
     if resume_safe_state is not None:
-        safe_source, _, safe_sha, safe_checkpoint = resume_safe_state
-        safe_check = initial_check
+        (
+            safe_source,
+            safe_check,
+            safe_sha,
+            safe_checkpoint,
+            safe_check_source_sha,
+        ) = resume_safe_state
     else:
         safe_source = original_source
         safe_check = initial_check
         safe_sha = original_sha
         safe_checkpoint = None
+        safe_check_source_sha = preflight_current_sha
     working_sha = preflight_current_sha if initial_check.ok else safe_sha
     terminal_broad_source: str | None = None
     terminal_broad_sha: str | None = None
@@ -1476,6 +1524,7 @@ def run_structured_workflow(
                     safe_check = recovered_check
                     safe_sha = recovered_sha
                     safe_checkpoint = str(checkpoint_dir)
+                    safe_check_source_sha = recovered_sha
                     working_sha = recovered_sha
                     store.update(
                         steps=step_rows,
@@ -1844,7 +1893,10 @@ def run_structured_workflow(
                 retrieval["import_validation"] = candidate_import_validation
                 retrieval["deterministic_import_repair"] = deterministic_import_repair
                 atomic_write_json(attempt_dir / "retrieval.json", retrieval)
-                atomic_write_json(attempt_dir / "check.json", _check_to_json(last_check))
+                atomic_write_json(
+                    attempt_dir / "check.json",
+                    _check_to_json(last_check, source_sha256=candidate_sha),
+                )
                 store.event(
                     "phase_completed",
                     phase="prove",
@@ -1950,6 +2002,7 @@ def run_structured_workflow(
                     safe_check = last_check
                     safe_sha = candidate_sha
                     safe_checkpoint = str(checkpoint_dir)
+                    safe_check_source_sha = candidate_sha
                     working_sha = candidate_sha
                     step_completed = True
                     store.update(steps=step_rows, current_sha256=candidate_sha)
@@ -2281,7 +2334,9 @@ def run_structured_workflow(
                 "ok": audit_ok and global_review["verdict"] == "accept",
                 "source_sha256": sha256_text(final_source),
                 "source_audit": final_source_audit,
-                "lean_check": _check_to_json(final_check),
+                "lean_check": _check_to_json(
+                    final_check, source_sha256=sha256_text(final_source)
+                ),
                 "review": global_review,
             }
             atomic_write_json(store.paths.root / "final-audit.json", final_audit)
@@ -2313,11 +2368,18 @@ def run_structured_workflow(
             last_step["rejected_checkpoint"] = last_step.get("checkpoint")
             last_step["checkpoint"] = None
             store.update(steps=step_rows)
-            safe_source, safe_check, safe_sha, safe_checkpoint = _checkpoint_state(
+            (
+                safe_source,
+                safe_check,
+                safe_sha,
+                safe_checkpoint,
+                safe_check_source_sha,
+            ) = _checkpoint_state(
                 store,
                 {"steps": step_rows},
                 original_source,
                 initial_check,
+                preflight_current_sha,
             )
             atomic_write_text(target, safe_source)
             last_check = final_check
@@ -2329,10 +2391,22 @@ def run_structured_workflow(
             restored_sha = sha256_text(target.read_text(encoding="utf-8"))
             if restored_sha != safe_sha:
                 raise OSError("Restored Lean file does not match the latest safe checkpoint")
+            reused_safe_check = safe_check_source_sha == restored_sha
+            if reused_safe_check:
+                restore_lean_check = safe_check
+            else:
+                with timings.measure("restore_lean_check"):
+                    restore_lean_check = lean_checker(
+                        project, target, lean_timeout_seconds, lake_executable
+                    )
             restored_check = {
-                **_check_to_json(safe_check),
-                "reused_safe_check": True,
-                "reused_initial_check": safe_checkpoint is None,
+                **_check_to_json(
+                    restore_lean_check, source_sha256=restored_sha
+                ),
+                "reused_safe_check": reused_safe_check,
+                "reused_initial_check": (
+                    reused_safe_check and safe_checkpoint is None
+                ),
                 "restored_sha256": restored_sha,
                 "checkpoint": safe_checkpoint,
             }
@@ -2342,7 +2416,7 @@ def run_structured_workflow(
             store.event(
                 "safe_checkpoint_restored",
                 checkpoint=safe_checkpoint,
-                reused_safe_check=True,
+                reused_safe_check=reused_safe_check,
             )
             current_sha = safe_sha
         else:

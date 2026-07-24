@@ -160,6 +160,77 @@ class MathlibSearchTests(unittest.TestCase):
             "theorem kept : True := by trivial\n",
         )
 
+    def test_block_comment_import_is_not_a_real_broad_import(self) -> None:
+        source = (
+            "/-\n"
+            "import Mathlib\n"
+            "-/\n"
+            "\n"
+            "import Mathlib.Logic.Basic\n"
+            "\n"
+            "example : True := by trivial\n"
+        )
+
+        self.assertFalse(mathlib_search.has_broad_import(source))
+        broadened = mathlib_search.ensure_broad_mathlib_import(source)
+        self.assertEqual(
+            broadened,
+            (
+                "/-\n"
+                "import Mathlib\n"
+                "-/\n"
+                "\n"
+                "import Mathlib.Logic.Basic\n"
+                "import Mathlib\n"
+                "\n"
+                "example : True := by trivial\n"
+            ),
+        )
+        self.assertTrue(mathlib_search.has_broad_import(broadened))
+
+    def test_reduction_preserves_import_text_inside_nested_block_comments(self) -> None:
+        comment = (
+            "/- outer\n"
+            "  /- nested\n"
+            "  import Mathlib\n"
+            "  -/\n"
+            "-/\n"
+        )
+        source = comment + "example : True := by trivial\n"
+        broadened = mathlib_search.ensure_broad_mathlib_import(source)
+
+        optimized, metadata = optimize_broad_imports(
+            broadened,
+            {
+                "import_suggestions": [
+                    {"module": "Mathlib.Logic.Basic", "confidence": "high"}
+                ]
+            },
+        )
+
+        self.assertTrue(metadata["changed"])
+        self.assertTrue(optimized.startswith(comment))
+        self.assertIn("  import Mathlib\n", optimized)
+        self.assertIn("import Mathlib.Logic.Basic\n", optimized)
+        self.assertFalse(mathlib_search.has_broad_import(optimized))
+
+    def test_unterminated_header_comment_fails_closed(self) -> None:
+        source = "/-\nimport Mathlib\n"
+
+        self.assertFalse(mathlib_search.has_broad_import(source))
+        with self.assertRaisesRegex(ValueError, "Cannot safely classify"):
+            mathlib_search.ensure_broad_mathlib_import(source)
+        optimized, metadata = optimize_broad_imports(
+            source,
+            {
+                "import_suggestions": [
+                    {"module": "Mathlib.Logic.Basic", "confidence": "high"}
+                ]
+            },
+        )
+        self.assertEqual(optimized, source)
+        self.assertEqual(metadata["reason"], "unterminated_import_header_comment")
+
     def test_optimize_broad_imports_reports_selected_and_only_adds_missing(self) -> None:
         source = (
             "import Demo.Basic\r\n"

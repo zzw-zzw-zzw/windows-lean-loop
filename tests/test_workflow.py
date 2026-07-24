@@ -3384,6 +3384,49 @@ class StructuredWorkflowTests(unittest.TestCase):
                 manifest["current_sha256"], sha256_text(restored_source)
             )
 
+    def test_single_step_proof_first_global_rejection_rechecks_original(self) -> None:
+        original = (
+            "import Mathlib.Logic.Basic\n"
+            "example : True := by exact missing\n"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            result, target, timeline, _ = self._run_terminal_reduction_case(
+                Path(directory),
+                source=original,
+                global_verdict="retry",
+            )
+
+            self.assertFalse(result.ok)
+            self.assertEqual(target.read_text(encoding="utf-8"), original)
+            manifest = json.loads(
+                (result.state_dir / "run.json").read_text(encoding="utf-8")
+            )
+            restore_check = json.loads(
+                (result.state_dir / "restore-check.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            initial_check = json.loads(
+                (result.state_dir / "initial-check.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            original_sha = sha256_text(original)
+            checked_sources = [
+                str(value) for kind, value in timeline if kind == "lean"
+            ]
+
+            self.assertTrue(has_broad_import(checked_sources[0]))
+            self.assertNotEqual(initial_check["source_sha256"], original_sha)
+            self.assertEqual(checked_sources[-1], original)
+            self.assertFalse(restore_check["reused_safe_check"])
+            self.assertFalse(restore_check["reused_initial_check"])
+            self.assertIsNone(restore_check["checkpoint"])
+            self.assertEqual(restore_check["source_sha256"], original_sha)
+            self.assertEqual(restore_check["restored_sha256"], original_sha)
+            self.assertEqual(manifest["current_sha256"], original_sha)
+            self.assertIsNone(manifest["restored_to_checkpoint"])
+
     def test_proof_first_retry_reviewer_and_checkpoint_share_broad_candidates(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             project, target = self._project(Path(directory), "-- start\n")
@@ -3580,6 +3623,280 @@ class StructuredWorkflowTests(unittest.TestCase):
             )
             self.assertEqual(target.read_text(encoding="utf-8"), precise_source)
 
+    def test_proof_first_resume_reuses_only_precise_checkpoint_check(self) -> None:
+        original = "example : True := by exact missing\n"
+        precise_source = (
+            "import Mathlib.Logic.Basic\n"
+            "example : True := by trivial\n"
+        )
+
+        def marker_check(source: str) -> LeanCheck:
+            ok = "missing" not in source
+            return LeanCheck(
+                ok,
+                0 if ok else 1,
+                f"checked:{sha256_text(source)}",
+                ("lake", "env", "lean", "Main.lean"),
+            )
+
+        with tempfile.TemporaryDirectory() as directory:
+            first, target, _, _ = self._run_terminal_reduction_case(
+                Path(directory),
+                source=original,
+                import_policy="precise",
+                candidates=[precise_source],
+                checker_override=marker_check,
+            )
+            self.assertTrue(first.ok)
+            manifest_path = first.state_dir / "run.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            checkpoint = Path(manifest["steps"][0]["checkpoint"])
+            checkpoint_sha = sha256_text(precise_source)
+            plan_path = first.state_dir / "plan.json"
+            plan = json.loads(plan_path.read_text(encoding="utf-8"))
+            plan["steps"].append(
+                {
+                    "id": "step-2",
+                    "goal": "finish proof",
+                    "success_criteria": "Lean passes",
+                    "search_terms": [],
+                    "required_declarations": [],
+                }
+            )
+            plan_path.write_text(
+                json.dumps(plan, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            manifest["steps"].append(
+                {
+                    "index": 2,
+                    "id": "step-2",
+                    "goal": "finish proof",
+                    "success_criteria": "Lean passes",
+                    "status": "pending",
+                    "attempts": [],
+                    "checkpoint": None,
+                }
+            )
+            manifest["status"] = "failed"
+            manifest["phase"] = "complete"
+            manifest["error"] = "historical interruption"
+            manifest["settings"]["import_policy"] = "auto"
+            manifest["settings"]["effective_import_policy"] = "proof-first"
+            manifest["current_sha256"] = checkpoint_sha
+            manifest_path.write_text(
+                json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            target.write_text(precise_source, encoding="utf-8")
+
+            checked_sources: list[str] = []
+
+            def checker(
+                project: Path, target: Path, timeout: int, lake: str
+            ) -> LeanCheck:
+                source = target.read_text(encoding="utf-8")
+                checked_sources.append(source)
+                return marker_check(source)
+
+            def json_model(config, system, user, temp):
+                self.assertNotIn("Planner", system)
+                self.assertNotIn("global-final-audit", user)
+                return {
+                    "verdict": "retry",
+                    "summary": "candidate still fails",
+                    "failure_analysis": ["missing"],
+                    "next_actions": [],
+                    "search_terms": [],
+                }
+
+            with patch(
+                "lean_loop.workflow._safe_retrieval",
+                return_value={
+                    "queries": [],
+                    "hits": [],
+                    "module_checks": [],
+                    "import_suggestions": [],
+                },
+            ):
+                resumed = run_structured_workflow(
+                    project=Path(directory),
+                    target=target,
+                    task="prove using `plan_term`",
+                    plan_config=_config(),
+                    prove_config=_config(),
+                    review_config=_config(),
+                    max_attempts=2,
+                    max_attempts_per_step=1,
+                    lean_timeout_seconds=10,
+                    lake_executable="lake",
+                    import_policy="auto",
+                    resume_run_id=first.run_id,
+                    json_model_call=json_model,
+                    file_model_call=lambda *args: (
+                        "import Mathlib.Logic.Basic\n"
+                        "example : True := by exact still_missing\n"
+                    ),
+                    lean_checker=checker,
+                )
+
+            self.assertFalse(resumed.ok)
+            self.assertEqual(target.read_text(encoding="utf-8"), precise_source)
+            resume_check = json.loads(
+                (first.state_dir / "resume-check.json").read_text(encoding="utf-8")
+            )
+            restore_check = json.loads(
+                (first.state_dir / "restore-check.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            checkpoint_check = json.loads(
+                (checkpoint / "check.json").read_text(encoding="utf-8")
+            )
+            final_manifest = json.loads(
+                manifest_path.read_text(encoding="utf-8")
+            )
+
+            self.assertTrue(has_broad_import(checked_sources[0]))
+            self.assertNotEqual(resume_check["source_sha256"], checkpoint_sha)
+            self.assertEqual(checkpoint_check["source_sha256"], checkpoint_sha)
+            self.assertEqual(
+                checkpoint_check["output"], f"checked:{checkpoint_sha}"
+            )
+            self.assertTrue(restore_check["reused_safe_check"])
+            self.assertFalse(restore_check["reused_initial_check"])
+            self.assertEqual(restore_check["source_sha256"], checkpoint_sha)
+            self.assertEqual(restore_check["restored_sha256"], checkpoint_sha)
+            self.assertEqual(restore_check["output"], f"checked:{checkpoint_sha}")
+            self.assertEqual(restore_check["checkpoint"], str(checkpoint))
+            self.assertEqual(final_manifest["current_sha256"], checkpoint_sha)
+            self.assertEqual(
+                final_manifest["restored_to_checkpoint"], str(checkpoint)
+            )
+
+    def test_historical_precise_resume_global_rejection_rechecks_original(self) -> None:
+        original = "example : True := by exact missing\n"
+        precise_source = (
+            "import Mathlib.Logic.Basic\n"
+            "example : True := by exact useful_true\n"
+        )
+        suggestions = [
+            {
+                "module": "Mathlib.Logic.Basic",
+                "confidence": "high",
+                "queries": ["useful_true"],
+                "evidence": ["Mathlib/Logic/Basic.lean:1 theorem useful_true"],
+            }
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            first, target, _, _ = self._run_terminal_reduction_case(
+                Path(directory),
+                source=original,
+                import_policy="precise",
+                candidates=[precise_source],
+            )
+            self.assertTrue(first.ok)
+            manifest_path = first.state_dir / "run.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            checkpoint = Path(manifest["steps"][0]["checkpoint"])
+            checkpoint_sha = sha256_text(precise_source)
+            manifest["status"] = "failed"
+            manifest["phase"] = "complete"
+            manifest["error"] = "historical interruption"
+            manifest["settings"]["import_policy"] = "auto"
+            manifest["settings"]["effective_import_policy"] = "proof-first"
+            manifest["current_sha256"] = checkpoint_sha
+            manifest_path.write_text(
+                json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            target.write_text(precise_source, encoding="utf-8")
+            checked_sources: list[str] = []
+
+            def checker(
+                project: Path, target: Path, timeout: int, lake: str
+            ) -> LeanCheck:
+                source = target.read_text(encoding="utf-8")
+                checked_sources.append(source)
+                ok = "missing" not in source
+                return LeanCheck(
+                    ok,
+                    0 if ok else 1,
+                    f"checked:{sha256_text(source)}",
+                    (lake, "env", "lean", "Main.lean"),
+                )
+
+            def json_model(config, system, user, temp):
+                self.assertIn("global-final-audit", user)
+                return {
+                    "verdict": "retry",
+                    "summary": "reject resumed final source",
+                    "failure_analysis": ["incomplete"],
+                    "next_actions": [],
+                    "search_terms": [],
+                }
+
+            with patch(
+                "lean_loop.workflow._safe_retrieval",
+                return_value={
+                    "queries": ["useful_true"],
+                    "hits": [],
+                    "module_checks": [],
+                    "import_suggestions": suggestions,
+                },
+            ):
+                resumed = run_structured_workflow(
+                    project=Path(directory),
+                    target=target,
+                    task="prove using `plan_term`",
+                    plan_config=_config(),
+                    prove_config=_config(),
+                    review_config=_config(),
+                    max_attempts=2,
+                    max_attempts_per_step=1,
+                    lean_timeout_seconds=10,
+                    lake_executable="lake",
+                    import_policy="auto",
+                    resume_run_id=first.run_id,
+                    json_model_call=json_model,
+                    file_model_call=lambda *args: self.fail(
+                        "completed historical plan must not call the Prover"
+                    ),
+                    lean_checker=checker,
+                )
+
+            self.assertFalse(resumed.ok)
+            self.assertEqual(target.read_text(encoding="utf-8"), original)
+            resume_check = json.loads(
+                (first.state_dir / "resume-check.json").read_text(encoding="utf-8")
+            )
+            restore_check = json.loads(
+                (first.state_dir / "restore-check.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            checkpoint_check = json.loads(
+                (checkpoint / "check.json").read_text(encoding="utf-8")
+            )
+            final_manifest = json.loads(
+                manifest_path.read_text(encoding="utf-8")
+            )
+            original_sha = sha256_text(original)
+
+            self.assertTrue(has_broad_import(checked_sources[0]))
+            self.assertEqual(
+                resume_check["source_sha256"], sha256_text(checked_sources[0])
+            )
+            self.assertEqual(checkpoint_check["source_sha256"], checkpoint_sha)
+            self.assertEqual(checked_sources[-1], original)
+            self.assertFalse(restore_check["reused_safe_check"])
+            self.assertFalse(restore_check["reused_initial_check"])
+            self.assertEqual(restore_check["source_sha256"], original_sha)
+            self.assertEqual(restore_check["restored_sha256"], original_sha)
+            self.assertIsNone(restore_check["checkpoint"])
+            self.assertEqual(final_manifest["current_sha256"], original_sha)
+            self.assertIsNone(final_manifest["restored_to_checkpoint"])
+
     def test_resume_policy_change_replans_and_original_archive_is_fail_closed(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             project, target = self._project(
@@ -3764,7 +4081,13 @@ class StructuredWorkflowTests(unittest.TestCase):
             (project / "lakefile.toml").is_file()
             or (project / "lakefile.lean").is_file()
         )
-        broad_source = "import Mathlib\nexample : True := by exact True.intro\n"
+        broad_source = (
+            "/-\n"
+            "import Mathlib\n"
+            "-/\n"
+            "import Mathlib\n"
+            "example : True := by exact True.intro\n"
+        )
         retrieval = {
             "import_suggestions": [
                 {"module": "Mathlib.Logic.Basic", "confidence": "high"}
@@ -3787,6 +4110,8 @@ class StructuredWorkflowTests(unittest.TestCase):
                 broad_source, retrieval
             )
             self.assertTrue(metadata["changed"])
+            self.assertIn("/-\nimport Mathlib\n-/\n", candidate)
+            self.assertIn("import Mathlib.Logic.Basic\n", candidate)
             target.write_text(candidate, encoding="utf-8")
             reduced_check = check_lean(project, target, 120, "lake")
             self.assertTrue(reduced_check.ok, reduced_check.output)
