@@ -480,6 +480,7 @@ function populateConfigForm(providerId = "default") {
   $("configApiBase").value = config.api_base || "";
   $("configModel").value = config.model || "";
   $("configApiMode").value = config.api_mode || "responses";
+  $("configApiTransport").value = config.api_transport || "auto";
   $("configReasoning").value = config.reasoning_effort || "medium";
   $("configTimeout").value = config.timeout_seconds || 180;
   $("configRetries").value = config.api_timeout_retries ?? 1;
@@ -508,6 +509,7 @@ async function saveConfiguration(event) {
         api_base: $("configApiBase").value.trim(),
         model: $("configModel").value.trim(),
         api_mode: $("configApiMode").value,
+        api_transport: $("configApiTransport").value,
         reasoning_effort: $("configReasoning").value,
         timeout_seconds: Number($("configTimeout").value),
         api_timeout_retries: Number($("configRetries").value),

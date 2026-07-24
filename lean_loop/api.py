@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
+import sys
 import tempfile
 from dataclasses import replace
 from pathlib import Path
@@ -212,6 +214,29 @@ def _curl_config(
     )
 
 
+def effective_api_transport(config: ApiConfig) -> str:
+    if config.api_transport != "auto":
+        return config.api_transport
+    return "python" if os.name == "nt" else "curl"
+
+
+def _python_transport_input(
+    endpoint: str,
+    api_key: str,
+    payload_path: Path,
+    timeout_seconds: int,
+) -> str:
+    return json.dumps(
+        {
+            "endpoint": endpoint,
+            "api_key": api_key,
+            "payload_path": str(payload_path.resolve()),
+            "timeout_seconds": timeout_seconds,
+        },
+        ensure_ascii=False,
+    )
+
+
 def _call_model_text_once(
     config: ApiConfig,
     system_prompt: str,
@@ -234,22 +259,36 @@ def _call_model_text_once(
         json.dump(payload, handle, ensure_ascii=False)
         payload_path = Path(handle.name)
 
+    transport = effective_api_transport(config)
+    if transport == "python":
+        command = [sys.executable, "-m", "lean_loop.python_transport"]
+        input_text = _python_transport_input(
+            config.endpoint,
+            config.api_key,
+            payload_path,
+            config.timeout_seconds,
+        )
+    else:
+        command = [config.curl_executable, "--config", "-"]
+        input_text = _curl_config(
+            config.endpoint,
+            config.api_key,
+            payload_path,
+            config.timeout_seconds,
+        )
+    _notify_progress(process_control, "transport.selected", transport=transport)
     try:
         completed = run_controlled_process(
-            [config.curl_executable, "--config", "-"],
-            input_text=_curl_config(
-                config.endpoint,
-                config.api_key,
-                payload_path,
-                config.timeout_seconds,
-            ),
+            command,
+            input_text=input_text,
             timeout_seconds=config.timeout_seconds + 5,
             kind="api",
             control=process_control,
             stdout_line_callback=stream.feed_line if stream is not None else None,
         )
     except FileNotFoundError as exc:
-        raise ApiError(f"curl executable not found: {config.curl_executable}") from exc
+        executable = config.curl_executable if transport == "curl" else sys.executable
+        raise ApiError(f"API transport executable not found: {executable}") from exc
     except subprocess.TimeoutExpired as exc:
         raise ApiTimeoutError(
             f"API request timed out after {config.timeout_seconds}s"
@@ -258,7 +297,11 @@ def _call_model_text_once(
         payload_path.unlink(missing_ok=True)
 
     if completed.returncode != 0:
-        detail = (completed.stdout or completed.stderr).strip()
+        detail = "\n".join(
+            value.strip()
+            for value in (completed.stdout, completed.stderr)
+            if value and value.strip()
+        )
         if completed.returncode == 28:
             raise ApiTimeoutError(
                 f"API request timed out after {config.timeout_seconds}s: {detail}"
@@ -269,9 +312,11 @@ def _call_model_text_once(
             re.IGNORECASE,
         ):
             raise TransientApiError(
-                f"Transient API gateway failure (curl exit {completed.returncode}): {detail}"
+                f"Transient API gateway failure ({transport} exit {completed.returncode}): {detail}"
             )
-        raise ApiError(f"API request failed (curl exit {completed.returncode}): {detail}")
+        raise ApiError(
+            f"API request failed ({transport} exit {completed.returncode}): {detail}"
+        )
 
     if stream is not None:
         return stream.final_text(completed.stdout)

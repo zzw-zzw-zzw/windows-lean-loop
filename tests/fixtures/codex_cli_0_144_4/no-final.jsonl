@@ -1,0 +1,4 @@
+{"type":"thread.started","thread_id":"fixture-thread"}
+{"type":"turn.started"}
+{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"I inspected the target but did not return the required result."}}
+{"type":"turn.completed","usage":{"input_tokens":1}}

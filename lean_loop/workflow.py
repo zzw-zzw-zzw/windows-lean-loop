@@ -15,7 +15,6 @@ from lean_loop.jsonutil import atomic_write_json, atomic_write_text, read_json, 
 from lean_loop.lean import LeanCheck, check_lean
 from lean_loop.mathlib_search import (
     collect_retrieval,
-    ensure_broad_mathlib_import,
     has_broad_import,
     import_validation_diagnostics,
     optimize_broad_imports,
@@ -54,8 +53,14 @@ FileModelCall = Callable[[ApiConfig, str, Path], str]
 LeanChecker = Callable[[Path, Path, int, str], LeanCheck]
 PhaseCallback = Callable[[str, int | None], None]
 WorkflowCreatedCallback = Callable[[str], None]
+BackendIdentityCallback = Callable[[dict[str, Any]], None]
 
 IMPORT_POLICIES = {"auto", "proof-first", "precise", "broad"}
+_RECOVERABLE_CODEX_PROVER_OUTPUT_FAILURES = {
+    "empty_output",
+    "malformed_output",
+    "output_protocol_incompatible",
+}
 _TOP_LEVEL_DECLARATION_RE = re.compile(
     r"^\s*(?:theorem|lemma|def|abbrev|structure|class|inductive|example)\b",
     re.MULTILINE,
@@ -66,8 +71,14 @@ _FORMAL_DECLARATION_RE = re.compile(
 _DECLARATION_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_'.]*$")
 
 
-class _FinalImportReductionRestoreError(OSError):
-    pass
+def _recoverable_codex_prover_output_failure(error: ApiError) -> bool:
+    metadata = getattr(error, "metadata", None)
+    return (
+        getattr(error, "kind", None) in _RECOVERABLE_CODEX_PROVER_OUTPUT_FAILURES
+        and isinstance(metadata, dict)
+        and metadata.get("backend_id") == "codex-subscription"
+        and metadata.get("exit_code") == 0
+    )
 
 
 def _qualify_formal_declaration(declaration: str) -> str:
@@ -157,30 +168,7 @@ def _effective_import_policy(import_policy: str, source: str) -> str:
         raise ValueError(f"Unsupported import policy: {import_policy}")
     if import_policy != "auto":
         return import_policy
-    return "proof-first"
-
-
-def _historical_effective_import_policy(
-    previous: dict[str, Any], original_source: str
-) -> tuple[str, bool]:
-    old_settings = dict(previous.get("settings") or {})
-    raw_policy = str(old_settings.get("import_policy") or "auto")
-    if raw_policy not in IMPORT_POLICIES:
-        raise ValueError(f"Unsupported historical import policy: {raw_policy}")
-    historical_effective = old_settings.get("effective_import_policy")
-    if historical_effective is not None:
-        effective = str(historical_effective)
-        if effective not in IMPORT_POLICIES - {"auto"}:
-            raise ValueError(
-                f"Unsupported historical effective import policy: {effective}"
-            )
-        return effective, False
-    if raw_policy != "auto":
-        return raw_policy, False
-    legacy_effective = (
-        "proof-first" if needs_goal_formalization(original_source) else "precise"
-    )
-    return legacy_effective, True
+    return "proof-first" if needs_goal_formalization(source) else "precise"
 
 
 def _check_to_json(check: LeanCheck) -> dict[str, Any]:
@@ -207,12 +195,7 @@ def _checkpoint_state(
     original_source: str,
     fallback_check: LeanCheck,
 ) -> tuple[str, LeanCheck, str, str | None]:
-    for step in reversed(list(manifest.get("steps") or [])):
-        if not isinstance(step, dict):
-            continue
-        checkpoint_value = step.get("checkpoint")
-        if step.get("status") != "succeeded" or not checkpoint_value:
-            continue
+    def load_checkpoint(checkpoint_value: Any) -> tuple[str, LeanCheck, str, str]:
         checkpoint = Path(str(checkpoint_value))
         source_path = checkpoint / "source.lean"
         check_path = checkpoint / "check.json"
@@ -225,7 +208,132 @@ def _checkpoint_state(
         if source_sha != metadata.get("candidate_sha256"):
             raise ValueError(f"Resume checkpoint hash mismatch: {checkpoint}")
         return source, _check_from_json(read_json(check_path)), source_sha, str(checkpoint)
+
+    for step in reversed(list(manifest.get("steps") or [])):
+        if not isinstance(step, dict):
+            continue
+        checkpoint_value = step.get("checkpoint")
+        if step.get("status") != "succeeded" or not checkpoint_value:
+            continue
+        return load_checkpoint(checkpoint_value)
+    restored_checkpoint = manifest.get("restored_to_checkpoint")
+    if restored_checkpoint:
+        return load_checkpoint(restored_checkpoint)
     return original_source, fallback_check, sha256_text(original_source), None
+
+
+def _archived_candidate_source(
+    store: WorkflowStore,
+    attempt_rows: list[dict[str, Any]],
+    attempt: int,
+) -> tuple[str, str]:
+    row = next(
+        (
+            candidate_row
+            for candidate_row in attempt_rows
+            if int(candidate_row.get("attempt") or 0) == attempt
+        ),
+        None,
+    )
+    if row is None:
+        raise ValueError(f"Resume attempt is missing from the workflow manifest: {attempt}")
+    candidate_path = store.paths.attempt_dir(attempt) / "candidate.lean"
+    if not candidate_path.is_file():
+        raise ValueError(f"Resume candidate is missing: {candidate_path}")
+    source = candidate_path.read_text(encoding="utf-8")
+    source_sha = sha256_text(source)
+    expected_sha = str(row.get("candidate_sha256") or "")
+    if not expected_sha or source_sha != expected_sha:
+        raise ValueError(f"Resume candidate hash mismatch: {candidate_path}")
+    return source, source_sha
+
+
+def _archived_candidate_check(store: WorkflowStore, attempt: int) -> LeanCheck:
+    check_path = store.paths.attempt_dir(attempt) / "check.json"
+    if not check_path.is_file():
+        raise ValueError(f"Resume candidate check is missing: {check_path}")
+    try:
+        value = read_json(check_path)
+        if not isinstance(value, dict):
+            raise TypeError("candidate check must be a JSON object")
+        required_fields = {"ok", "returncode", "output", "command"}
+        if not required_fields.issubset(value):
+            raise TypeError("candidate check is missing required fields")
+        if type(value["ok"]) is not bool:
+            raise TypeError("candidate check ok must be a boolean")
+        if type(value["returncode"]) is not int:
+            raise TypeError("candidate check returncode must be an integer")
+        if type(value["output"]) is not str:
+            raise TypeError("candidate check output must be a string")
+        command = value["command"]
+        if type(command) is not list or any(
+            type(part) is not str for part in command
+        ):
+            raise TypeError("candidate check command must be a string list")
+        return _check_from_json(value)
+    except (OSError, TypeError, ValueError) as exc:
+        raise ValueError(f"Resume candidate check is invalid: {check_path}") from exc
+
+
+def _accepted_attempt_row(
+    attempt_rows: list[dict[str, Any]],
+    step_attempts: list[int],
+) -> dict[str, Any] | None:
+    if not step_attempts:
+        return None
+    latest = int(step_attempts[-1])
+    row = next(
+        (
+            candidate_row
+            for candidate_row in reversed(attempt_rows)
+            if int(candidate_row.get("attempt") or 0) == latest
+        ),
+        None,
+    )
+    if not isinstance(row, dict):
+        return None
+    if not bool(row.get("check_ok")) or row.get("review_verdict") != "accept":
+        return None
+    return row
+
+
+def _persist_step_checkpoint(
+    *,
+    store: WorkflowStore,
+    step_index: int,
+    active_step: dict[str, Any],
+    attempt: int,
+    candidate: str,
+    candidate_sha: str,
+    check: LeanCheck,
+    review: dict[str, Any],
+    retrieval: dict[str, Any],
+) -> Path:
+    generation = int(store.read().get("resume_count") or 0)
+    checkpoint_dir = store.paths.checkpoint_dir(
+        step_index,
+        str(active_step["id"]),
+        attempt=attempt,
+        generation=generation,
+    )
+    checkpoint_dir.mkdir(parents=True, exist_ok=False)
+    atomic_write_text(checkpoint_dir / "source.lean", candidate)
+    atomic_write_json(checkpoint_dir / "check.json", _check_to_json(check))
+    atomic_write_json(checkpoint_dir / "review.json", review)
+    atomic_write_json(checkpoint_dir / "retrieval.json", retrieval)
+    atomic_write_json(
+        checkpoint_dir / "checkpoint.json",
+        {
+            "generation": generation,
+            "step_index": step_index,
+            "step_id": active_step["id"],
+            "goal": active_step["goal"],
+            "success_criteria": active_step["success_criteria"],
+            "attempt": attempt,
+            "candidate_sha256": candidate_sha,
+        },
+    )
+    return checkpoint_dir
 
 
 def _latest_attempt_check(store: WorkflowStore, attempts: list[dict[str, Any]]) -> LeanCheck | None:
@@ -387,9 +495,15 @@ def _resume_replan_reason(
     current_settings: dict[str, Any],
 ) -> str | None:
     old_settings = dict(previous.get("settings") or {})
-    old_import_policy = str(old_settings.get("import_policy") or "auto")
-    if old_import_policy != current_settings.get("import_policy"):
-        return "import_policy_changed"
+    old_backend = str(old_settings.get("agent_backend") or "direct")
+    if old_backend != str(current_settings.get("agent_backend") or "direct"):
+        return "backend_changed"
+    old_backend_identity = old_settings.get("backend_identity")
+    if (
+        old_backend_identity is not None
+        and old_backend_identity != current_settings.get("backend_identity")
+    ):
+        return "backend_identity_changed"
     old_models = old_settings.get("models")
     if old_models and old_models != current_settings.get("models"):
         return "model_changed"
@@ -408,7 +522,7 @@ def _resume_replan_reason(
         check_path = store.paths.attempt_dir(number) / "check.json"
         if not check_path.is_file():
             return None
-        output = str(read_json(check_path).get("output") or "")
+        output = _archived_candidate_check(store, number).output
         diagnostics.append(" ".join(output.split()))
     if diagnostics[0] and diagnostics[0] == diagnostics[1]:
         return "repeated_diagnostics"
@@ -520,51 +634,6 @@ def _safe_retrieval(
         }
 
 
-def _final_import_reduction_summary(
-    artifact: dict[str, Any],
-) -> dict[str, Any]:
-    return {
-        "artifact": "final-import-reduction.json",
-        "attempted": artifact["attempted"],
-        "changed": artifact["changed"],
-        "effective_import_policy": artifact["effective_import_policy"],
-        "broad_source_sha256": artifact["broad_source_sha256"],
-        "candidate_source_sha256": artifact["candidate_source_sha256"],
-        "selected_source_sha256": artifact["selected_source_sha256"],
-        "selected_source": artifact["selected_source"],
-        "fallback_reason": artifact["fallback_reason"],
-    }
-
-
-def _restore_final_broad_source(
-    target: Path,
-    broad_source: str,
-    broad_source_sha256: str,
-) -> None:
-    try:
-        atomic_write_text(target, broad_source)
-    except Exception as exc:
-        raise _FinalImportReductionRestoreError(
-            f"Final import reduction could not restore the broad source: {exc}"
-        ) from exc
-    restored_sha = sha256_text(target.read_text(encoding="utf-8"))
-    if restored_sha != broad_source_sha256:
-        raise _FinalImportReductionRestoreError(
-            "Final import reduction restored a source with the wrong SHA-256"
-        )
-
-
-def _write_final_import_reduction(
-    store: WorkflowStore,
-    artifact: dict[str, Any],
-) -> None:
-    atomic_write_json(store.paths.root / "final-import-reduction.json", artifact)
-    store.update(
-        final_import_reduction=_final_import_reduction_summary(artifact),
-        current_sha256=artifact["selected_source_sha256"],
-    )
-
-
 def run_structured_workflow(
     *,
     project: Path,
@@ -588,8 +657,10 @@ def run_structured_workflow(
     lean_checker: LeanChecker = check_lean,
     phase_callback: PhaseCallback | None = None,
     workflow_created_callback: WorkflowCreatedCallback | None = None,
+    backend_identity_callback: BackendIdentityCallback | None = None,
     process_control: ProcessControl | None = None,
     agent_backend: AgentBackend | None = None,
+    agent_backend_id: str = "direct",
 ) -> WorkflowResult:
     if max_attempts < 1:
         raise ValueError("max_attempts must be positive")
@@ -598,8 +669,40 @@ def run_structured_workflow(
     if max_attempts_per_step < 1:
         raise ValueError("max_attempts_per_step must be positive")
     protected_declarations = list(protected_declarations or [])
+    if agent_backend_id not in {
+        "direct",
+        "codex-subscription",
+        "claude-subscription",
+    }:
+        raise ValueError(f"Unsupported Agent backend: {agent_backend_id}")
     relative = target.relative_to(project)
+    original_for_policy = target.read_text(encoding="utf-8")
+    effective_import_policy = _effective_import_policy(import_policy, original_for_policy)
+    selected_backend = agent_backend
+    backend_identity: dict[str, Any] | None = None
+    if agent_backend_id != "direct":
+        from lean_loop.subscription_backend import (
+            build_subscription_identity_summary,
+            create_subscription_backend,
+        )
+
+        if selected_backend is None:
+            selected_backend = create_subscription_backend(
+                agent_backend_id,
+                protected_root=project,
+                protected_target=target,
+                process_control=process_control,
+            )
+        backend_identity = build_subscription_identity_summary(
+            selected_backend,  # type: ignore[arg-type]
+            {
+                "plan": plan_config,
+                "prove": prove_config,
+                "review": review_config,
+            },
+        )
     settings = {
+        "agent_backend": agent_backend_id,
         "max_attempts": max_attempts,
         "max_attempts_total": max_attempts,
         "max_attempts_per_step": max_attempts_per_step,
@@ -608,6 +711,7 @@ def run_structured_workflow(
         "keep_failed": keep_failed,
         "formalize_goal": formalize_goal,
         "import_policy": import_policy,
+        "effective_import_policy": effective_import_policy,
         "protect_existing_statements": protect_existing_statements,
         "protected_declarations": protected_declarations,
         "models": {
@@ -617,19 +721,22 @@ def run_structured_workflow(
         },
         "provider_signatures": {
             "plan": {
+                "backend": agent_backend_id,
                 "model": plan_config.model,
                 "mode": plan_config.mode,
-                "endpoint": plan_config.endpoint,
+                "endpoint": plan_config.endpoint if agent_backend_id == "direct" else None,
             },
             "prove": {
+                "backend": agent_backend_id,
                 "model": prove_config.model,
                 "mode": prove_config.mode,
-                "endpoint": prove_config.endpoint,
+                "endpoint": prove_config.endpoint if agent_backend_id == "direct" else None,
             },
             "review": {
+                "backend": agent_backend_id,
                 "model": review_config.model,
                 "mode": review_config.mode,
-                "endpoint": review_config.endpoint,
+                "endpoint": review_config.endpoint if agent_backend_id == "direct" else None,
             },
         },
         "reasoning_effort": {
@@ -638,10 +745,11 @@ def run_structured_workflow(
             "review": review_config.reasoning_effort,
         },
     }
+    if backend_identity is not None:
+        settings["backend_identity"] = backend_identity
     resuming = resume_run_id is not None
     resume_safe_state: tuple[str, LeanCheck, str, str | None] | None = None
     resume_replan_reason: str | None = None
-    legacy_policy_resolved = False
     if resuming:
         store = WorkflowStore.open(project, str(resume_run_id))
         previous = store.read()
@@ -662,32 +770,11 @@ def run_structured_workflow(
                 "Target file changed after the last verified checkpoint; "
                 "resume refuses to overwrite external edits"
             )
-        old_settings = dict(previous.get("settings") or {})
-        old_import_policy = str(old_settings.get("import_policy") or "auto")
-        if import_policy == old_import_policy:
-            effective_import_policy, legacy_policy_resolved = (
-                _historical_effective_import_policy(previous, original_source)
-            )
-        else:
-            effective_import_policy = _effective_import_policy(
-                import_policy, original_source
-            )
-        settings["effective_import_policy"] = effective_import_policy
         resume_replan_reason = _resume_replan_reason(store, previous, settings)
         store.resume(phase="lean_checking", settings=settings)
-        if legacy_policy_resolved:
-            store.event(
-                "legacy_import_policy_resolved",
-                import_policy=old_import_policy,
-                effective_import_policy=effective_import_policy,
-            )
     else:
         original_source = target.read_text(encoding="utf-8")
         original_sha = sha256_text(original_source)
-        effective_import_policy = _effective_import_policy(
-            import_policy, original_source
-        )
-        settings["effective_import_policy"] = effective_import_policy
         store = WorkflowStore.create(
             project=project,
             target_file=relative.as_posix(),
@@ -700,7 +787,7 @@ def run_structured_workflow(
     agent_runtime = AgentRuntime(
         workflow_root=store.paths.root,
         run_id=store.paths.run_id,
-        backend=agent_backend
+        backend=selected_backend
         or DirectModelBackend(
             json_model_call=json_model_call,
             file_model_call=file_model_call,
@@ -710,6 +797,8 @@ def run_structured_workflow(
     target_changed = False
     transaction_touched = False
     try:
+        if backend_identity is not None and backend_identity_callback is not None:
+            backend_identity_callback(dict(backend_identity))
         if workflow_created_callback is not None:
             workflow_created_callback(store.paths.run_id)
         if phase_callback is not None:
@@ -737,14 +826,10 @@ def run_structured_workflow(
                     preflight_source, seed_retrieval
                 )
             else:
-                optimized_source = ensure_broad_mathlib_import(preflight_source)
+                optimized_source = preflight_source
                 import_optimization = {
-                    "changed": optimized_source != preflight_source,
-                    "reason": (
-                        "broad_import_ensured"
-                        if optimized_source != preflight_source
-                        else "broad_import_present"
-                    ),
+                    "changed": False,
+                    "reason": "proof_first_policy",
                     "policy": effective_import_policy,
                 }
         if import_optimization.get("changed"):
@@ -782,68 +867,36 @@ def run_structured_workflow(
             )
         initial_retrieval["import_optimization"] = import_optimization
     except ProcessCancelled as exc:
-        restored = False
         if target_changed and not keep_failed:
             atomic_write_text(target, preflight_source)
-            restored = True
-        current_sha = sha256_text(target.read_text(encoding="utf-8"))
-        restored_checkpoint = None
-        if (
-            restored
-            and resume_safe_state is not None
-            and current_sha == resume_safe_state[2]
-        ):
-            restored_checkpoint = resume_safe_state[3]
         timing_summary = timings.finish("cancelled")
         store.update(
             status="cancelled",
             phase="complete",
-            current_sha256=current_sha,
-            restored=restored,
-            restored_to_checkpoint=restored_checkpoint,
+            restored=False,
             error=str(exc),
             timings=timing_summary,
         )
-        store.event("workflow_cancelled", restored=restored)
+        store.event("workflow_cancelled", restored=False)
         raise
     except Exception as exc:
-        restored = False
         if target_changed and not keep_failed:
             atomic_write_text(target, preflight_source)
-            restored = True
-        current_sha = sha256_text(target.read_text(encoding="utf-8"))
-        restored_checkpoint = None
-        if (
-            restored
-            and resume_safe_state is not None
-            and current_sha == resume_safe_state[2]
-        ):
-            restored_checkpoint = resume_safe_state[3]
         timing_summary = timings.finish("failed")
         store.update(
             status="failed",
             phase="complete",
-            current_sha256=current_sha,
-            restored=restored,
-            restored_to_checkpoint=restored_checkpoint,
+            restored=False,
             error=f"{type(exc).__name__}: {exc}",
             timings=timing_summary,
         )
-        store.event(
-            "workflow_crashed",
-            error=f"{type(exc).__name__}: {exc}",
-            restored=restored,
-        )
+        store.event("workflow_crashed", error=f"{type(exc).__name__}: {exc}")
         raise
     check_name = "resume-check.json" if resuming else "initial-check.json"
     retrieval_name = "resume-retrieval.json" if resuming else "initial-retrieval.json"
     atomic_write_json(store.paths.root / check_name, _check_to_json(initial_check))
     atomic_write_json(store.paths.root / retrieval_name, initial_retrieval)
-    preflight_current_sha = sha256_text(target.read_text(encoding="utf-8"))
-    store.update(
-        initial_check=_check_to_json(initial_check),
-        current_sha256=preflight_current_sha,
-    )
+    store.update(initial_check=_check_to_json(initial_check))
 
     formal_goal: dict[str, Any] | None = None
     formal_goal_created = False
@@ -978,9 +1031,6 @@ def run_structured_workflow(
         safe_check = initial_check
         safe_sha = original_sha
         safe_checkpoint = None
-    working_sha = preflight_current_sha if initial_check.ok else safe_sha
-    terminal_broad_source: str | None = None
-    terminal_broad_sha: str | None = None
 
     try:
         previous_manifest = store.read()
@@ -1031,7 +1081,7 @@ def run_structured_workflow(
             plan_prompt = build_plan_prompt(
                 relative_file=relative.as_posix(),
                 task=task,
-                source=target.read_text(encoding="utf-8"),
+                source=safe_source,
                 diagnostics=initial_check.output,
                 retrieval=retrieval_prompt_block(planning_retrieval),
                 formal_goal=_formal_goal_prompt_block(formal_goal),
@@ -1137,8 +1187,6 @@ def run_structured_workflow(
             step_row = step_rows[step_index - 1]
             if step_row.get("status") == "succeeded":
                 continue
-            if attempt >= max_attempts:
-                break
             step_row["status"] = "running"
             store.update(
                 phase="prove",
@@ -1163,8 +1211,18 @@ def run_structured_workflow(
             if step_row.get("rejected_checkpoint") and isinstance(prior_global_review, dict):
                 last_review = prior_global_review
             elif prior_attempts:
-                review_path = store.paths.reviews / f"{int(prior_attempts[-1]):03d}.json"
-                last_review = read_json(review_path) if review_path.is_file() else last_review
+                prior_attempt = int(prior_attempts[-1])
+                review_path = store.paths.reviews / f"{prior_attempt:03d}.json"
+                if review_path.is_file():
+                    last_review = read_json(review_path)
+                elif (
+                    attempt_rows
+                    and int(attempt_rows[-1].get("attempt") or 0) == prior_attempt
+                    and attempt_rows[-1].get("failure_stage")
+                    == "prover_output_protocol"
+                    and isinstance(previous_manifest.get("final_review"), dict)
+                ):
+                    last_review = dict(previous_manifest["final_review"])
             else:
                 last_review = {
                     "verdict": "retry",
@@ -1187,10 +1245,142 @@ def run_structured_workflow(
                     for name in completed_or_active.get("required_declarations", [])
                 )
             )
+            working_source = target.read_text(encoding="utf-8")
+            working_base_attempt: int | None = None
+            archived_base_attempt: int | None = None
+            for prior_attempt in reversed(prior_attempts):
+                prior_attempt_number = int(prior_attempt)
+                prior_attempt_row = next(
+                    (
+                        row
+                        for row in attempt_rows
+                        if int(row.get("attempt") or 0) == prior_attempt_number
+                    ),
+                    None,
+                )
+                if prior_attempt_row is None:
+                    raise ValueError(
+                        "Resume attempt is missing from the workflow manifest: "
+                        f"{prior_attempt_number}"
+                    )
+                if prior_attempt_row.get("candidate_sha256"):
+                    archived_base_attempt = prior_attempt_number
+                    break
+            if archived_base_attempt is not None:
+                working_source, working_source_sha = _archived_candidate_source(
+                    store, attempt_rows, archived_base_attempt
+                )
+                last_check = _archived_candidate_check(store, archived_base_attempt)
+                working_base_attempt = archived_base_attempt
+                store.event(
+                    "working_candidate_restored",
+                    step_index=step_index,
+                    step_id=active_step["id"],
+                    attempt=archived_base_attempt,
+                    candidate_sha256=working_source_sha,
+                )
+
+            accepted_row = _accepted_attempt_row(attempt_rows, prior_attempts)
+            if accepted_row is not None:
+                accepted_attempt = int(accepted_row["attempt"])
+                recovered_candidate, recovered_sha = _archived_candidate_source(
+                    store, attempt_rows, accepted_attempt
+                )
+                recovered_review_path = store.paths.reviews / f"{accepted_attempt:03d}.json"
+                recovered_retrieval_path = (
+                    store.paths.attempt_dir(accepted_attempt) / "retrieval.json"
+                )
+                recovered_review = read_json(recovered_review_path)
+                recovered_retrieval = read_json(recovered_retrieval_path)
+                recovered_audit = audit_source(
+                    original_source,
+                    recovered_candidate,
+                    protect_existing_statements=protect_existing_statements,
+                    protected_declarations=protected_declarations,
+                    required_declaration=step_required_declaration,
+                    required_declaration_names=step_required_names,
+                )
+                recovered_import_validation = validate_mathlib_imports(
+                    project, recovered_candidate
+                )
+                recovered_check: LeanCheck | None = None
+                if recovered_audit["ok"] and recovered_import_validation["ok"]:
+                    rollback_source = target.read_text(encoding="utf-8")
+                    atomic_write_text(target, recovered_candidate)
+                    transaction_touched = True
+                    try:
+                        with timings.measure("accepted_attempt_recovery", accepted_attempt):
+                            recovered_check = lean_checker(
+                                project,
+                                target,
+                                lean_timeout_seconds,
+                                lake_executable,
+                            )
+                    finally:
+                        atomic_write_text(target, rollback_source)
+                if recovered_check is not None and recovered_check.ok:
+                    checkpoint_dir = _persist_step_checkpoint(
+                        store=store,
+                        step_index=step_index,
+                        active_step=active_step,
+                        attempt=accepted_attempt,
+                        candidate=recovered_candidate,
+                        candidate_sha=recovered_sha,
+                        check=recovered_check,
+                        review=recovered_review,
+                        retrieval=recovered_retrieval,
+                    )
+                    atomic_write_text(target, recovered_candidate)
+                    target_changed = True
+                    step_row["status"] = "succeeded"
+                    step_row["checkpoint"] = str(checkpoint_dir)
+                    step_row["budget_exhausted"] = None
+                    safe_source = recovered_candidate
+                    safe_check = recovered_check
+                    safe_sha = recovered_sha
+                    safe_checkpoint = str(checkpoint_dir)
+                    store.update(
+                        steps=step_rows,
+                        current_sha256=recovered_sha,
+                        final_review=recovered_review,
+                    )
+                    store.event(
+                        "accepted_attempt_recovered",
+                        step_index=step_index,
+                        step_id=active_step["id"],
+                        attempt=accepted_attempt,
+                        checkpoint=str(checkpoint_dir),
+                    )
+                    store.event(
+                        "plan_step_succeeded",
+                        step_index=step_index,
+                        step_id=active_step["id"],
+                        attempt=accepted_attempt,
+                        checkpoint=str(checkpoint_dir),
+                        recovered=True,
+                    )
+                    continue
+                recovery_failure = (
+                    recovered_check.output
+                    if recovered_check is not None
+                    else "Source audit or import validation failed."
+                )
+                if recovered_check is not None:
+                    last_check = recovered_check
+                store.event(
+                    "accepted_attempt_recovery_failed",
+                    step_index=step_index,
+                    step_id=active_step["id"],
+                    attempt=accepted_attempt,
+                    source_audit_ok=recovered_audit["ok"],
+                    import_validation_ok=recovered_import_validation["ok"],
+                    diagnostics=recovery_failure,
+                )
 
             while attempt < max_attempts and step_attempt < max_attempts_per_step:
                 candidate_attempt = attempt + 1
                 candidate_step_attempt = step_attempt + 1
+                candidate_base_attempt = working_base_attempt
                 store.event(
                     "phase_started",
                     phase="prove",
@@ -1212,7 +1402,7 @@ def run_structured_workflow(
                 for term in last_review.get("search_terms", []):
                     if term not in requested_terms:
                         requested_terms.append(term)
-                for term in source_search_terms(target.read_text(encoding="utf-8"), task):
+                for term in source_search_terms(working_source, task):
                     if term not in requested_terms:
                         requested_terms.append(term)
                 with timings.measure("attempt_retrieval", candidate_attempt):
@@ -1223,7 +1413,6 @@ def run_structured_workflow(
                         process_control=process_control,
                     )
 
-                current_source = target.read_text(encoding="utf-8")
                 completed_steps = [
                     {"id": row["id"], "goal": row["goal"], "checkpoint": row["checkpoint"]}
                     for row in step_rows
@@ -1237,7 +1426,7 @@ def run_structured_workflow(
                 prover_prompt = build_user_prompt(
                     relative_file=relative.as_posix(),
                     task=task,
-                    source=current_source,
+                    source=working_source,
                     diagnostics=last_check.output,
                     attempt=candidate_attempt,
                     plan=json.dumps(plan, ensure_ascii=False, indent=2),
@@ -1266,6 +1455,7 @@ def run_structured_workflow(
                             context={
                                 "step_index": step_index,
                                 "step_attempt": candidate_step_attempt,
+                                "base_attempt": candidate_base_attempt,
                                 "target_file": relative.as_posix(),
                             },
                         )
@@ -1275,6 +1465,85 @@ def run_structured_workflow(
                 except ApiError as exc:
                     prover_error = exc
                 if prover_error is not None:
+                    if _recoverable_codex_prover_output_failure(prover_error):
+                        consecutive_prover_api_failures = 0
+                        attempt = candidate_attempt
+                        step_attempt = candidate_step_attempt
+                        attempt_dir = store.paths.attempt_dir(attempt)
+                        attempt_dir.mkdir(parents=True, exist_ok=False)
+                        atomic_write_json(attempt_dir / "retrieval.json", retrieval)
+                        protocol_failure = {
+                            "attempt": attempt,
+                            "step_index": step_index,
+                            "step_id": active_step["id"],
+                            "step_attempt": step_attempt,
+                            "stage": "prover_output_protocol",
+                            "error_kind": getattr(prover_error, "kind", None),
+                            "error": str(prover_error),
+                            "process_exit_code": getattr(
+                                prover_error, "metadata", {}
+                            ).get("exit_code"),
+                        }
+                        atomic_write_json(
+                            attempt_dir / "protocol-failure.json", protocol_failure
+                        )
+                        attempt_row = {
+                            "attempt": attempt,
+                            "step_index": step_index,
+                            "step_id": active_step["id"],
+                            "step_attempt": step_attempt,
+                            "candidate_sha256": None,
+                            "check_ok": False,
+                            "returncode": None,
+                            "review_verdict": "not_run",
+                            "prover_error": str(prover_error),
+                            "failure_stage": "prover_output_protocol",
+                            "error_kind": getattr(prover_error, "kind", None),
+                            "artifacts": {
+                                "retrieval": str(attempt_dir / "retrieval.json"),
+                                "protocol_failure": str(
+                                    attempt_dir / "protocol-failure.json"
+                                ),
+                            },
+                        }
+                        attempt_rows.append(attempt_row)
+                        step_row["attempts"].append(attempt)
+                        last_review = {
+                            "verdict": "retry",
+                            "summary": (
+                                "The Prover process completed, but its output did not "
+                                "contain one unique result matching the Lean-file contract."
+                            ),
+                            "failure_analysis": [str(prover_error)],
+                            "next_actions": [
+                                "Return exactly one complete Lean file using the required output contract."
+                            ],
+                            "search_terms": [],
+                        }
+                        store.update(
+                            attempts=attempt_rows,
+                            steps=step_rows,
+                            final_review=last_review,
+                            phase="prove",
+                        )
+                        store.event(
+                            "prover_output_rejected",
+                            attempt=attempt,
+                            step_index=step_index,
+                            step_id=active_step["id"],
+                            step_attempt=step_attempt,
+                            error_kind=getattr(prover_error, "kind", None),
+                        )
+                        store.event(
+                            "phase_completed",
+                            phase="prove",
+                            attempt=attempt,
+                            step_index=step_index,
+                            step_id=active_step["id"],
+                            check_ok=False,
+                            failure_stage="prover_output_protocol",
+                        )
+                        continue
                     consecutive_prover_api_failures += 1
                     failure_root = store.paths.root / "api-failures"
                     failure_root.mkdir(parents=True, exist_ok=True)
@@ -1332,8 +1601,6 @@ def run_structured_workflow(
                 candidate, deterministic_import_repair = repair_invalid_mathlib_imports(
                     project, candidate
                 )
-                if effective_import_policy in {"proof-first", "broad"}:
-                    candidate = ensure_broad_mathlib_import(candidate)
                 # Search names introduced by the candidate before making an
                 # import decision. Under proof-first, broad Mathlib is checked
                 # first and minimized only after the proof already passes.
@@ -1380,6 +1647,7 @@ def run_structured_workflow(
                 if phase_callback is not None:
                     phase_callback("lean_checking", attempt)
                 candidate_import_validation = validate_mathlib_imports(project, candidate)
+                rollback_source = target.read_text(encoding="utf-8")
                 if prover_error is not None:
                     last_check = LeanCheck(
                         False,
@@ -1410,7 +1678,56 @@ def run_structured_workflow(
                                 project, target, lean_timeout_seconds, lake_executable
                             )
                     finally:
-                        atomic_write_text(target, current_source)
+                        atomic_write_text(target, rollback_source)
+
+                if (
+                    last_check.ok
+                    and has_broad_import(candidate)
+                    and effective_import_policy == "proof-first"
+                ):
+                    optimized_candidate, precise_metadata = optimize_broad_imports(
+                        candidate, candidate_retrieval
+                    )
+                    candidate_import_optimization["precise_probe"] = precise_metadata
+                    if precise_metadata.get("changed"):
+                        optimized_audit = audit_source(
+                            original_source,
+                            optimized_candidate,
+                            protect_existing_statements=protect_existing_statements,
+                            protected_declarations=protected_declarations,
+                            required_declaration=step_required_declaration,
+                            required_declaration_names=step_required_names,
+                        )
+                        optimized_validation = validate_mathlib_imports(
+                            project, optimized_candidate
+                        )
+                        if optimized_audit["ok"] and optimized_validation["ok"]:
+                            atomic_write_text(target, optimized_candidate)
+                            try:
+                                with timings.measure("precise_import_lean_check", attempt):
+                                    precise_check = lean_checker(
+                                        project, target, lean_timeout_seconds, lake_executable
+                                    )
+                            finally:
+                                atomic_write_text(target, rollback_source)
+                            precise_metadata["probe_ok"] = precise_check.ok
+                            precise_metadata["probe_returncode"] = precise_check.returncode
+                            precise_metadata["diagnostics"] = precise_check.output
+                            if precise_check.ok:
+                                candidate = optimized_candidate
+                                source_audit = optimized_audit
+                                candidate_import_validation = optimized_validation
+                                last_check = precise_check
+                                candidate_import_optimization["changed"] = True
+                                candidate_import_optimization["reason"] = (
+                                    "proof_passed_then_precise_imports_passed"
+                                )
+                        else:
+                            precise_metadata["probe_skipped"] = (
+                                "source_audit_failed"
+                                if not optimized_audit["ok"]
+                                else "import_validation_failed"
+                            )
 
                 candidate_sha = sha256_text(candidate)
                 atomic_write_text(attempt_dir / "candidate.lean", candidate)
@@ -1488,6 +1805,7 @@ def run_structured_workflow(
                 atomic_write_json(review_path, last_review)
                 attempt_row = {
                     "attempt": attempt,
+                    "base_attempt": candidate_base_attempt,
                     "step_index": step_index,
                     "step_id": active_step["id"],
                     "step_attempt": step_attempt,
@@ -1521,34 +1839,25 @@ def run_structured_workflow(
                 )
 
                 if last_check.ok and last_review["verdict"] == "accept":
+                    checkpoint_dir = _persist_step_checkpoint(
+                        store=store,
+                        step_index=step_index,
+                        active_step=active_step,
+                        attempt=attempt,
+                        candidate=candidate,
+                        candidate_sha=candidate_sha,
+                        check=last_check,
+                        review=last_review,
+                        retrieval=retrieval,
+                    )
                     atomic_write_text(target, candidate)
                     target_changed = True
-                    checkpoint_dir = store.paths.checkpoint_dir(
-                        step_index, active_step["id"]
-                    )
-                    checkpoint_dir.mkdir(parents=True, exist_ok=False)
-                    atomic_write_text(checkpoint_dir / "source.lean", candidate)
-                    atomic_write_json(
-                        checkpoint_dir / "check.json", _check_to_json(last_check)
-                    )
-                    atomic_write_json(checkpoint_dir / "review.json", last_review)
-                    atomic_write_json(checkpoint_dir / "retrieval.json", retrieval)
-                    checkpoint_meta = {
-                        "step_index": step_index,
-                        "step_id": active_step["id"],
-                        "goal": active_step["goal"],
-                        "success_criteria": active_step["success_criteria"],
-                        "attempt": attempt,
-                        "candidate_sha256": candidate_sha,
-                    }
-                    atomic_write_json(checkpoint_dir / "checkpoint.json", checkpoint_meta)
                     step_row["status"] = "succeeded"
                     step_row["checkpoint"] = str(checkpoint_dir)
                     safe_source = candidate
                     safe_check = last_check
                     safe_sha = candidate_sha
                     safe_checkpoint = str(checkpoint_dir)
-                    working_sha = candidate_sha
                     step_completed = True
                     store.update(steps=step_rows, current_sha256=candidate_sha)
                     store.event(
@@ -1559,6 +1868,17 @@ def run_structured_workflow(
                         checkpoint=str(checkpoint_dir),
                     )
                     break
+                working_source = candidate
+                working_base_attempt = attempt
+                store.event(
+                    "failed_candidate_kept_as_working_source",
+                    step_index=step_index,
+                    step_id=active_step["id"],
+                    attempt=attempt,
+                    candidate_sha256=candidate_sha,
+                    check_ok=last_check.ok,
+                    review_verdict=last_review["verdict"],
+                )
                 if last_review["verdict"] == "stop":
                     step_row["status"] = "stopped"
                     workflow_stopped = True
@@ -1582,200 +1902,6 @@ def run_structured_workflow(
             row["status"] == "succeeded" for row in step_rows
         )
         if all_steps_succeeded:
-            broad_source = target.read_text(encoding="utf-8")
-            broad_source_sha = sha256_text(broad_source)
-            if broad_source_sha != working_sha:
-                raise OSError(
-                    "Final broad source does not match the latest verified working source"
-                )
-            terminal_broad_source = broad_source
-            terminal_broad_sha = broad_source_sha
-            selected_source = broad_source
-            selected_source_kind = (
-                "broad" if has_broad_import(broad_source) else "precise"
-            )
-            final_import_reduction: dict[str, Any] = {
-                "attempted": effective_import_policy == "proof-first",
-                "changed": False,
-                "effective_import_policy": effective_import_policy,
-                "broad_source_sha256": broad_source_sha,
-                "candidate_source_sha256": None,
-                "selected_source_sha256": broad_source_sha,
-                "retrieval": {
-                    "queries": [],
-                    "import_suggestions": [],
-                },
-                "selected_modules": [],
-                "added_modules": [],
-                "optimization": {},
-                "source_audit": None,
-                "import_validation": None,
-                "lean_probe": {
-                    "ok": None,
-                    "returncode": None,
-                    "diagnostics": "",
-                    "command": [],
-                },
-                "selected_source": selected_source_kind,
-                "fallback_reason": (
-                    None
-                    if effective_import_policy == "proof-first"
-                    else "policy_not_applicable"
-                ),
-            }
-            if effective_import_policy == "proof-first":
-                try:
-                    reduction_terms = _plan_search_terms(plan)
-                    for term in source_search_terms(broad_source, task):
-                        if term not in reduction_terms:
-                            reduction_terms.append(term)
-                    with timings.measure("final_import_reduction_retrieval"):
-                        reduction_retrieval = _safe_retrieval(
-                            project,
-                            diagnostics="",
-                            requested_terms=reduction_terms,
-                            process_control=process_control,
-                        )
-                    retrieval_queries = reduction_retrieval.get("queries", [])
-                    retrieval_suggestions = reduction_retrieval.get(
-                        "import_suggestions", []
-                    )
-                    final_import_reduction["retrieval"] = {
-                        "queries": (
-                            list(retrieval_queries)
-                            if isinstance(retrieval_queries, list)
-                            else []
-                        ),
-                        "import_suggestions": (
-                            list(retrieval_suggestions)
-                            if isinstance(retrieval_suggestions, list)
-                            else []
-                        ),
-                    }
-                    reduction_candidate, reduction_optimization = (
-                        optimize_broad_imports(broad_source, reduction_retrieval)
-                    )
-                    final_import_reduction["optimization"] = reduction_optimization
-                    final_import_reduction["selected_modules"] = list(
-                        reduction_optimization.get("selected_modules") or []
-                    )
-                    final_import_reduction["added_modules"] = list(
-                        reduction_optimization.get("added_modules") or []
-                    )
-                    if not reduction_optimization.get("changed"):
-                        final_import_reduction["fallback_reason"] = str(
-                            reduction_optimization.get("reason") or "no_candidate"
-                        )
-                    else:
-                        reduction_candidate_sha = sha256_text(reduction_candidate)
-                        final_import_reduction[
-                            "candidate_source_sha256"
-                        ] = reduction_candidate_sha
-                        reduction_source_audit = audit_source(
-                            original_source,
-                            reduction_candidate,
-                            final=True,
-                            protect_existing_statements=protect_existing_statements,
-                            protected_declarations=protected_declarations,
-                            required_declaration=required_formal_declaration,
-                            required_declaration_names=list(
-                                dict.fromkeys(
-                                    name
-                                    for step in plan["steps"]
-                                    for name in step.get("required_declarations", [])
-                                )
-                            ),
-                        )
-                        final_import_reduction["source_audit"] = reduction_source_audit
-                        if not reduction_source_audit["ok"]:
-                            final_import_reduction[
-                                "fallback_reason"
-                            ] = "source_audit_failed"
-                        else:
-                            reduction_import_validation = validate_mathlib_imports(
-                                project, reduction_candidate
-                            )
-                            final_import_reduction[
-                                "import_validation"
-                            ] = reduction_import_validation
-                            if not reduction_import_validation["ok"]:
-                                final_import_reduction[
-                                    "fallback_reason"
-                                ] = "import_validation_failed"
-                            else:
-                                atomic_write_text(target, reduction_candidate)
-                                transaction_touched = True
-                                try:
-                                    with timings.measure(
-                                        "final_import_reduction_lean_check"
-                                    ):
-                                        reduction_check = lean_checker(
-                                            project,
-                                            target,
-                                            lean_timeout_seconds,
-                                            lake_executable,
-                                        )
-                                finally:
-                                    _restore_final_broad_source(
-                                        target, broad_source, broad_source_sha
-                                    )
-                                final_import_reduction["lean_probe"] = {
-                                    "ok": reduction_check.ok,
-                                    "returncode": reduction_check.returncode,
-                                    "diagnostics": reduction_check.output,
-                                    "command": list(reduction_check.command),
-                                }
-                                if reduction_check.ok:
-                                    selected_source = reduction_candidate
-                                    final_import_reduction["changed"] = True
-                                    final_import_reduction[
-                                        "selected_source_sha256"
-                                    ] = reduction_candidate_sha
-                                    final_import_reduction[
-                                        "selected_source"
-                                    ] = "precise"
-                                    final_import_reduction["fallback_reason"] = None
-                                else:
-                                    final_import_reduction[
-                                        "fallback_reason"
-                                    ] = "lean_probe_failed"
-                except ProcessCancelled:
-                    _restore_final_broad_source(
-                        target, broad_source, broad_source_sha
-                    )
-                    final_import_reduction["changed"] = False
-                    final_import_reduction[
-                        "selected_source_sha256"
-                    ] = broad_source_sha
-                    final_import_reduction["selected_source"] = "broad"
-                    final_import_reduction["fallback_reason"] = "cancelled"
-                    _write_final_import_reduction(store, final_import_reduction)
-                    raise
-                except _FinalImportReductionRestoreError:
-                    raise
-                except Exception:
-                    _restore_final_broad_source(
-                        target, broad_source, broad_source_sha
-                    )
-                    selected_source = broad_source
-                    final_import_reduction["changed"] = False
-                    final_import_reduction[
-                        "selected_source_sha256"
-                    ] = broad_source_sha
-                    final_import_reduction["selected_source"] = "broad"
-                    final_import_reduction[
-                        "fallback_reason"
-                    ] = "reduction_exception"
-
-            atomic_write_text(target, selected_source)
-            target_changed = target_changed or selected_source != broad_source
-            try:
-                _write_final_import_reduction(store, final_import_reduction)
-            except Exception:
-                _restore_final_broad_source(
-                    target, broad_source, broad_source_sha
-                )
-                raise
             store.update(phase="audit", current_step=None)
             store.event("phase_started", phase="global_audit")
             if phase_callback is not None:
@@ -1886,7 +2012,7 @@ def run_structured_workflow(
                     status="succeeded",
                     phase="complete",
                     current_step=None,
-                    current_sha256=final_audit["source_sha256"],
+                    current_sha256=safe_sha,
                     completed_attempt=attempt,
                     timings=timing_summary,
                 )
@@ -1933,15 +2059,82 @@ def run_structured_workflow(
             )
             current_sha = safe_sha
         else:
-            if attempt_rows:
-                failed_candidate = store.paths.attempt_dir(
-                    int(attempt_rows[-1]["attempt"])
-                ) / "candidate.lean"
-                if failed_candidate.is_file():
-                    atomic_write_text(
-                        target, failed_candidate.read_text(encoding="utf-8")
-                    )
+            failed_candidate_attempt = next(
+                (
+                    int(row.get("attempt") or 0)
+                    for row in reversed(attempt_rows)
+                    if row.get("candidate_sha256")
+                ),
+                None,
+            )
+            if failed_candidate_attempt is not None:
+                failed_candidate, _ = _archived_candidate_source(
+                    store, attempt_rows, failed_candidate_attempt
+                )
+                atomic_write_text(target, failed_candidate)
             current_sha = sha256_text(target.read_text(encoding="utf-8"))
+        failed_step_indexes = {
+            int(row["index"])
+            for row in step_rows
+            if row.get("status") in {"failed", "stopped"}
+        }
+        failure_attempt_rows = [
+            row
+            for row in attempt_rows
+            if int(row.get("step_index") or 0) in failed_step_indexes
+        ]
+        has_protocol_failure = any(
+            row.get("failure_stage") == "prover_output_protocol"
+            for row in failure_attempt_rows
+        )
+        has_lean_validation_failure = any(
+            row.get("candidate_sha256") and row.get("check_ok") is False
+            for row in failure_attempt_rows
+        )
+        has_reviewer_rejection = any(
+            row.get("candidate_sha256")
+            and row.get("check_ok") is True
+            and row.get("review_verdict") != "accept"
+            for row in failure_attempt_rows
+        )
+        if all_steps_succeeded:
+            failure_error = "Global final audit did not accept the complete proof."
+        elif failure_attempt_rows and all(
+            row.get("failure_stage") == "prover_output_protocol"
+            and not row.get("candidate_sha256")
+            for row in failure_attempt_rows
+        ):
+            failure_error = (
+                "Prover output did not produce a valid Lean candidate within the "
+                "configured candidate budgets."
+            )
+        elif (
+            has_protocol_failure
+            and has_lean_validation_failure
+            and has_reviewer_rejection
+        ):
+            failure_error = (
+                "Candidate budgets were exhausted after Lean candidate validation "
+                "failures, Reviewer rejection of Lean-valid candidates, and Prover "
+                "output protocol failures."
+            )
+        elif has_protocol_failure and has_lean_validation_failure:
+            failure_error = (
+                "Candidate budgets were exhausted after both Lean candidate validation "
+                "failures and Prover output protocol failures."
+            )
+        elif has_protocol_failure and has_reviewer_rejection:
+            failure_error = (
+                "Candidate budgets were exhausted after both Reviewer rejection of "
+                "Lean-valid candidates and Prover output protocol failures."
+            )
+        elif has_protocol_failure:
+            failure_error = (
+                "Candidate budgets were exhausted after Prover output protocol failures "
+                "and other recorded attempt failures."
+            )
+        else:
+            failure_error = "Lean did not pass within the configured candidate budgets."
         timing_summary = timings.finish("failed")
         store.update(
             status="failed",
@@ -1949,11 +2142,7 @@ def run_structured_workflow(
             current_sha256=current_sha,
             restored=restored,
             restored_to_checkpoint=safe_checkpoint,
-            error=(
-                "Global final audit did not accept the complete proof."
-                if all_steps_succeeded
-                else "Lean did not pass within the configured candidate budgets."
-            ),
+            error=failure_error,
             timings=timing_summary,
         )
         store.event(
@@ -1971,29 +2160,16 @@ def run_structured_workflow(
             restored,
         )
     except ProcessCancelled as exc:
-        if terminal_broad_source is not None and terminal_broad_sha is not None:
-            _restore_final_broad_source(
-                target, terminal_broad_source, terminal_broad_sha
-            )
-            restored = True
-        elif target_changed and not keep_failed:
+        if target_changed and not keep_failed:
             atomic_write_text(target, safe_source)
-            restored = True
-        else:
-            restored = False
-        current_sha = sha256_text(target.read_text(encoding="utf-8"))
-        restored_checkpoint = (
-            safe_checkpoint
-            if restored and current_sha == safe_sha
-            else None
-        )
+        restored = (target_changed or transaction_touched) and not keep_failed
         timing_summary = timings.finish("cancelled")
         store.update(
             status="cancelled",
             phase="complete",
-            current_sha256=current_sha,
+            current_sha256=sha256_text(target.read_text(encoding="utf-8")),
             restored=restored,
-            restored_to_checkpoint=restored_checkpoint,
+            restored_to_checkpoint=safe_checkpoint,
             error=str(exc),
             timings=timing_summary,
         )
@@ -2002,20 +2178,13 @@ def run_structured_workflow(
     except Exception as exc:
         if target_changed and not keep_failed:
             atomic_write_text(target, safe_source)
-        current_sha = sha256_text(target.read_text(encoding="utf-8"))
-        restored = (target_changed or transaction_touched) and not keep_failed
-        restored_checkpoint = (
-            safe_checkpoint
-            if restored and current_sha == safe_sha
-            else None
-        )
         timing_summary = timings.finish("failed")
         store.update(
             status="failed",
             phase="complete",
-            current_sha256=current_sha,
-            restored=restored,
-            restored_to_checkpoint=restored_checkpoint,
+            current_sha256=sha256_text(target.read_text(encoding="utf-8")),
+            restored=(target_changed or transaction_touched) and not keep_failed,
+            restored_to_checkpoint=safe_checkpoint,
             error=f"{type(exc).__name__}: {exc}",
             timings=timing_summary,
         )

@@ -152,6 +152,7 @@ class DashboardTests(unittest.TestCase):
                     self.assertIn(b'id="taskModel"', page)
                     self.assertIn(b'id="multiProver"', page)
                     self.assertIn(b'id="configProviderSelect"', page)
+                    self.assertIn(b'id="configApiTransport"', page)
                     self.assertIn(b'id="configButton"', page)
                 with urllib.request.urlopen(base + "/assets/dashboard.js", timeout=5) as response:
                     script = response.read()
@@ -211,6 +212,7 @@ class DashboardTests(unittest.TestCase):
                             "api_base": "https://relay.example",
                             "model": "relay-gpt-5.6-sol",
                             "api_mode": "responses",
+                            "api_transport": "python",
                             "reasoning_effort": "medium",
                             "disable_response_storage": True,
                             "lake": "D:/tools/lake.exe",
@@ -224,6 +226,9 @@ class DashboardTests(unittest.TestCase):
                     token,
                 )
                 self.assertTrue(configured["configuration"]["api_key_configured"])
+                self.assertEqual(
+                    configured["configuration"]["api_transport"], "python"
+                )
                 self.assertNotIn("dashboard-secret", json.dumps(configured))
                 deepseek = self._post(
                     base,
@@ -235,6 +240,7 @@ class DashboardTests(unittest.TestCase):
                             "api_base": "https://api.deepseek.com",
                             "model": "deepseek-reasoner",
                             "api_mode": "chat-completions",
+                            "api_transport": "curl",
                             "reasoning_effort": "high",
                             "timeout_seconds": 600,
                             "max_output_tokens": 8192,

@@ -4,7 +4,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from lean_loop.config import ApiConfig
+from lean_loop.config import ApiConfig, ConfigError
 from lean_loop.project_config import (
     load_provider_api_key,
     load_project_api_key,
@@ -18,6 +18,24 @@ from lean_loop.project_config import (
 
 @unittest.skipUnless(os.name == "nt", "Windows DPAPI test")
 class ProjectConfigTests(unittest.TestCase):
+    def test_subscription_config_requires_model_but_not_api_credentials(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory)
+            config = ApiConfig.for_backend(
+                project,
+                "codex-subscription",
+                model="gpt-5.6-sol",
+                reasoning_effort="low",
+            )
+            self.assertEqual(config.mode, "subscription")
+            self.assertEqual(config.api_key, "")
+            self.assertEqual(config.model, "gpt-5.6-sol")
+
+    def test_subscription_config_rejects_missing_explicit_model(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.dict(os.environ, {}, clear=True):
+                with self.assertRaisesRegex(ConfigError, "explicit model"):
+                    ApiConfig.for_backend(Path(directory), "claude-subscription")
     def test_persists_settings_and_dpapi_encrypted_key(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             project = Path(directory)
@@ -28,6 +46,7 @@ class ProjectConfigTests(unittest.TestCase):
                         "api_base": "https://relay.example",
                         "model": "gpt-test-sol",
                         "api_mode": "responses",
+                        "api_transport": "python",
                         "reasoning_effort": "high",
                         "disable_response_storage": True,
                         "lake": "D:/tools/lake.exe",
@@ -50,6 +69,7 @@ class ProjectConfigTests(unittest.TestCase):
                 self.assertEqual(config.api_key, "secret-test-key")
                 self.assertEqual(config.model, "gpt-test-sol")
                 self.assertEqual(config.api_timeout_retries, 2)
+                self.assertEqual(config.api_transport, "python")
                 self.assertTrue(config.stream_responses)
 
     def test_can_clear_persisted_key(self) -> None:
@@ -92,6 +112,7 @@ class ProjectConfigTests(unittest.TestCase):
                         "api_base": "https://api.deepseek.com",
                         "model": "deepseek-reasoner",
                         "api_mode": "chat-completions",
+                        "api_transport": "curl",
                         "reasoning_effort": "high",
                     },
                     api_key="deepseek-key",
@@ -104,6 +125,7 @@ class ProjectConfigTests(unittest.TestCase):
                 )
                 config = ApiConfig.from_environment(project, "deepseek")
                 self.assertEqual(config.provider_kind, "deepseek")
+                self.assertEqual(config.api_transport, "curl")
                 self.assertEqual(config.api_key, "deepseek-key")
                 self.assertEqual(config.endpoint, "https://api.deepseek.com/chat/completions")
                 secret_text = (
@@ -111,6 +133,21 @@ class ProjectConfigTests(unittest.TestCase):
                 ).read_text(encoding="utf-8")
                 self.assertNotIn("gpt-key", secret_text)
                 self.assertNotIn("deepseek-key", secret_text)
+
+    def test_rejects_unknown_api_transport(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(ConfigError, "API_TRANSPORT"):
+                with patch.dict(
+                    os.environ,
+                    {
+                        "LEAN_AGENT_API_BASE": "https://relay.example",
+                        "LEAN_AGENT_API_KEY": "key",
+                        "LEAN_AGENT_MODEL": "model",
+                        "LEAN_AGENT_API_TRANSPORT": "unknown",
+                    },
+                    clear=True,
+                ):
+                    ApiConfig.from_environment(Path(directory))
 
 
 if __name__ == "__main__":

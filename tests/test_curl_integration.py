@@ -55,6 +55,7 @@ class CurlIntegrationTests(unittest.TestCase):
                 mode="responses",
                 timeout_seconds=10,
                 curl_executable="curl.exe",
+                api_transport="curl",
                 reasoning_effort="xhigh",
             )
             with tempfile.TemporaryDirectory() as directory:
@@ -133,6 +134,7 @@ class CurlIntegrationTests(unittest.TestCase):
                 mode="responses",
                 timeout_seconds=10,
                 curl_executable="curl.exe",
+                api_transport="curl",
                 reasoning_effort="high",
             )
             with tempfile.TemporaryDirectory() as directory:
@@ -190,6 +192,7 @@ class CurlIntegrationTests(unittest.TestCase):
                 mode="responses",
                 timeout_seconds=1,
                 curl_executable="curl.exe",
+                api_transport="curl",
                 reasoning_effort="high",
                 api_timeout_retries=1,
             )
@@ -246,6 +249,7 @@ class CurlIntegrationTests(unittest.TestCase):
                 mode="chat-completions",
                 timeout_seconds=10,
                 curl_executable="curl.exe",
+                api_transport="curl",
                 reasoning_effort="high",
                 api_timeout_retries=1,
             )
@@ -311,6 +315,7 @@ class CurlIntegrationTests(unittest.TestCase):
                 mode="responses",
                 timeout_seconds=10,
                 curl_executable="curl.exe",
+                api_transport="curl",
                 reasoning_effort="high",
                 empty_response_retries=1,
             )
@@ -365,6 +370,7 @@ class CurlIntegrationTests(unittest.TestCase):
                 mode="responses",
                 timeout_seconds=10,
                 curl_executable="curl.exe",
+                api_transport="curl",
                 reasoning_effort="high",
                 empty_response_retries=1,
             )
