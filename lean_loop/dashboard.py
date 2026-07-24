@@ -62,6 +62,7 @@ def _default_queue_settings(project: Path) -> dict[str, Any]:
         "provider": "default",
         "max_attempts": 3,
         "max_attempts_per_step": 3,
+        "planning_mode": "planner",
         "lean_timeout": 120,
         "api_timeout": int(configured.get("timeout_seconds") or 180),
         "api_retries": int(configured.get("api_timeout_retries") or 0),
@@ -110,6 +111,7 @@ def _queue_settings(value: object, project: Path) -> dict[str, Any]:
     for key in (
         "agent_backend", "model", "provider", "review_model", "lake", "explain_language", "explain_model",
         "import_policy",
+        "planning_mode",
     ):
         settings[key] = str(settings[key]).strip()
     if settings["agent_backend"] not in {
@@ -118,6 +120,10 @@ def _queue_settings(value: object, project: Path) -> dict[str, Any]:
         raise ValueError(f"Unsupported agent_backend: {settings['agent_backend']}")
     if settings["import_policy"] not in {"auto", "proof-first", "precise", "broad"}:
         raise ValueError(f"Unsupported import_policy: {settings['import_policy']}")
+    if settings["planning_mode"] not in {
+        "planner", "direct", "direct-then-planner"
+    }:
+        raise ValueError(f"Unsupported planning_mode: {settings['planning_mode']}")
     protected = settings.get("protected_declarations", [])
     if not isinstance(protected, list):
         raise ValueError("protected_declarations must be an array")

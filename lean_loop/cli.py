@@ -146,6 +146,11 @@ def _parser() -> argparse.ArgumentParser:
     )
     workflow_run.add_argument("--max-attempts", type=int, default=3)
     workflow_run.add_argument("--max-attempts-per-step", type=int, default=3)
+    workflow_run.add_argument(
+        "--planning-mode",
+        choices=("planner", "direct", "direct-then-planner"),
+        default="planner",
+    )
     workflow_run.add_argument("--lean-timeout", type=int, default=120)
     workflow_run.add_argument(
         "--formalize-goal", action=argparse.BooleanOptionalAction, default=True
@@ -223,6 +228,11 @@ def _parser() -> argparse.ArgumentParser:
     workflow_resume.add_argument("--agent-backend", choices=AGENT_BACKEND_CHOICES, default=None)
     workflow_resume.add_argument("--max-attempts", type=int, default=None)
     workflow_resume.add_argument("--max-attempts-per-step", type=int, default=None)
+    workflow_resume.add_argument(
+        "--planning-mode",
+        choices=("planner", "direct", "direct-then-planner"),
+        default=None,
+    )
     workflow_resume.add_argument("--api-timeout", type=int, default=None)
     workflow_resume.add_argument("--api-retries", type=int, default=None)
     workflow_resume.add_argument("--model", default="")
@@ -257,6 +267,11 @@ def _parser() -> argparse.ArgumentParser:
     queue_add.add_argument("--depends-on", action="append", default=[])
     queue_add.add_argument("--max-attempts", type=int, default=3)
     queue_add.add_argument("--max-attempts-per-step", type=int, default=3)
+    queue_add.add_argument(
+        "--planning-mode",
+        choices=("planner", "direct", "direct-then-planner"),
+        default="planner",
+    )
     queue_add.add_argument("--lean-timeout", type=int, default=120)
     queue_add.add_argument(
         "--formalize-goal", action=argparse.BooleanOptionalAction, default=True
@@ -456,6 +471,7 @@ def _queue_settings(args: argparse.Namespace) -> dict[str, object]:
         "model": args.model,
         "max_attempts": args.max_attempts,
         "max_attempts_per_step": args.max_attempts_per_step,
+        "planning_mode": args.planning_mode,
         "lean_timeout": args.lean_timeout,
         "api_timeout": args.api_timeout,
         "api_retries": args.api_retries,
@@ -855,6 +871,10 @@ def main(argv: list[str] | None = None) -> None:
                     args.import_policy
                     or str(settings.get("import_policy") or "auto")
                 ),
+                planning_mode=(
+                    args.planning_mode
+                    or str(settings.get("planning_mode") or "planner")
+                ),
                 protect_existing_statements=bool(
                     settings.get("protect_existing_statements", True)
                 ),
@@ -913,6 +933,7 @@ def main(argv: list[str] | None = None) -> None:
                 keep_failed=args.keep_failed,
                 formalize_goal=args.formalize_goal,
                 import_policy=args.import_policy,
+                planning_mode=args.planning_mode,
                 protected_declarations=list(args.protect_declaration),
                 agent_backend_id=args.agent_backend,
             )

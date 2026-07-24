@@ -310,6 +310,7 @@ function renderOverview(task, workflow, race) {
     ${kv("Lean 检查", attempt?.check?.ok == null ? "-" : attempt.check.ok ? "passed" : "failed")}${kv("流式状态", task?.activity_text || "-")}
     ${kv("活动进程", task?.active_pid ? `${task.active_kind} / PID ${task.active_pid}` : "Idle")}${kv("自然语言证明", manifest.explanation_status || "not requested")}
     ${kv("目标形式化", manifest.formal_goal?.validated == null ? "not used" : manifest.formal_goal.validated ? "validated" : "invalid")}${kv("Import 策略", manifest.settings?.effective_import_policy || task?.settings?.import_policy || "auto")}
+    ${kv("证明规划", manifest.settings?.planning_mode || task?.settings?.planning_mode || "planner")}${kv("Direct 回退", manifest.direct_fallback?.triggered ? `after ${manifest.direct_fallback.failed_attempts} failures` : "-")}
   </div></section>
   ${manifest.error || task?.error ? `<section class="section"><h3>错误</h3><div class="notice">${escapeHtml(manifest.error || task.error)}</div></section>` : ""}
   <section class="section"><h3>结果</h3><div class="kv-grid">
@@ -414,6 +415,7 @@ async function addTask(event) {
         api_timeout: apiTimeout ? Number(apiTimeout) : null,
         api_retries: Number($("apiRetries").value),
         import_policy: $("importPolicy").value,
+        planning_mode: $("planningMode").value,
         plan_effort: $("planEffort").value, prove_effort: $("proveEffort").value,
         review_effort: $("reviewEffort").value, explain: $("explainProof").checked,
         protect_existing_statements: $("protectExistingStatements").checked,

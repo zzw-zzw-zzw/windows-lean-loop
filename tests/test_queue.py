@@ -53,6 +53,7 @@ class QueueStoreTests(unittest.TestCase):
                 captured["plan"] = kwargs["plan_config"].model
                 captured["prove"] = kwargs["prove_config"].model
                 captured["review"] = kwargs["review_config"].model
+                captured["planning_mode"] = kwargs["planning_mode"]
                 kwargs["workflow_created_callback"]("20260714T000000000000Z")
                 kwargs["phase_callback"]("proving", 1)
                 kwargs["phase_callback"]("lean_checking", 1)
@@ -89,6 +90,7 @@ class QueueStoreTests(unittest.TestCase):
                     "plan": "relay-gpt-5.6",
                     "prove": "relay-gpt-5.6",
                     "review": "relay-gpt-5.6",
+                    "planning_mode": "planner",
                 },
             )
             self.assertEqual(store.get_task(task["id"])["state"], "succeeded")

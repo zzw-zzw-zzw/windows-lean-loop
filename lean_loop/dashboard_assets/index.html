@@ -112,6 +112,7 @@
           <label class="field"><span>API 超时（秒）</span><input id="apiTimeout" type="number" min="1" placeholder="使用环境默认值"></label>
           <label class="field"><span>API 超时重试</span><input id="apiRetries" type="number" min="0" max="5" value="1"></label>
           <label class="field"><span>Import 策略</span><select id="importPolicy"><option value="auto" selected>自动</option><option value="proof-first">证明优先，成功后缩小</option><option value="precise">检查前必须精确</option><option value="broad">保留 import Mathlib</option></select></label>
+          <label class="field"><span>证明规划模式</span><select id="planningMode"><option value="planner" selected>Planner（默认）</option><option value="direct-then-planner">Direct 失败 3 次后 Planner</option><option value="direct">仅 Direct Proof</option></select></label>
           <label class="field"><span>Plan 强度</span><select id="planEffort"><option>low</option><option>medium</option><option selected>high</option><option>xhigh</option></select></label>
           <label class="field"><span>Prove 强度</span><select id="proveEffort"><option>low</option><option>medium</option><option selected>high</option><option>xhigh</option></select></label>
           <label class="field"><span>Review 强度</span><select id="reviewEffort"><option>low</option><option selected>medium</option><option>high</option><option>xhigh</option></select></label>

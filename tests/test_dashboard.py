@@ -150,6 +150,7 @@ class DashboardTests(unittest.TestCase):
                     page = response.read()
                     self.assertIn(b"Lean Agent", page)
                     self.assertIn(b'id="taskModel"', page)
+                    self.assertIn(b'id="planningMode"', page)
                     self.assertIn(b'id="multiProver"', page)
                     self.assertIn(b'id="configProviderSelect"', page)
                     self.assertIn(b'id="configApiTransport"', page)
@@ -158,6 +159,7 @@ class DashboardTests(unittest.TestCase):
                     script = response.read()
                     self.assertIn(b"EventSource", script)
                     self.assertIn(b'taskModel', script)
+                    self.assertIn(b'planning_mode', script)
                     self.assertIn(b'first_verified_wins', script)
                     self.assertIn(b'renderRaceLane', script)
                 with urllib.request.urlopen(base + "/api/snapshot", timeout=5) as response:
@@ -273,6 +275,7 @@ class DashboardTests(unittest.TestCase):
                         "settings": {
                             "model": "relay-gpt-5.6",
                             "max_attempts": 2,
+                            "planning_mode": "direct-then-planner",
                             "explain": True,
                         },
                     },
@@ -283,6 +286,23 @@ class DashboardTests(unittest.TestCase):
                 stored_settings = QueueStore(project).get_task(task_id)["settings"]
                 self.assertTrue(stored_settings["explain"])
                 self.assertEqual(stored_settings["model"], "relay-gpt-5.6")
+                self.assertEqual(
+                    stored_settings["planning_mode"], "direct-then-planner"
+                )
+
+                with self.assertRaises(urllib.error.HTTPError) as invalid_mode:
+                    self._post(
+                        base,
+                        "/api/tasks",
+                        {
+                            "target_file": "Main.lean",
+                            "task_text": "prove True",
+                            "settings": {"planning_mode": "automatic"},
+                        },
+                        token,
+                    )
+                self.assertEqual(invalid_mode.exception.code, 400)
+                invalid_mode.exception.close()
 
                 generated = self._post(
                     base,
