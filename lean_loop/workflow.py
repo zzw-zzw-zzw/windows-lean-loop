@@ -15,6 +15,7 @@ from lean_loop.jsonutil import atomic_write_json, atomic_write_text, read_json, 
 from lean_loop.lean import LeanCheck, check_lean
 from lean_loop.mathlib_search import (
     collect_retrieval,
+    ensure_broad_mathlib_import,
     has_broad_import,
     import_validation_diagnostics,
     optimize_broad_imports,
@@ -69,6 +70,10 @@ _FORMAL_DECLARATION_RE = re.compile(
     r"^\s*theorem\s+(?P<name>[A-Za-z_][A-Za-z0-9_'.]*)\b"
 )
 _DECLARATION_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_'.]*$")
+
+
+class _FinalImportReductionRestoreError(OSError):
+    pass
 
 
 def _recoverable_codex_prover_output_failure(error: ApiError) -> bool:
@@ -168,7 +173,30 @@ def _effective_import_policy(import_policy: str, source: str) -> str:
         raise ValueError(f"Unsupported import policy: {import_policy}")
     if import_policy != "auto":
         return import_policy
-    return "proof-first" if needs_goal_formalization(source) else "precise"
+    return "precise"
+
+
+def _historical_effective_import_policy(
+    previous: dict[str, Any], original_source: str
+) -> tuple[str, bool]:
+    old_settings = dict(previous.get("settings") or {})
+    raw_policy = str(old_settings.get("import_policy") or "auto")
+    if raw_policy not in IMPORT_POLICIES:
+        raise ValueError(f"Unsupported historical import policy: {raw_policy}")
+    historical_effective = old_settings.get("effective_import_policy")
+    if historical_effective is not None:
+        effective = str(historical_effective)
+        if effective not in IMPORT_POLICIES - {"auto"}:
+            raise ValueError(
+                f"Unsupported historical effective import policy: {effective}"
+            )
+        return effective, False
+    if raw_policy != "auto":
+        return raw_policy, False
+    legacy_effective = (
+        "proof-first" if needs_goal_formalization(original_source) else "precise"
+    )
+    return legacy_effective, True
 
 
 def _check_to_json(check: LeanCheck) -> dict[str, Any]:
@@ -495,6 +523,9 @@ def _resume_replan_reason(
     current_settings: dict[str, Any],
 ) -> str | None:
     old_settings = dict(previous.get("settings") or {})
+    old_import_policy = str(old_settings.get("import_policy") or "auto")
+    if old_import_policy != str(current_settings.get("import_policy") or "auto"):
+        return "import_policy_changed"
     old_backend = str(old_settings.get("agent_backend") or "direct")
     if old_backend != str(current_settings.get("agent_backend") or "direct"):
         return "backend_changed"
@@ -634,6 +665,51 @@ def _safe_retrieval(
         }
 
 
+def _final_import_reduction_summary(
+    artifact: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        "artifact": "final-import-reduction.json",
+        "attempted": artifact["attempted"],
+        "changed": artifact["changed"],
+        "effective_import_policy": artifact["effective_import_policy"],
+        "broad_source_sha256": artifact["broad_source_sha256"],
+        "candidate_source_sha256": artifact["candidate_source_sha256"],
+        "selected_source_sha256": artifact["selected_source_sha256"],
+        "selected_source": artifact["selected_source"],
+        "fallback_reason": artifact["fallback_reason"],
+    }
+
+
+def _restore_final_broad_source(
+    target: Path,
+    broad_source: str,
+    broad_source_sha256: str,
+) -> None:
+    try:
+        atomic_write_text(target, broad_source)
+    except Exception as exc:
+        raise _FinalImportReductionRestoreError(
+            f"Final import reduction could not restore the broad source: {exc}"
+        ) from exc
+    restored_sha = sha256_text(target.read_text(encoding="utf-8"))
+    if restored_sha != broad_source_sha256:
+        raise _FinalImportReductionRestoreError(
+            "Final import reduction restored a source with the wrong SHA-256"
+        )
+
+
+def _write_final_import_reduction(
+    store: WorkflowStore,
+    artifact: dict[str, Any],
+) -> None:
+    atomic_write_json(store.paths.root / "final-import-reduction.json", artifact)
+    store.update(
+        final_import_reduction=_final_import_reduction_summary(artifact),
+        current_sha256=artifact["selected_source_sha256"],
+    )
+
+
 def run_structured_workflow(
     *,
     project: Path,
@@ -676,8 +752,9 @@ def run_structured_workflow(
     }:
         raise ValueError(f"Unsupported Agent backend: {agent_backend_id}")
     relative = target.relative_to(project)
-    original_for_policy = target.read_text(encoding="utf-8")
-    effective_import_policy = _effective_import_policy(import_policy, original_for_policy)
+    if import_policy not in IMPORT_POLICIES:
+        raise ValueError(f"Unsupported import policy: {import_policy}")
+    effective_import_policy = _effective_import_policy(import_policy, "")
     selected_backend = agent_backend
     backend_identity: dict[str, Any] | None = None
     if agent_backend_id != "direct":
@@ -770,11 +847,33 @@ def run_structured_workflow(
                 "Target file changed after the last verified checkpoint; "
                 "resume refuses to overwrite external edits"
             )
+        old_settings = dict(previous.get("settings") or {})
+        old_import_policy = str(old_settings.get("import_policy") or "auto")
+        legacy_policy_resolved = False
+        if import_policy == old_import_policy:
+            effective_import_policy, legacy_policy_resolved = (
+                _historical_effective_import_policy(previous, original_source)
+            )
+        else:
+            effective_import_policy = _effective_import_policy(
+                import_policy, original_source
+            )
+        settings["effective_import_policy"] = effective_import_policy
         resume_replan_reason = _resume_replan_reason(store, previous, settings)
         store.resume(phase="lean_checking", settings=settings)
+        if legacy_policy_resolved:
+            store.event(
+                "legacy_import_policy_resolved",
+                import_policy=old_import_policy,
+                effective_import_policy=effective_import_policy,
+            )
     else:
         original_source = target.read_text(encoding="utf-8")
         original_sha = sha256_text(original_source)
+        effective_import_policy = _effective_import_policy(
+            import_policy, original_source
+        )
+        settings["effective_import_policy"] = effective_import_policy
         store = WorkflowStore.create(
             project=project,
             target_file=relative.as_posix(),
@@ -826,10 +925,14 @@ def run_structured_workflow(
                     preflight_source, seed_retrieval
                 )
             else:
-                optimized_source = preflight_source
+                optimized_source = ensure_broad_mathlib_import(preflight_source)
                 import_optimization = {
-                    "changed": False,
-                    "reason": "proof_first_policy",
+                    "changed": optimized_source != preflight_source,
+                    "reason": (
+                        "broad_import_added"
+                        if optimized_source != preflight_source
+                        else "broad_import_present"
+                    ),
                     "policy": effective_import_policy,
                 }
         if import_optimization.get("changed"):
@@ -858,6 +961,7 @@ def run_structured_workflow(
         import_optimization["import_validation"] = initial_import_validation
         import_optimization["probe_ok"] = initial_check.ok
         import_optimization["probe_returncode"] = initial_check.returncode
+        preflight_current_sha = sha256_text(target.read_text(encoding="utf-8"))
         with timings.measure("resume_retrieval" if resuming else "initial_retrieval"):
             initial_retrieval = _safe_retrieval(
                 project,
@@ -869,24 +973,44 @@ def run_structured_workflow(
     except ProcessCancelled as exc:
         if target_changed and not keep_failed:
             atomic_write_text(target, preflight_source)
+        preflight_current_sha = sha256_text(target.read_text(encoding="utf-8"))
+        preflight_restored = target_changed and not keep_failed
         timing_summary = timings.finish("cancelled")
         store.update(
             status="cancelled",
             phase="complete",
-            restored=False,
+            current_sha256=preflight_current_sha,
+            restored=preflight_restored,
+            restored_to_checkpoint=(
+                resume_safe_state[3]
+                if preflight_restored
+                and resume_safe_state is not None
+                and preflight_current_sha == resume_safe_state[2]
+                else None
+            ),
             error=str(exc),
             timings=timing_summary,
         )
-        store.event("workflow_cancelled", restored=False)
+        store.event("workflow_cancelled", restored=preflight_restored)
         raise
     except Exception as exc:
         if target_changed and not keep_failed:
             atomic_write_text(target, preflight_source)
+        preflight_current_sha = sha256_text(target.read_text(encoding="utf-8"))
+        preflight_restored = target_changed and not keep_failed
         timing_summary = timings.finish("failed")
         store.update(
             status="failed",
             phase="complete",
-            restored=False,
+            current_sha256=preflight_current_sha,
+            restored=preflight_restored,
+            restored_to_checkpoint=(
+                resume_safe_state[3]
+                if preflight_restored
+                and resume_safe_state is not None
+                and preflight_current_sha == resume_safe_state[2]
+                else None
+            ),
             error=f"{type(exc).__name__}: {exc}",
             timings=timing_summary,
         )
@@ -1031,6 +1155,9 @@ def run_structured_workflow(
         safe_check = initial_check
         safe_sha = original_sha
         safe_checkpoint = None
+    working_sha = preflight_current_sha if initial_check.ok else safe_sha
+    terminal_broad_source: str | None = None
+    terminal_broad_sha: str | None = None
 
     try:
         previous_manifest = store.read()
@@ -1081,7 +1208,7 @@ def run_structured_workflow(
             plan_prompt = build_plan_prompt(
                 relative_file=relative.as_posix(),
                 task=task,
-                source=safe_source,
+                source=target.read_text(encoding="utf-8"),
                 diagnostics=initial_check.output,
                 retrieval=retrieval_prompt_block(planning_retrieval),
                 formal_goal=_formal_goal_prompt_block(formal_goal),
@@ -1279,6 +1406,8 @@ def run_structured_workflow(
                     attempt=archived_base_attempt,
                     candidate_sha256=working_source_sha,
                 )
+            if effective_import_policy in {"proof-first", "broad"}:
+                working_source = ensure_broad_mathlib_import(working_source)
 
             accepted_row = _accepted_attempt_row(attempt_rows, prior_attempts)
             if accepted_row is not None:
@@ -1292,6 +1421,10 @@ def run_structured_workflow(
                 )
                 recovered_review = read_json(recovered_review_path)
                 recovered_retrieval = read_json(recovered_retrieval_path)
+                recovered_policy_compatible = not (
+                    effective_import_policy in {"proof-first", "broad"}
+                    and not has_broad_import(recovered_candidate)
+                )
                 recovered_audit = audit_source(
                     original_source,
                     recovered_candidate,
@@ -1304,7 +1437,11 @@ def run_structured_workflow(
                     project, recovered_candidate
                 )
                 recovered_check: LeanCheck | None = None
-                if recovered_audit["ok"] and recovered_import_validation["ok"]:
+                if (
+                    recovered_policy_compatible
+                    and recovered_audit["ok"]
+                    and recovered_import_validation["ok"]
+                ):
                     rollback_source = target.read_text(encoding="utf-8")
                     atomic_write_text(target, recovered_candidate)
                     transaction_touched = True
@@ -1339,6 +1476,7 @@ def run_structured_workflow(
                     safe_check = recovered_check
                     safe_sha = recovered_sha
                     safe_checkpoint = str(checkpoint_dir)
+                    working_sha = recovered_sha
                     store.update(
                         steps=step_rows,
                         current_sha256=recovered_sha,
@@ -1374,6 +1512,7 @@ def run_structured_workflow(
                     attempt=accepted_attempt,
                     source_audit_ok=recovered_audit["ok"],
                     import_validation_ok=recovered_import_validation["ok"],
+                    import_policy_compatible=recovered_policy_compatible,
                     diagnostics=recovery_failure,
                 )
 
@@ -1601,9 +1740,11 @@ def run_structured_workflow(
                 candidate, deterministic_import_repair = repair_invalid_mathlib_imports(
                     project, candidate
                 )
+                if effective_import_policy in {"proof-first", "broad"}:
+                    candidate = ensure_broad_mathlib_import(candidate)
                 # Search names introduced by the candidate before making an
-                # import decision. Under proof-first, broad Mathlib is checked
-                # first and minimized only after the proof already passes.
+                # import decision. Proof-first and broad candidates keep the
+                # orchestrator-owned broad import throughout proof and review.
                 if has_broad_import(candidate):
                     with timings.measure("candidate_retrieval", attempt):
                         candidate_retrieval = _safe_retrieval(
@@ -1679,55 +1820,6 @@ def run_structured_workflow(
                             )
                     finally:
                         atomic_write_text(target, rollback_source)
-
-                if (
-                    last_check.ok
-                    and has_broad_import(candidate)
-                    and effective_import_policy == "proof-first"
-                ):
-                    optimized_candidate, precise_metadata = optimize_broad_imports(
-                        candidate, candidate_retrieval
-                    )
-                    candidate_import_optimization["precise_probe"] = precise_metadata
-                    if precise_metadata.get("changed"):
-                        optimized_audit = audit_source(
-                            original_source,
-                            optimized_candidate,
-                            protect_existing_statements=protect_existing_statements,
-                            protected_declarations=protected_declarations,
-                            required_declaration=step_required_declaration,
-                            required_declaration_names=step_required_names,
-                        )
-                        optimized_validation = validate_mathlib_imports(
-                            project, optimized_candidate
-                        )
-                        if optimized_audit["ok"] and optimized_validation["ok"]:
-                            atomic_write_text(target, optimized_candidate)
-                            try:
-                                with timings.measure("precise_import_lean_check", attempt):
-                                    precise_check = lean_checker(
-                                        project, target, lean_timeout_seconds, lake_executable
-                                    )
-                            finally:
-                                atomic_write_text(target, rollback_source)
-                            precise_metadata["probe_ok"] = precise_check.ok
-                            precise_metadata["probe_returncode"] = precise_check.returncode
-                            precise_metadata["diagnostics"] = precise_check.output
-                            if precise_check.ok:
-                                candidate = optimized_candidate
-                                source_audit = optimized_audit
-                                candidate_import_validation = optimized_validation
-                                last_check = precise_check
-                                candidate_import_optimization["changed"] = True
-                                candidate_import_optimization["reason"] = (
-                                    "proof_passed_then_precise_imports_passed"
-                                )
-                        else:
-                            precise_metadata["probe_skipped"] = (
-                                "source_audit_failed"
-                                if not optimized_audit["ok"]
-                                else "import_validation_failed"
-                            )
 
                 candidate_sha = sha256_text(candidate)
                 atomic_write_text(attempt_dir / "candidate.lean", candidate)
@@ -1858,6 +1950,7 @@ def run_structured_workflow(
                     safe_check = last_check
                     safe_sha = candidate_sha
                     safe_checkpoint = str(checkpoint_dir)
+                    working_sha = candidate_sha
                     step_completed = True
                     store.update(steps=step_rows, current_sha256=candidate_sha)
                     store.event(
@@ -1902,6 +1995,199 @@ def run_structured_workflow(
             row["status"] == "succeeded" for row in step_rows
         )
         if all_steps_succeeded:
+            if effective_import_policy == "proof-first":
+                broad_source = target.read_text(encoding="utf-8")
+                broad_source_sha = sha256_text(broad_source)
+                if not has_broad_import(broad_source):
+                    raise OSError(
+                        "Proof-first final source is missing the broad Mathlib import"
+                    )
+                if broad_source_sha != working_sha:
+                    raise OSError(
+                        "Final broad source does not match the latest verified checkpoint"
+                    )
+                terminal_broad_source = broad_source
+                terminal_broad_sha = broad_source_sha
+                selected_source = broad_source
+                final_import_reduction: dict[str, Any] = {
+                    "attempted": True,
+                    "changed": False,
+                    "effective_import_policy": effective_import_policy,
+                    "broad_source_sha256": broad_source_sha,
+                    "candidate_source_sha256": None,
+                    "selected_source_sha256": broad_source_sha,
+                    "retrieval": {
+                        "queries": [],
+                        "import_suggestions": [],
+                    },
+                    "selected_modules": [],
+                    "added_modules": [],
+                    "optimization": {},
+                    "source_audit": None,
+                    "import_validation": None,
+                    "lean_probe": {
+                        "ok": None,
+                        "returncode": None,
+                        "diagnostics": "",
+                        "command": [],
+                    },
+                    "selected_source": "broad",
+                    "fallback_reason": None,
+                }
+                try:
+                    reduction_terms = _plan_search_terms(plan)
+                    for term in source_search_terms(broad_source, task):
+                        if term not in reduction_terms:
+                            reduction_terms.append(term)
+                    with timings.measure("final_import_reduction_retrieval"):
+                        reduction_retrieval = _safe_retrieval(
+                            project,
+                            diagnostics="",
+                            requested_terms=reduction_terms,
+                            process_control=process_control,
+                        )
+                    retrieval_queries = reduction_retrieval.get("queries", [])
+                    retrieval_suggestions = reduction_retrieval.get(
+                        "import_suggestions", []
+                    )
+                    final_import_reduction["retrieval"] = {
+                        "queries": (
+                            list(retrieval_queries)
+                            if isinstance(retrieval_queries, list)
+                            else []
+                        ),
+                        "import_suggestions": (
+                            list(retrieval_suggestions)
+                            if isinstance(retrieval_suggestions, list)
+                            else []
+                        ),
+                    }
+                    reduction_candidate, reduction_optimization = (
+                        optimize_broad_imports(broad_source, reduction_retrieval)
+                    )
+                    final_import_reduction["optimization"] = reduction_optimization
+                    final_import_reduction["selected_modules"] = list(
+                        reduction_optimization.get("selected_modules") or []
+                    )
+                    final_import_reduction["added_modules"] = list(
+                        reduction_optimization.get("added_modules") or []
+                    )
+                    if not reduction_optimization.get("changed"):
+                        final_import_reduction["fallback_reason"] = str(
+                            reduction_optimization.get("reason") or "no_candidate"
+                        )
+                    else:
+                        reduction_candidate_sha = sha256_text(reduction_candidate)
+                        final_import_reduction[
+                            "candidate_source_sha256"
+                        ] = reduction_candidate_sha
+                        reduction_source_audit = audit_source(
+                            original_source,
+                            reduction_candidate,
+                            final=True,
+                            protect_existing_statements=protect_existing_statements,
+                            protected_declarations=protected_declarations,
+                            required_declaration=required_formal_declaration,
+                            required_declaration_names=list(
+                                dict.fromkeys(
+                                    name
+                                    for step in plan["steps"]
+                                    for name in step.get("required_declarations", [])
+                                )
+                            ),
+                        )
+                        final_import_reduction[
+                            "source_audit"
+                        ] = reduction_source_audit
+                        if not reduction_source_audit["ok"]:
+                            final_import_reduction[
+                                "fallback_reason"
+                            ] = "source_audit_failed"
+                        else:
+                            reduction_import_validation = validate_mathlib_imports(
+                                project, reduction_candidate
+                            )
+                            final_import_reduction[
+                                "import_validation"
+                            ] = reduction_import_validation
+                            if not reduction_import_validation["ok"]:
+                                final_import_reduction[
+                                    "fallback_reason"
+                                ] = "import_validation_failed"
+                            else:
+                                atomic_write_text(target, reduction_candidate)
+                                transaction_touched = True
+                                try:
+                                    with timings.measure(
+                                        "final_import_reduction_lean_check"
+                                    ):
+                                        reduction_check = lean_checker(
+                                            project,
+                                            target,
+                                            lean_timeout_seconds,
+                                            lake_executable,
+                                        )
+                                finally:
+                                    _restore_final_broad_source(
+                                        target, broad_source, broad_source_sha
+                                    )
+                                final_import_reduction["lean_probe"] = {
+                                    "ok": reduction_check.ok,
+                                    "returncode": reduction_check.returncode,
+                                    "diagnostics": reduction_check.output,
+                                    "command": list(reduction_check.command),
+                                }
+                                if reduction_check.ok:
+                                    selected_source = reduction_candidate
+                                    final_import_reduction["changed"] = True
+                                    final_import_reduction[
+                                        "selected_source_sha256"
+                                    ] = reduction_candidate_sha
+                                    final_import_reduction[
+                                        "selected_source"
+                                    ] = "precise"
+                                    final_import_reduction["fallback_reason"] = None
+                                else:
+                                    final_import_reduction[
+                                        "fallback_reason"
+                                    ] = "lean_probe_failed"
+                except ProcessCancelled:
+                    _restore_final_broad_source(
+                        target, broad_source, broad_source_sha
+                    )
+                    final_import_reduction["changed"] = False
+                    final_import_reduction[
+                        "selected_source_sha256"
+                    ] = broad_source_sha
+                    final_import_reduction["selected_source"] = "broad"
+                    final_import_reduction["fallback_reason"] = "cancelled"
+                    _write_final_import_reduction(store, final_import_reduction)
+                    raise
+                except _FinalImportReductionRestoreError:
+                    raise
+                except Exception:
+                    _restore_final_broad_source(
+                        target, broad_source, broad_source_sha
+                    )
+                    selected_source = broad_source
+                    final_import_reduction["changed"] = False
+                    final_import_reduction[
+                        "selected_source_sha256"
+                    ] = broad_source_sha
+                    final_import_reduction["selected_source"] = "broad"
+                    final_import_reduction[
+                        "fallback_reason"
+                    ] = "reduction_exception"
+
+                atomic_write_text(target, selected_source)
+                target_changed = target_changed or selected_source != broad_source
+                try:
+                    _write_final_import_reduction(store, final_import_reduction)
+                except Exception:
+                    _restore_final_broad_source(
+                        target, broad_source, broad_source_sha
+                    )
+                    raise
             store.update(phase="audit", current_step=None)
             store.event("phase_started", phase="global_audit")
             if phase_callback is not None:
@@ -2007,12 +2293,13 @@ def run_structured_workflow(
                 verdict=global_review["verdict"],
             )
             if final_audit["ok"]:
+                final_source_sha = sha256_text(final_source)
                 timing_summary = timings.finish("succeeded")
                 store.update(
                     status="succeeded",
                     phase="complete",
                     current_step=None,
-                    current_sha256=safe_sha,
+                    current_sha256=final_source_sha,
                     completed_attempt=attempt,
                     timings=timing_summary,
                 )
@@ -2160,16 +2447,27 @@ def run_structured_workflow(
             restored,
         )
     except ProcessCancelled as exc:
-        if target_changed and not keep_failed:
+        if terminal_broad_source is not None and terminal_broad_sha is not None:
+            _restore_final_broad_source(
+                target, terminal_broad_source, terminal_broad_sha
+            )
+            restored = True
+        elif (target_changed or transaction_touched) and not keep_failed:
             atomic_write_text(target, safe_source)
-        restored = (target_changed or transaction_touched) and not keep_failed
+            restored = True
+        else:
+            restored = False
+        current_sha = sha256_text(target.read_text(encoding="utf-8"))
+        restored_checkpoint = (
+            safe_checkpoint if restored and current_sha == safe_sha else None
+        )
         timing_summary = timings.finish("cancelled")
         store.update(
             status="cancelled",
             phase="complete",
-            current_sha256=sha256_text(target.read_text(encoding="utf-8")),
+            current_sha256=current_sha,
             restored=restored,
-            restored_to_checkpoint=safe_checkpoint,
+            restored_to_checkpoint=restored_checkpoint,
             error=str(exc),
             timings=timing_summary,
         )

@@ -38,8 +38,8 @@ use that theorem directly instead of rebuilding it from lower-level lemmas.
 During `proof-first` and `broad` proof phases, import breadth is
 orchestrator-owned. Do not narrow or remove a standalone `import Mathlib`.
 Retrieval remains available for theorem and premise selection, not proof-time
-import restriction. Only explicit `precise` may use locally evidenced fine
-imports.
+import restriction. Only the resolved `precise` policy may use locally
+evidenced fine imports.
 A request to preserve an existing theorem, statement, or proof does not freeze
 the file's import section unless the user explicitly says imports must remain
 unchanged. On retries, treat compiler diagnostics as hard evidence: do not
