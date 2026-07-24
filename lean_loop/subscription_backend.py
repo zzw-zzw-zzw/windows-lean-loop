@@ -173,60 +173,11 @@ def _redact_assignments(value: str) -> str:
     return clean
 
 
-def _redact_lean_source(value: str) -> str:
-    clean = _redact_standalone_credentials(value)
-    saved: list[str] = []
-    cursor = 0
-    index = 0
-    length = len(clean)
-    while index < length:
-        start = index
-        if clean.startswith("--", index):
-            end = clean.find("\n", index)
-            if end < 0:
-                end = length
-        elif clean.startswith("/-", index):
-            index += 2
-            depth = 1
-            while index < length and depth:
-                if clean.startswith("/-", index):
-                    depth += 1
-                    index += 2
-                elif clean.startswith("-/", index):
-                    depth -= 1
-                    index += 2
-                else:
-                    index += 1
-            end = index
-        elif clean[index] == '"':
-            index += 1
-            escaped = False
-            while index < length:
-                char = clean[index]
-                index += 1
-                if escaped:
-                    escaped = False
-                elif char == "\\":
-                    escaped = True
-                elif char == '"':
-                    break
-            end = index
-        else:
-            index += 1
-            continue
-        saved.append(clean[cursor:start])
-        saved.append(_redact_assignments(clean[start:end]))
-        cursor = end
-        index = end
-    saved.append(clean[cursor:])
-    return "".join(saved)
-
-
 def _redact_text(
     value: str, *, text_context: str = "generic"
 ) -> tuple[str, bool]:
     clean = (
-        _redact_lean_source(value)
+        _redact_standalone_credentials(value)
         if text_context == "lean_source"
         else _redact_assignments(_redact_standalone_credentials(value))
     )
@@ -1093,6 +1044,9 @@ class _SubscriptionBackend:
                     collection_stop_reason="output_safety_limit_exceeded",
                     output_safety_limit_bytes=exc.limit_bytes,
                     output_type=output_type,
+                    complete_captured_prefix_saved=getattr(
+                        exc, "complete_captured_prefix_saved", False
+                    ),
                 )
                 self.last_metadata.update(
                     {

@@ -348,6 +348,44 @@ class ControlledProcessTests(unittest.TestCase):
             )
             self.assert_control_cleaned(control)
 
+    def test_output_limit_marks_queue_pressure_capture_as_truncated(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            ready = Path(directory) / "ready"
+
+            class QueuePressureControl(_Control):
+                def cancel_requested(self) -> bool:
+                    deadline = time.monotonic() + 3
+                    while time.monotonic() < deadline and not ready.is_file():
+                        time.sleep(0.01)
+                    if ready.is_file():
+                        time.sleep(0.2)
+                    return False
+
+            control = QueuePressureControl()
+            limit = 4096
+            script = (
+                "import pathlib, sys, time\n"
+                "sys.stdout.write(('q' * 70000) + 'CAPTURED_TAIL')\n"
+                "sys.stdout.flush()\n"
+                f"pathlib.Path({str(ready)!r}).write_text('ready')\n"
+                "time.sleep(30)\n"
+            )
+            with self.assertRaises(ProcessOutputLimitExceeded) as raised:
+                run_controlled_process(
+                    [sys.executable, "-c", script],
+                    timeout_seconds=10,
+                    kind="bounded-queued-output-limit-test",
+                    max_output_bytes=limit,
+                    control=control,
+                )
+            self.assertEqual(raised.exception.captured_bytes, limit)
+            self.assertTrue(ready.is_file())
+            self.assertFalse(
+                raised.exception.complete_captured_prefix_saved
+            )
+            self.assertNotIn("CAPTURED_TAIL", raised.exception.stdout)
+            self.assert_control_cleaned(control)
+
     def test_bounded_collection_enforces_combined_stdout_stderr_limit(
         self,
     ) -> None:

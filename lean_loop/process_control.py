@@ -142,12 +142,15 @@ class ProcessOutputLimitExceeded(RuntimeError):
         limit_bytes: int,
         stdout: str,
         stderr: str,
+        *,
+        complete_captured_prefix_saved: bool = False,
     ) -> None:
         super().__init__(f"Process output exceeded {limit_bytes} captured bytes")
         self.command = tuple(command)
         self.limit_bytes = limit_bytes
         self.stdout = stdout
         self.stderr = stderr
+        self.complete_captured_prefix_saved = complete_captured_prefix_saved
         self.captured_bytes = len(stdout.encode("utf-8")) + len(
             stderr.encode("utf-8")
         )
@@ -551,7 +554,9 @@ def _collect_bounded_process(
             captured_bytes += len(saved_chunk.encode("utf-8"))
         return chunk_bytes > remaining
 
-    def finalize_captured_prefix() -> tuple[bool, bool]:
+    def finalize_captured_prefix(
+        *, save_pending: bool = True
+    ) -> tuple[bool, bool]:
         stop_readers.set()
         deadline = time.monotonic() + 2
         for thread in reader_threads:
@@ -561,11 +566,14 @@ def _collect_bounded_process(
             remaining_chunks = sorted(pending_chunks.items())
             pending_chunks.clear()
         limit_exceeded = False
-        for _, (name, chunk) in remaining_chunks:
-            if save_chunk(name, chunk):
-                limit_exceeded = True
-                break
-        return limit_exceeded, complete
+        if not save_pending:
+            limit_exceeded = bool(remaining_chunks)
+        else:
+            for _, (name, chunk) in remaining_chunks:
+                if save_chunk(name, chunk):
+                    limit_exceeded = True
+                    break
+        return limit_exceeded, complete and not limit_exceeded
 
     try:
         while process.poll() is None or len(completed_streams) < 2:
@@ -578,7 +586,11 @@ def _collect_bounded_process(
                 stdout, stderr = captured_streams()
                 if limit_exceeded:
                     raise ProcessOutputLimitExceeded(
-                        command, max_output_bytes, stdout, stderr
+                        command,
+                        max_output_bytes,
+                        stdout,
+                        stderr,
+                        complete_captured_prefix_saved=complete_prefix,
                     )
                 raise ProcessCancelled(
                     f"Cancelled while running {kind} (PID {process.pid})",
@@ -593,7 +605,11 @@ def _collect_bounded_process(
                 stdout, stderr = captured_streams()
                 if limit_exceeded:
                     raise ProcessOutputLimitExceeded(
-                        command, max_output_bytes, stdout, stderr
+                        command,
+                        max_output_bytes,
+                        stdout,
+                        stderr,
+                        complete_captured_prefix_saved=complete_prefix,
                     )
                 timeout = subprocess.TimeoutExpired(
                     command, timeout_seconds, stdout, stderr
@@ -616,9 +632,14 @@ def _collect_bounded_process(
             _, chunk = pending
             if save_chunk(name, chunk):
                 terminate_process_tree(process)
+                finalize_captured_prefix(save_pending=False)
                 stdout, stderr = captured_streams()
                 raise ProcessOutputLimitExceeded(
-                    command, max_output_bytes, stdout, stderr
+                    command,
+                    max_output_bytes,
+                    stdout,
+                    stderr,
+                    complete_captured_prefix_saved=False,
                 )
         process.wait()
     except KeyboardInterrupt:

@@ -1413,6 +1413,63 @@ class SubscriptionBackendTests(unittest.TestCase):
             )
             self.assertEqual(saved_events[2]["item"]["text"], legal_lean)
 
+    def test_codex_lean_evidence_preserves_non_token_comments_and_strings(
+        self,
+    ) -> None:
+        legal_lean = (
+            "-- password=alpha beta gamma; token=ordinary\n"
+            '/- client_secret_blob = documentation only -/\n'
+            'def note : String := "secret=plain text; session_token=ordinary"\n\n'
+            "example : True := by\n"
+            '  let secret := "value"\n'
+            "  trivial\n"
+        )
+        events = (
+            {"type": "thread.started", "thread_id": "legal-lean-text"},
+            {"type": "turn.started"},
+            {
+                "type": "item.completed",
+                "item": {
+                    "id": "final",
+                    "type": "agent_message",
+                    "text": legal_lean,
+                },
+            },
+            {"type": "turn.completed", "usage": {}},
+        )
+        stdout = "\n".join(json.dumps(event) for event in events) + "\n"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            backend = self._backend("codex", root)
+            backend.inspect(model="gpt-test-pinned", reasoning_effort="low")
+            runtime = AgentRuntime(
+                workflow_root=root / "workflow",
+                run_id="run-legal-lean-text",
+                backend=backend,
+            )
+            with patch.object(
+                backend,
+                "_run",
+                return_value=subprocess.CompletedProcess(
+                    args=[], returncode=0, stdout=stdout, stderr=""
+                ),
+            ):
+                result = runtime.invoke(
+                    role="prover",
+                    phase="prove",
+                    output_type="lean_file",
+                    config=_config("gpt-test-pinned"),
+                    system_prompt="system",
+                    user_prompt="user",
+                    temp_dir=root / "ignored",
+                )
+            self.assertEqual(result, legal_lean)
+            call_dir = next((root / "workflow" / "agent-calls").iterdir())
+            saved_events = _jsonl_events(
+                (call_dir / "stdout.txt").read_text(encoding="utf-8")
+            )
+            self.assertEqual(saved_events[2]["item"]["text"], legal_lean)
+
     def test_codex_rejects_quoted_bearers_in_tool_output(
         self,
     ) -> None:
@@ -2469,8 +2526,8 @@ class SubscriptionBackendTests(unittest.TestCase):
             self.assertEqual(streams["captured_process_bytes"], 4096)
             self.assertEqual(streams["output_safety_limit_bytes"], 4096)
             self.assertFalse(streams["complete_process_stream_observed"])
-            self.assertTrue(streams["complete_captured_prefix_saved"])
-            self.assertFalse(streams["saved_evidence_truncated"])
+            self.assertFalse(streams["complete_captured_prefix_saved"])
+            self.assertTrue(streams["saved_evidence_truncated"])
             self.assertEqual(
                 streams["collection_stop_reason"],
                 "output_safety_limit_exceeded",
@@ -2480,12 +2537,12 @@ class SubscriptionBackendTests(unittest.TestCase):
                 streams["stdout"]["process_stream"]["scope"],
                 "captured_prefix_only",
             )
-            self.assertTrue(
+            self.assertFalse(
                 streams["stdout"]["saved_redacted_evidence"][
                     "complete_captured_prefix_saved"
                 ]
             )
-            self.assertFalse(
+            self.assertTrue(
                 streams["stdout"]["saved_redacted_evidence"][
                     "saved_evidence_truncated"
                 ]
