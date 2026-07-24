@@ -24,6 +24,8 @@ from lean_loop.lean import (
 from lean_loop.mathlib_search import collect_retrieval, search_mathlib
 from lean_loop.mathlib_search import suggest_imports
 from lean_loop.mathlib_index import build_mathlib_index, index_status
+from lean_loop.lsp_tools import LspEvidenceCollector, LspSettings, resolve_lsp_command
+from lean_loop.project_config import load_project_config
 from lean_loop.queue import QueueError, QueueStore, work_queue
 from lean_loop.retrieval_cache import RetrievalCache, clear_retrieval_cache
 from lean_loop.runner import run_repair_loop
@@ -95,6 +97,22 @@ def _parser() -> argparse.ArgumentParser:
         "--lake",
         default=os.environ.get("LEAN_AGENT_LAKE", "lake"),
         help="lake executable or full path (default: LEAN_AGENT_LAKE or lake)",
+    )
+
+    lsp_check = subparsers.add_parser(
+        "lsp-check", help="Start or connect to Lean LSP MCP and collect evidence"
+    )
+    lsp_check.add_argument("--project", type=Path, required=True)
+    lsp_check.add_argument("--file", required=True)
+    lsp_check.add_argument("--query", action="append", default=[])
+    lsp_check.add_argument("--mode", choices=("stdio", "http"), default=None)
+    lsp_check.add_argument("--mcp-command", dest="lsp_command", default="")
+    lsp_check.add_argument("--url", default="")
+    lsp_check.add_argument("--startup-timeout", type=int, default=None)
+    lsp_check.add_argument("--call-timeout", type=int, default=None)
+    lsp_check.add_argument("--total-timeout", type=int, default=180)
+    lsp_check.add_argument(
+        "--remote-search", action=argparse.BooleanOptionalAction, default=None
     )
 
     search = subparsers.add_parser(
@@ -373,6 +391,11 @@ def _doctor(
         "programs": {
             name: find_program(name) for name in ("elan", "lake", "lean", "curl.exe")
         },
+        "optional_programs": {
+            "uv": find_program("uv"),
+            "uvx": find_program("uvx"),
+            "lean-lsp-mcp": None,
+        },
         "api_environment": {
             "LEAN_AGENT_API_BASE": bool(_environment_value("LEAN_AGENT_API_BASE")),
             "API_KEY": bool(
@@ -382,6 +405,12 @@ def _doctor(
             "LEAN_AGENT_MODEL": bool(_environment_value("LEAN_AGENT_MODEL")),
         },
     }
+    try:
+        report["optional_programs"]["lean-lsp-mcp"] = resolve_lsp_command(
+            LspSettings.from_values(load_project_config(project)).command
+        )
+    except (FileNotFoundError, ValueError):
+        pass
     if agent_backend in SUBSCRIPTION_BACKENDS:
         try:
             config = ApiConfig.for_backend(
@@ -793,6 +822,41 @@ def main(argv: list[str] | None = None) -> None:
                             f"queries={suggestion['queries']}"
                         )
             raise SystemExit(0)
+
+        if args.command == "lsp-check":
+            project = resolve_project(args.project)
+            target = resolve_target(project, args.file)
+            values = load_project_config(project)
+            values["lsp_mode"] = args.mode or values.get("lsp_mode") or "stdio"
+            if args.lsp_command:
+                values["lsp_command"] = args.lsp_command
+            if args.url:
+                values["lsp_url"] = args.url
+            if args.startup_timeout is not None:
+                values["lsp_startup_timeout_seconds"] = args.startup_timeout
+            if args.call_timeout is not None:
+                values["lsp_call_timeout_seconds"] = args.call_timeout
+            if args.remote_search is not None:
+                values["lsp_remote_search"] = args.remote_search
+            if args.total_timeout < 1:
+                raise ValueError("LSP total timeout must be positive")
+            settings = LspSettings.from_values(values)
+            collector = LspEvidenceCollector(project=project, settings=settings)
+            try:
+                evidence = collector.collect(
+                    file_path=target,
+                    source=target.read_text(encoding="utf-8"),
+                    diagnostics="",
+                    search_terms=list(args.query),
+                    allow_remote_search=settings.remote_search,
+                    total_timeout_seconds=args.total_timeout,
+                )
+                print(json.dumps(evidence, ensure_ascii=False, indent=2))
+                raise SystemExit(
+                    0 if evidence.get("session", {}).get("status") == "ready" else 1
+                )
+            finally:
+                collector.close()
 
         if args.command == "workflow" and args.workflow_command == "resume":
             project = resolve_project(args.project)

@@ -344,6 +344,48 @@ python -m lean_loop queue add `
   --lean-timeout 120
 ```
 
+## Lean LSP MCP integration
+
+The optional MCP layer gives Planner, Prover, and Reviewer incremental Lean
+evidence: diagnostics, proof goals, hover signatures, local declaration search,
+and a bounded fallback to online Loogle. It never decides success and never
+writes the authoritative target file. The existing transaction, checkpoint,
+placeholder audit, declaration protection, and final `lake env lean` check remain
+authoritative.
+
+Install it on Windows:
+
+```powershell
+winget install --id astral-sh.uv -e
+uv tool install lean-lsp-mcp
+```
+
+Enable it for a project in the Dashboard configuration, or set:
+
+```powershell
+$env:LEAN_AGENT_LSP_MODE = "stdio"
+$env:LEAN_AGENT_LSP_COMMAND = "C:\Users\you\.local\bin\lean-lsp-mcp.exe"
+$env:LEAN_AGENT_LSP_STARTUP_TIMEOUT = "240"
+$env:LEAN_AGENT_LSP_CALL_TIMEOUT = "90"
+$env:LEAN_AGENT_LSP_REMOTE_SEARCH = "true"
+```
+
+Verify the service without calling the model API:
+
+```powershell
+python -m lean_loop lsp-check `
+  --project D:\my_math_project `
+  --file MyMathProject.lean `
+  --mcp-command C:\Users\you\.local\bin\lean-lsp-mcp.exe `
+  --query Real.pi_gt_three `
+  --total-timeout 180
+```
+
+Use `--no-remote-search` to test only local LSP search. Online Loogle is
+advisory and rate-limited; its failure is recorded in workflow evidence and
+does not fail a proof. Windows local Loogle is not required; use WSL only if
+you later need the local Loogle index.
+
 命令会输出任务 ID。第二个任务可以等待第一个任务成功后再运行：
 
 ```powershell

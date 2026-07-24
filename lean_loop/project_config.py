@@ -26,6 +26,13 @@ CONFIG_KEYS = {
     "api_timeout_retries",
     "stream_responses",
     "provider_kind",
+    "lsp_mode",
+    "lsp_command",
+    "lsp_url",
+    "lsp_startup_timeout_seconds",
+    "lsp_call_timeout_seconds",
+    "lsp_remote_search",
+    "lsp_max_search_terms",
 }
 EFFORTS = {"low", "medium", "high", "xhigh"}
 PROVIDER_KINDS = {"openai-compatible", "deepseek"}
@@ -148,7 +155,8 @@ def _validated_config(value: dict[str, Any]) -> dict[str, Any]:
         )
     result: dict[str, Any] = {}
     for key in (
-        "api_base", "model", "api_mode", "api_transport", "reasoning_effort", "lake", "provider_kind"
+        "api_base", "model", "api_mode", "api_transport", "reasoning_effort", "lake", "provider_kind",
+        "lsp_mode", "lsp_command", "lsp_url",
     ):
         if key in value:
             result[key] = str(value[key]).strip()
@@ -173,10 +181,27 @@ def _validated_config(value: dict[str, Any]) -> dict[str, Any]:
         raise ProjectConfigError(
             "Provider kind must be openai-compatible or deepseek"
         )
+    if result.get("lsp_mode") and result["lsp_mode"] not in {
+        "off",
+        "stdio",
+        "http",
+    }:
+        raise ProjectConfigError("LSP mode must be off, stdio, or http")
+    if result.get("lsp_url"):
+        parsed = urlparse(result["lsp_url"])
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            raise ProjectConfigError("LSP URL must be an http:// or https:// URL")
+        if parsed.hostname not in {"127.0.0.1", "localhost", "::1"}:
+            raise ProjectConfigError(
+                "HTTP LSP MCP is restricted to loopback addresses"
+            )
     for key, minimum in (
         ("timeout_seconds", 1),
         ("max_output_tokens", 256),
         ("api_timeout_retries", 0),
+        ("lsp_startup_timeout_seconds", 1),
+        ("lsp_call_timeout_seconds", 1),
+        ("lsp_max_search_terms", 1),
     ):
         if key in value:
             try:
@@ -185,7 +210,13 @@ def _validated_config(value: dict[str, Any]) -> dict[str, Any]:
                 raise ProjectConfigError(f"{key} must be an integer") from exc
             if result[key] < minimum:
                 raise ProjectConfigError(f"{key} must be at least {minimum}")
-    for key in ("disable_response_storage", "stream_responses"):
+    if result.get("lsp_max_search_terms", 1) > 10:
+        raise ProjectConfigError("lsp_max_search_terms must be at most 10")
+    for key in (
+        "disable_response_storage",
+        "stream_responses",
+        "lsp_remote_search",
+    ):
         if key in value:
             result[key] = bool(value[key])
     return result
@@ -378,6 +409,26 @@ def project_config_view(project: Path) -> dict[str, Any]:
         ).strip().lower()
         in {"true", "1", "yes"},
         "provider_kind": "openai-compatible",
+        "lsp_mode": os.environ.get("LEAN_AGENT_LSP_MODE", "off").strip().lower(),
+        "lsp_command": os.environ.get(
+            "LEAN_AGENT_LSP_COMMAND", "lean-lsp-mcp"
+        ).strip(),
+        "lsp_url": os.environ.get(
+            "LEAN_AGENT_LSP_URL", "http://127.0.0.1:8000/mcp"
+        ).strip(),
+        "lsp_startup_timeout_seconds": int(
+            os.environ.get("LEAN_AGENT_LSP_STARTUP_TIMEOUT", "180")
+        ),
+        "lsp_call_timeout_seconds": int(
+            os.environ.get("LEAN_AGENT_LSP_CALL_TIMEOUT", "60")
+        ),
+        "lsp_remote_search": os.environ.get(
+            "LEAN_AGENT_LSP_REMOTE_SEARCH", "true"
+        ).strip().lower()
+        in {"true", "1", "yes"},
+        "lsp_max_search_terms": int(
+            os.environ.get("LEAN_AGENT_LSP_MAX_SEARCH_TERMS", "3")
+        ),
     }
     effective = {**defaults, **stored}
     return {

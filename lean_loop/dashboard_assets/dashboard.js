@@ -470,6 +470,7 @@ async function startWorker() {
 
 function populateConfigForm(providerId = "default") {
   const providers = state.snapshot?.providers || { default: state.snapshot?.configuration || {} };
+  const projectConfig = state.snapshot?.configuration || {};
   const isNew = providerId === "__new__";
   const config = isNew ? {} : providers[providerId] || {};
   $("configProviderSelect").innerHTML = [
@@ -492,6 +493,16 @@ function populateConfigForm(providerId = "default") {
   $("configClearKey").checked = false;
   $("configDisableStorage").checked = config.disable_response_storage !== false;
   $("configStreaming").checked = config.stream_responses !== false;
+  $("configLspMode").value = projectConfig.lsp_mode || "off";
+  $("configLspCommand").value = projectConfig.lsp_command || "lean-lsp-mcp";
+  $("configLspUrl").value = projectConfig.lsp_url || "http://127.0.0.1:8000/mcp";
+  $("configLspStartupTimeout").value = projectConfig.lsp_startup_timeout_seconds || 180;
+  $("configLspCallTimeout").value = projectConfig.lsp_call_timeout_seconds || 60;
+  $("configLspMaxTerms").value = projectConfig.lsp_max_search_terms || 3;
+  $("configLspRemoteSearch").checked = projectConfig.lsp_remote_search !== false;
+  for (const id of ["configLspMode", "configLspCommand", "configLspUrl", "configLspStartupTimeout", "configLspCallTimeout", "configLspMaxTerms", "configLspRemoteSearch"]) {
+    $(id).disabled = providerId !== "default";
+  }
   const status = $("configKeyStatus");
   status.textContent = config.api_key_configured
     ? `API Key 已配置，来源：${config.api_key_source === "project" ? "项目加密存储" : "环境变量"}`
@@ -504,22 +515,35 @@ async function saveConfiguration(event) {
   const button = $("saveConfigButton");
   button.disabled = true;
   try {
+    const providerId = $("configProviderId").value.trim() || "default";
+    const configuration = {
+      provider_kind: $("configProviderKind").value,
+      api_base: $("configApiBase").value.trim(),
+      model: $("configModel").value.trim(),
+      api_mode: $("configApiMode").value,
+      api_transport: $("configApiTransport").value,
+      reasoning_effort: $("configReasoning").value,
+      timeout_seconds: Number($("configTimeout").value),
+      api_timeout_retries: Number($("configRetries").value),
+      max_output_tokens: Number($("configMaxOutput").value),
+      lake: $("configLake").value.trim(),
+      disable_response_storage: $("configDisableStorage").checked,
+      stream_responses: $("configStreaming").checked,
+    };
+    if (providerId === "default") {
+      Object.assign(configuration, {
+        lsp_mode: $("configLspMode").value,
+        lsp_command: $("configLspCommand").value.trim() || "lean-lsp-mcp",
+        lsp_url: $("configLspUrl").value.trim() || "http://127.0.0.1:8000/mcp",
+        lsp_startup_timeout_seconds: Number($("configLspStartupTimeout").value),
+        lsp_call_timeout_seconds: Number($("configLspCallTimeout").value),
+        lsp_max_search_terms: Number($("configLspMaxTerms").value),
+        lsp_remote_search: $("configLspRemoteSearch").checked,
+      });
+    }
     const result = await controlRequest("/api/config", {
-      provider_id: $("configProviderId").value.trim() || "default",
-      configuration: {
-        provider_kind: $("configProviderKind").value,
-        api_base: $("configApiBase").value.trim(),
-        model: $("configModel").value.trim(),
-        api_mode: $("configApiMode").value,
-        api_transport: $("configApiTransport").value,
-        reasoning_effort: $("configReasoning").value,
-        timeout_seconds: Number($("configTimeout").value),
-        api_timeout_retries: Number($("configRetries").value),
-        max_output_tokens: Number($("configMaxOutput").value),
-        lake: $("configLake").value.trim(),
-        disable_response_storage: $("configDisableStorage").checked,
-        stream_responses: $("configStreaming").checked,
-      },
+      provider_id: providerId,
+      configuration,
       api_key: $("configApiKey").value || null,
       clear_api_key: $("configClearKey").checked,
     });

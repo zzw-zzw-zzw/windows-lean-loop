@@ -35,6 +35,8 @@ from lean_loop.prompts import (
     build_user_prompt,
 )
 from lean_loop.process_control import ProcessCancelled, ProcessControl
+from lean_loop.lsp_tools import LspEvidenceCollector, LspSettings
+from lean_loop.project_config import load_project_config
 from lean_loop.state import WorkflowStore
 from lean_loop.timings import TimingRecorder
 
@@ -806,6 +808,7 @@ def run_structured_workflow(
     relative = target.relative_to(project)
     if import_policy not in IMPORT_POLICIES:
         raise ValueError(f"Unsupported import policy: {import_policy}")
+    lsp_settings = LspSettings.from_values(load_project_config(project))
     effective_import_policy = _effective_import_policy(import_policy, "")
     selected_backend = agent_backend
     backend_identity: dict[str, Any] | None = None
@@ -874,6 +877,7 @@ def run_structured_workflow(
             "prove": prove_config.reasoning_effort,
             "review": review_config.reasoning_effort,
         },
+        "lsp": lsp_settings.to_dict(),
     }
     if backend_identity is not None:
         settings["backend_identity"] = backend_identity
@@ -955,6 +959,25 @@ def run_structured_workflow(
             file_model_call=file_model_call,
         ),
     )
+    lsp_collector = LspEvidenceCollector(
+        project=project,
+        settings=lsp_settings,
+        process_control=process_control,
+    )
+
+    def close_lsp() -> None:
+        status = lsp_collector.status()
+        lsp_collector.close()
+        try:
+            if status.get("status") == "ready":
+                status = {
+                    **status,
+                    "status": "stopped",
+                    "pid": None,
+                }
+            store.update(lsp=status)
+        except Exception:
+            pass
 
     target_changed = False
     transaction_touched = False
@@ -1032,8 +1055,18 @@ def run_structured_workflow(
                 requested_terms=preflight_terms,
                 process_control=process_control,
             )
+        if lsp_settings.mode != "off":
+            with timings.measure("initial_lsp_evidence"):
+                initial_retrieval["lsp"] = lsp_collector.collect(
+                    file_path=target,
+                    source=preflight_source,
+                    diagnostics=initial_check.output,
+                    search_terms=preflight_terms,
+                    allow_remote_search=lsp_settings.remote_search,
+                )
         initial_retrieval["import_optimization"] = import_optimization
     except ProcessCancelled as exc:
+        close_lsp()
         if target_changed and not keep_failed:
             atomic_write_text(target, preflight_source)
         preflight_current_sha = sha256_text(target.read_text(encoding="utf-8"))
@@ -1057,6 +1090,7 @@ def run_structured_workflow(
         store.event("workflow_cancelled", restored=preflight_restored)
         raise
     except Exception as exc:
+        close_lsp()
         if target_changed and not keep_failed:
             atomic_write_text(target, preflight_source)
         preflight_current_sha = sha256_text(target.read_text(encoding="utf-8"))
@@ -1228,6 +1262,7 @@ def run_structured_workflow(
         safe_checkpoint = None
         safe_check_source_sha = preflight_current_sha
     working_sha = preflight_current_sha if initial_check.ok else safe_sha
+    lsp_working_path = target
     terminal_broad_source: str | None = None
     terminal_broad_sha: str | None = None
 
@@ -1580,6 +1615,7 @@ def run_structured_workflow(
                     safe_checkpoint = str(checkpoint_dir)
                     safe_check_source_sha = recovered_sha
                     working_sha = recovered_sha
+                    lsp_working_path = target
                     store.update(
                         steps=step_rows,
                         current_sha256=recovered_sha,
@@ -1661,6 +1697,15 @@ def run_structured_workflow(
                         requested_terms=requested_terms,
                         process_control=process_control,
                     )
+                if lsp_settings.mode != "off" and lsp_working_path.is_file():
+                    with timings.measure("attempt_lsp_evidence", candidate_attempt):
+                        retrieval["lsp"] = lsp_collector.collect(
+                            file_path=lsp_working_path,
+                            source=working_source,
+                            diagnostics=last_check.output,
+                            search_terms=requested_terms,
+                            allow_remote_search=lsp_settings.remote_search,
+                        )
 
                 completed_steps = [
                     {"id": row["id"], "goal": row["goal"], "checkpoint": row["checkpoint"]}
@@ -1950,6 +1995,15 @@ def run_structured_workflow(
                         requested_terms=candidate_terms,
                         process_control=process_control,
                     )
+                if lsp_settings.mode != "off":
+                    with timings.measure("post_check_lsp_evidence", attempt):
+                        retrieval["lsp"] = lsp_collector.collect(
+                            file_path=attempt_dir / "candidate.lean",
+                            source=candidate,
+                            diagnostics=last_check.output,
+                            search_terms=candidate_terms,
+                            allow_remote_search=lsp_settings.remote_search,
+                        )
                 retrieval["import_optimization"] = candidate_import_optimization
                 retrieval["import_validation"] = candidate_import_validation
                 retrieval["deterministic_import_repair"] = deterministic_import_repair
@@ -2065,6 +2119,7 @@ def run_structured_workflow(
                     safe_checkpoint = str(checkpoint_dir)
                     safe_check_source_sha = candidate_sha
                     working_sha = candidate_sha
+                    lsp_working_path = target
                     step_completed = True
                     store.update(steps=step_rows, current_sha256=candidate_sha)
                     store.event(
@@ -2076,6 +2131,7 @@ def run_structured_workflow(
                     )
                     break
                 working_source = candidate
+                lsp_working_path = attempt_dir / "candidate.lean"
                 working_base_attempt = attempt
                 store.event(
                     "failed_candidate_kept_as_working_source",
@@ -2424,6 +2480,15 @@ def run_structured_workflow(
                 ],
                 process_control=process_control,
             )
+            if lsp_settings.mode != "off":
+                with timings.measure("final_lsp_evidence"):
+                    final_retrieval["lsp"] = lsp_collector.collect(
+                        file_path=target,
+                        source=final_source,
+                        diagnostics=final_check.output,
+                        search_terms=_plan_search_terms(plan),
+                        allow_remote_search=False,
+                    )
             audit_ok = final_check.ok and bool(final_source_audit["ok"])
             audit_diagnostics = final_check.output
             if not final_source_audit["ok"]:
@@ -2495,6 +2560,7 @@ def run_structured_workflow(
             )
             if final_audit["ok"]:
                 final_source_sha = sha256_text(final_source)
+                close_lsp()
                 timing_summary = timings.finish("succeeded")
                 store.update(
                     status="succeeded",
@@ -2642,6 +2708,7 @@ def run_structured_workflow(
             )
         else:
             failure_error = "Lean did not pass within the configured candidate budgets."
+        close_lsp()
         timing_summary = timings.finish("failed")
         store.update(
             status="failed",
@@ -2667,6 +2734,7 @@ def run_structured_workflow(
             restored,
         )
     except ProcessCancelled as exc:
+        close_lsp()
         if terminal_broad_source is not None and terminal_broad_sha is not None:
             _restore_final_broad_source(
                 target, terminal_broad_source, terminal_broad_sha
@@ -2694,6 +2762,7 @@ def run_structured_workflow(
         store.event("workflow_cancelled", restored=restored)
         raise
     except Exception as exc:
+        close_lsp()
         if target_changed and not keep_failed:
             atomic_write_text(target, safe_source)
         timing_summary = timings.finish("failed")

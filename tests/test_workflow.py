@@ -10,6 +10,7 @@ from lean_loop.audit import audit_source as real_audit_source
 from lean_loop.config import ApiConfig
 from lean_loop.jsonutil import sha256_text
 from lean_loop.lean import LeanCheck, check_lean
+from lean_loop.lsp_tools import LspSettings
 from lean_loop.mathlib_search import (
     has_broad_import,
     optimize_broad_imports,
@@ -792,24 +793,51 @@ class StructuredWorkflowTests(unittest.TestCase):
                 self.assertIn("first_candidate_marker", prompt)
                 return "example : True := by trivial\n"
 
-            result = run_structured_workflow(
-                project=project,
-                target=target,
-                task="prove the example",
-                plan_config=_config(),
-                prove_config=_config(),
-                review_config=_config(),
-                max_attempts=2,
-                max_attempts_per_step=2,
-                lean_timeout_seconds=10,
-                lake_executable="lake",
-                json_model_call=json_model,
-                file_model_call=file_model,
-                lean_checker=checker,
-            )
+            class FakeLspCollector:
+                def __init__(self, **kwargs):
+                    del kwargs
+                    self.closed = False
+
+                def collect(self, *, source, **kwargs):
+                    del kwargs
+                    return {
+                        "session": {"status": "ready"},
+                        "marker": "failed_candidate_lsp"
+                        if "first_candidate_marker" in source
+                        else "other_lsp",
+                    }
+
+                def status(self):
+                    return {"status": "ready", "pid": 1234}
+
+                def close(self):
+                    self.closed = True
+
+            with patch(
+                "lean_loop.workflow.LspSettings.from_values",
+                return_value=LspSettings(mode="stdio"),
+            ), patch(
+                "lean_loop.workflow.LspEvidenceCollector", FakeLspCollector
+            ):
+                result = run_structured_workflow(
+                    project=project,
+                    target=target,
+                    task="prove the example",
+                    plan_config=_config(),
+                    prove_config=_config(),
+                    review_config=_config(),
+                    max_attempts=2,
+                    max_attempts_per_step=2,
+                    lean_timeout_seconds=10,
+                    lake_executable="lake",
+                    json_model_call=json_model,
+                    file_model_call=file_model,
+                    lean_checker=checker,
+                )
 
             self.assertTrue(result.ok)
             self.assertEqual(len(prover_prompts), 2)
+            self.assertIn("failed_candidate_lsp", prover_prompts[1])
             manifest = json.loads((result.state_dir / "run.json").read_text(encoding="utf-8"))
             self.assertIsNone(manifest["attempts"][0]["base_attempt"])
             self.assertEqual(manifest["attempts"][1]["base_attempt"], 1)
