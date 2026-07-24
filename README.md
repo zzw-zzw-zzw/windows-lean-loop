@@ -365,25 +365,41 @@ Enable it for a project in the Dashboard configuration, or set:
 ```powershell
 $env:LEAN_AGENT_LSP_MODE = "stdio"
 $env:LEAN_AGENT_LSP_COMMAND = "C:\Users\you\.local\bin\lean-lsp-mcp.exe"
+$env:LEAN_AGENT_LSP_RG = "C:\Tools\ripgrep\rg.exe" # optional; auto-discovered otherwise
 $env:LEAN_AGENT_LSP_STARTUP_TIMEOUT = "240"
 $env:LEAN_AGENT_LSP_CALL_TIMEOUT = "90"
+$env:LEAN_AGENT_LSP_EVIDENCE_BUDGET = "60"
 $env:LEAN_AGENT_LSP_REMOTE_SEARCH = "true"
 $env:LEAN_AGENT_LSP_LOCAL_REPAIR = "true"
 $env:LEAN_AGENT_LSP_LOCAL_MAX_ROUNDS = "2"
-$env:LEAN_AGENT_LSP_LOCAL_MAX_CANDIDATES = "6"
+$env:LEAN_AGENT_LSP_LOCAL_MAX_CANDIDATES = "4"
+$env:LEAN_AGENT_LSP_LOCAL_VALIDATION_TIMEOUT = "75"
+$env:LEAN_AGENT_LSP_LOCAL_TOTAL_BUDGET = "240"
+$env:LEAN_AGENT_LSP_LOCAL_REASONING_EFFORT = "low"
 ```
 
 When local repair is enabled, each full-file Prover candidate may use a
 separate bounded local budget. The workflow asks the Local Repair Prover for
-several tactic snippets at one LSP diagnostic, tests all snippets with
-`lean_multi_attempt` as whole-line replacements, and applies only an explicitly
-completed result to the archived candidate. Omitting the diagnostic column for
-this test also allows MCP to use its faster REPL path for single-line tactics.
+several tactic snippets at one LSP diagnostic and tests them one at a time with
+`lean_multi_attempt`, stopping at the first safe improvement. A result is safe
+when the selected target diagnostic disappears and no new hard diagnostic is
+introduced; remaining outer proof goals are allowed and become the next local
+repair target. Complete results rank above partial progress. The workflow
+classifies independent tactic lines separately from `:= by ...` proof tails and
+constructs an exact whole-line replacement before validation. Unsupported
+declaration or expression continuation lines fall back to the full-file Prover.
+Omitting the diagnostic column allows MCP to use its faster REPL path when it is
+compatible with the replacement.
 MCP never edits the authoritative target. The repaired
 candidate must still pass the normal full-file Lean check, source/import
 audits, Reviewer, checkpoint transaction, and final global audit. API errors,
 malformed local JSON, unavailable MCP tools, and unverified snippets fall back
 to the existing full-file workflow without consuming another full candidate.
+Repeated target/source/diagnostic triples stop immediately. Ordinary evidence
+collection, one local validation, and the whole local-repair phase have separate
+configurable budgets. The local model defaults to low reasoning effort and sees
+only a bounded source window. `rg.exe` is discovered independently of the
+Dashboard process PATH and its directory is injected into the MCP child.
 
 Local evidence and decisions are stored under
 `attempts/<attempt>/local-repair/`. Immutable `base.lean` and `selected.lean`

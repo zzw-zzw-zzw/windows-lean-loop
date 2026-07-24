@@ -104,8 +104,10 @@ deterministic external blocker has independently been verified."""
 
 LOCAL_REPAIR_SYSTEM_PROMPT = """You are the Local Repair Prover inside a
 controlled Lean 4 workflow. The orchestrator has selected one failing tactic
-line in an archived candidate file. Propose several alternative tactic snippets
-for exactly that line. Do not return a complete file, imports, declarations,
+line or one `:= by ...` proof tail in an archived candidate file. Propose
+several alternative proof/tactic snippets for exactly that target. For a
+`proof_tail` target, return `by ...` or a tactic; the orchestrator preserves the
+expression before `:=`. Do not return a complete file, imports, declarations,
 namespaces, `sorry`, `admit`, axioms, or Markdown fences. Use the supplied goal,
 diagnostic, code actions, and exact source context. Return only one JSON object:
 {
@@ -242,7 +244,7 @@ Results from the previous local round, if any:
 {prior_results or 'No previous local round.'}
 --- end prior local results ---
 
-Archived candidate file (read-only context):
+Bounded, line-numbered candidate window (read-only context):
 --- lean source ---
 {candidate}
 --- end lean source ---

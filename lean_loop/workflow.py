@@ -3,7 +3,8 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable
 
@@ -41,9 +42,11 @@ from lean_loop.lsp_tools import (
     LspEvidenceCollector,
     LspSettings,
     apply_line_local_snippet,
+    prepare_local_snippets,
     select_local_attempt,
     validate_local_repair_proposal,
 )
+from lean_loop.mcp_client import McpTimeoutError
 from lean_loop.project_config import load_project_config
 from lean_loop.state import WorkflowStore
 from lean_loop.timings import TimingRecorder
@@ -795,6 +798,13 @@ def _run_lsp_local_repairs(
     atomic_write_text(working_path, current)
     rows: list[dict[str, Any]] = []
     prior_results = ""
+    started = time.monotonic()
+    deadline = started + lsp_settings.local_total_budget_seconds
+    seen_targets: set[tuple[Any, ...]] = set()
+
+    def remaining_budget() -> float:
+        return max(0.0, deadline - time.monotonic())
+
     for round_number in range(1, lsp_settings.local_max_rounds + 1):
         round_dir = local_root / f"{round_number:03d}"
         round_dir.mkdir(exist_ok=False)
@@ -820,10 +830,16 @@ def _run_lsp_local_repairs(
             },
         }
         try:
+            if remaining_budget() < 1:
+                row["status"] = "budget_exhausted"
+                row["reason"] = "local_total_budget_exhausted"
+                rows.append(row)
+                break
             with timings.measure("local_repair_context", attempt):
                 context = lsp_collector.local_repair_context(
                     file_path=working_path,
                     source=current,
+                    total_timeout_seconds=remaining_budget(),
                 )
             atomic_write_json(round_dir / "context.json", context)
             row["artifacts"]["context"] = str(round_dir / "context.json")
@@ -831,27 +847,60 @@ def _run_lsp_local_repairs(
                 "line": context.get("line"),
                 "column": context.get("column"),
                 "source_line": context.get("source_line"),
+                "kind": context.get("target_kind"),
             }
             if context.get("status") != "target":
                 row["status"] = str(context.get("status") or "unavailable")
                 row["reason"] = str(context.get("reason") or "no_local_target")
                 rows.append(row)
                 break
+            target_fingerprint = (
+                context.get("line"),
+                context.get("source_line"),
+                str((context.get("diagnostic") or {}).get("message") or ""),
+            )
+            if target_fingerprint in seen_targets:
+                row["status"] = "duplicate_target"
+                row["reason"] = "diagnostic_and_source_unchanged"
+                rows.append(row)
+                break
+            seen_targets.add(target_fingerprint)
+            source_lines = current.splitlines()
+            target_line = int(context["line"])
+            window_start = max(0, target_line - 41)
+            window_end = min(len(source_lines), target_line + 40)
+            candidate_window = "\n".join(
+                f"{index + 1}: {source_lines[index]}"
+                for index in range(window_start, window_end)
+            )
             prompt = build_local_repair_prompt(
                 relative_file=relative_file,
                 task=task,
                 active_step=active_step_json,
-                candidate=current,
+                candidate=candidate_window,
                 context=json.dumps(context, ensure_ascii=False, indent=2),
                 prior_results=prior_results,
                 max_candidates=lsp_settings.local_max_candidates,
+            )
+            if remaining_budget() < 1:
+                row["status"] = "budget_exhausted"
+                row["reason"] = "local_total_budget_exhausted_before_api"
+                rows.append(row)
+                break
+            local_config = replace(
+                prove_config,
+                reasoning_effort=lsp_settings.local_reasoning_effort,
+                timeout_seconds=max(
+                    1,
+                    min(prove_config.timeout_seconds, int(remaining_budget())),
+                ),
             )
             with timings.measure("local_repair_api", attempt):
                 proposal_value = agent_runtime.invoke(
                     role="prover",
                     phase="local_repair",
                     output_type="json",
-                    config=prove_config,
+                    config=local_config,
                     system_prompt=LOCAL_REPAIR_SYSTEM_PROMPT,
                     user_prompt=prompt,
                     temp_dir=round_dir,
@@ -872,20 +921,67 @@ def _run_lsp_local_repairs(
             )
             atomic_write_json(round_dir / "proposal.json", proposal)
             row["artifacts"]["proposal"] = str(round_dir / "proposal.json")
+            submitted_snippets = prepare_local_snippets(
+                source_line=str(context["source_line"]),
+                target_kind=str(context.get("target_kind") or "tactic_line"),
+                snippets=list(proposal["snippets"]),
+            )
+            if not submitted_snippets:
+                row["status"] = "unsupported"
+                row["reason"] = "no_safe_whole_line_replacements"
+                rows.append(row)
+                break
+            multi_result: dict[str, Any] = {"items": [], "trials": []}
+            selected = None
             with timings.measure("local_multi_attempt", attempt):
-                multi_result = lsp_collector.try_local_snippets(
-                    file_path=working_path,
-                    line=int(context["line"]),
-                    # Omit the diagnostic column: this repair replaces one
-                    # complete tactic line and can use MCP's fast REPL path.
-                    column=None,
-                    snippets=list(proposal["snippets"]),
-                )
+                for snippet in submitted_snippets:
+                    remaining = remaining_budget()
+                    if remaining < 1:
+                        multi_result["budget_exhausted"] = True
+                        break
+                    validation_timeout = min(
+                        float(lsp_settings.local_validation_timeout_seconds),
+                        remaining,
+                    )
+                    try:
+                        trial = lsp_collector.try_local_snippets(
+                            file_path=working_path,
+                            line=int(context["line"]),
+                            column=None,
+                            snippets=[snippet],
+                            timeout_seconds=validation_timeout,
+                        )
+                    except McpTimeoutError as exc:
+                        multi_result["trials"].append(
+                            {
+                                "snippet": snippet,
+                                "status": "timeout",
+                                "timeout_seconds": validation_timeout,
+                                "error": str(exc),
+                            }
+                        )
+                        continue
+                    items = trial.get("items")
+                    if not isinstance(items, list):
+                        nested = trial.get("result")
+                        items = nested.get("items") if isinstance(nested, dict) else []
+                    multi_result["items"].extend(
+                        item for item in items or [] if isinstance(item, dict)
+                    )
+                    multi_result["trials"].append(
+                        {"snippet": snippet, "status": "completed"}
+                    )
+                    selected = select_local_attempt(
+                        trial,
+                        target_diagnostic=context.get("diagnostic"),
+                        baseline_diagnostics=context.get("baseline_diagnostics"),
+                    )
+                    if selected is not None:
+                        break
             atomic_write_json(round_dir / "multi-attempt.json", multi_result)
             row["artifacts"]["multi_attempt"] = str(
                 round_dir / "multi-attempt.json"
             )
-            selected = select_local_attempt(multi_result)
             if selected is None:
                 row["status"] = "no_verified_snippet"
                 rows.append(row)
@@ -894,7 +990,7 @@ def _run_lsp_local_repairs(
                 )
                 continue
             selected_snippet = str(selected.get("snippet") or "")
-            if selected_snippet not in proposal["snippets"]:
+            if selected_snippet not in submitted_snippets:
                 raise ValueError(
                     "LSP selected a snippet that was not in the submitted candidate set"
                 )
@@ -934,7 +1030,13 @@ def _run_lsp_local_repairs(
             break
     atomic_write_json(
         local_root / "summary.json",
-        {"working_file": str(working_path), "rounds": rows},
+        {
+            "working_file": str(working_path),
+            "rounds": rows,
+            "elapsed_seconds": round(time.monotonic() - started, 6),
+            "total_budget_seconds": lsp_settings.local_total_budget_seconds,
+            "budget_exhausted": remaining_budget() < 1,
+        },
     )
     return current, rows
 
@@ -1241,6 +1343,7 @@ def run_structured_workflow(
                     diagnostics=initial_check.output,
                     search_terms=preflight_terms,
                     allow_remote_search=lsp_settings.remote_search,
+                    total_timeout_seconds=lsp_settings.evidence_budget_seconds,
                 )
         initial_retrieval["import_optimization"] = import_optimization
     except ProcessCancelled as exc:
@@ -1883,6 +1986,7 @@ def run_structured_workflow(
                             diagnostics=last_check.output,
                             search_terms=requested_terms,
                             allow_remote_search=lsp_settings.remote_search,
+                            total_timeout_seconds=lsp_settings.evidence_budget_seconds,
                         )
 
                 completed_steps = [
@@ -2227,6 +2331,7 @@ def run_structured_workflow(
                             diagnostics=last_check.output,
                             search_terms=candidate_terms,
                             allow_remote_search=lsp_settings.remote_search,
+                            total_timeout_seconds=lsp_settings.evidence_budget_seconds,
                         )
                 retrieval["import_optimization"] = candidate_import_optimization
                 retrieval["import_validation"] = candidate_import_validation
@@ -2722,6 +2827,7 @@ def run_structured_workflow(
                         diagnostics=final_check.output,
                         search_terms=_plan_search_terms(plan),
                         allow_remote_search=False,
+                        total_timeout_seconds=lsp_settings.evidence_budget_seconds,
                     )
             audit_ok = final_check.ok and bool(final_source_audit["ok"])
             audit_diagnostics = final_check.output

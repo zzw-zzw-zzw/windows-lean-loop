@@ -165,14 +165,19 @@
         <label class="field model-field"><span>API Key</span><input id="configApiKey" type="password" autocomplete="new-password" placeholder="留空则保留当前 Key"></label>
         <label class="field"><span>Lean LSP MCP</span><select id="configLspMode"><option value="off">关闭</option><option value="stdio">Windows 自动启动</option><option value="http">连接本机 HTTP</option></select></label>
         <label class="field model-field"><span>LSP MCP 命令</span><input id="configLspCommand" type="text" placeholder="lean-lsp-mcp"></label>
+        <label class="field model-field"><span>rg.exe 路径（可选）</span><input id="configLspRgPath" type="text" placeholder="自动查找，或填写 C:\path\rg.exe"></label>
         <label class="field model-field"><span>LSP MCP URL</span><input id="configLspUrl" type="url" placeholder="http://127.0.0.1:8000/mcp"></label>
         <label class="field"><span>LSP 启动超时（秒）</span><input id="configLspStartupTimeout" type="number" min="1" required></label>
         <label class="field"><span>LSP 工具超时（秒）</span><input id="configLspCallTimeout" type="number" min="1" required></label>
+        <label class="field"><span>每次 LSP 证据采集总预算（秒）</span><input id="configLspEvidenceBudget" type="number" min="1" required></label>
         <label class="field"><span>每轮 LSP 检索词</span><input id="configLspMaxTerms" type="number" min="1" max="10" required></label>
         <label class="check-field"><input id="configLspRemoteSearch" type="checkbox" checked><span>本地检索无结果时限量调用线上 Loogle</span></label>
         <label class="check-field"><input id="configLspLocalRepair" type="checkbox" checked><span>对单个 proof error 启用局部候选验证</span></label>
         <label class="field"><span>每个完整候选的局部轮次</span><input id="configLspLocalRounds" type="number" min="1" max="5" required></label>
         <label class="field"><span>每轮局部候选数</span><input id="configLspLocalCandidates" type="number" min="2" max="12" required></label>
+        <label class="field"><span>单个局部候选验证超时（秒）</span><input id="configLspLocalValidationTimeout" type="number" min="1" required></label>
+        <label class="field"><span>每个完整候选的局部修复总预算（秒）</span><input id="configLspLocalTotalBudget" type="number" min="1" required></label>
+        <label class="field"><span>局部修复推理强度</span><select id="configLspLocalReasoning"><option>low</option><option>medium</option><option>high</option><option>xhigh</option></select></label>
       </div>
       <div class="key-status" id="configKeyStatus"></div>
       <label class="check-field"><input id="configDisableStorage" type="checkbox" checked><span>禁用响应存储（store=false）</span></label>

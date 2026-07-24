@@ -894,7 +894,8 @@ class StructuredWorkflowTests(unittest.TestCase):
                     del kwargs
                     return {"session": {"status": "ready"}}
 
-                def local_repair_context(self, *, file_path, source):
+                def local_repair_context(self, *, file_path, source, **kwargs):
+                    del kwargs
                     local_paths.append(Path(file_path))
                     if "trivial" in source:
                         return {
@@ -908,7 +909,13 @@ class StructuredWorkflowTests(unittest.TestCase):
                         "line": 2,
                         "column": 3,
                         "source_line": "  exact candidate_missing",
-                        "diagnostic": {"severity": "error", "message": "unknown"},
+                        "diagnostic": {
+                            "severity": "error", "message": "unknown", "line": 2, "column": 3
+                        },
+                        "baseline_diagnostics": [{
+                            "severity": "error", "message": "unknown", "line": 2, "column": 3
+                        }],
+                        "target_kind": "tactic_line",
                         "goal": {"goals": [{"goal": "True"}]},
                         "code_actions": {"actions": []},
                     }
@@ -917,19 +924,18 @@ class StructuredWorkflowTests(unittest.TestCase):
                     local_paths.append(Path(kwargs["file_path"]))
                     if kwargs["column"] is not None:
                         raise AssertionError("Whole-line repair must omit column")
+                    if len(kwargs["snippets"]) != 1:
+                        raise AssertionError("Local candidates must be tried incrementally")
+                    if kwargs["timeout_seconds"] <= 0:
+                        raise AssertionError("Local validation needs an explicit timeout")
                     self.assert_not_formal_target(kwargs["file_path"])
                     return {
                         "items": [
                             {
-                                "snippet": "trivial",
+                                "snippet": kwargs["snippets"][0],
                                 "goals": [],
                                 "diagnostics": [],
                                 "proof_status": "Completed",
-                            },
-                            {
-                                "snippet": "exact True.intro",
-                                "goals": [],
-                                "diagnostics": [],
                             },
                         ]
                     }
@@ -1008,7 +1014,12 @@ class StructuredWorkflowTests(unittest.TestCase):
                     "items": [{
                         "snippet": "trivial",
                         "goals": ["True"],
-                        "diagnostics": [],
+                        "diagnostics": [{
+                            "severity": "error",
+                            "message": "unexpected token",
+                            "line": 2,
+                            "column": 3,
+                        }],
                     }]
                 },
                 "source_line": "  exact candidate_missing",
@@ -1076,7 +1087,13 @@ class StructuredWorkflowTests(unittest.TestCase):
                             "line": 2,
                             "column": 3,
                             "source_line": case["source_line"],
-                            "diagnostic": {"severity": "error", "message": "missing"},
+                            "diagnostic": {
+                                "severity": "error", "message": "missing", "line": 2, "column": 3
+                            },
+                            "baseline_diagnostics": [{
+                                "severity": "error", "message": "missing", "line": 2, "column": 3
+                            }],
+                            "target_kind": "tactic_line",
                             "goal": {"goals": [{"goal": "True"}]},
                             "code_actions": {},
                         }

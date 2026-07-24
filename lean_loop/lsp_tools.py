@@ -4,8 +4,10 @@ import json
 import os
 import re
 import shutil
+import sys
 import textwrap
 import time
+from collections import Counter
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -41,20 +43,41 @@ _FORBIDDEN_LOCAL_SNIPPET_RE = re.compile(
 _STRUCTURAL_SOURCE_LINE_RE = re.compile(
     rf"^\s*{_DECLARATION_MODIFIERS}(?:{_STRUCTURAL_COMMANDS})\b"
 )
+_TACTIC_SOURCE_LINE_RE = re.compile(
+    r"^(?:[·{}]|case\b|next\b|have\b|let\b|suffices\b|show\b|calc\b|"
+    r"conv\b|exact\b|refine\b|apply\b|apply_fun\b|intro\b|intros\b|"
+    r"rintro\b|use\b|constructor\b|left\b|right\b|rfl\b|trivial\b|"
+    r"assumption\b|contradiction\b|exfalso\b|by_cases\b|by_contra\b|"
+    r"cases\b|rcases\b|obtain\b|induction\b|subst\b|specialize\b|"
+    r"generalize\b|rename_i\b|clear\b|revert\b|change\b|unfold\b|"
+    r"dsimp\b|simp\b|simpa\b|simp_all\b|rw\b|nth_rw\b|erw\b|ext\b|"
+    r"funext\b|set\b|wlog\b|repeat\b|try\b|first\b|solve\b|all_goals\b|"
+    r"any_goals\b|aesop\b|omega\b|linarith\b|nlinarith\b|ring\b|"
+    r"ring_nf\b|norm_num\b|native_decide\b|decide\b|tauto\b|grind\b|"
+    r"positivity\b|field_simp\b|polyrith\b|linear_combination\b|"
+    r"gcongr\b|push_neg\b|norm_cast\b|exact_mod_cast\b|lift\b|"
+    r"filter_upwards\b|fin_cases\b|interval_cases\b|continuity\b|"
+    r"fun_prop\b|measurability\b)"
+)
 
 
 @dataclass(frozen=True)
 class LspSettings:
     mode: str = "off"
     command: str = "lean-lsp-mcp"
+    rg_path: str = ""
     url: str = "http://127.0.0.1:8000/mcp"
     startup_timeout_seconds: int = 180
     call_timeout_seconds: int = 60
+    evidence_budget_seconds: int = 60
     remote_search: bool = True
     max_search_terms: int = 3
     local_repair: bool = True
     local_max_rounds: int = 2
-    local_max_candidates: int = 6
+    local_max_candidates: int = 4
+    local_validation_timeout_seconds: int = 75
+    local_total_budget_seconds: int = 240
+    local_reasoning_effort: str = "low"
 
     @classmethod
     def from_values(cls, values: dict[str, Any]) -> "LspSettings":
@@ -65,6 +88,10 @@ class LspSettings:
         command = str(
             values.get("lsp_command")
             or os.environ.get("LEAN_AGENT_LSP_COMMAND", "lean-lsp-mcp")
+        ).strip()
+        rg_path = str(
+            values.get("lsp_rg_path")
+            or os.environ.get("LEAN_AGENT_LSP_RG", "")
         ).strip()
         url = str(
             values.get("lsp_url")
@@ -81,6 +108,10 @@ class LspSettings:
                 values.get("lsp_call_timeout_seconds")
                 or os.environ.get("LEAN_AGENT_LSP_CALL_TIMEOUT", "60")
             )
+            evidence_budget = int(
+                values.get("lsp_evidence_budget_seconds")
+                or os.environ.get("LEAN_AGENT_LSP_EVIDENCE_BUDGET", "60")
+            )
             max_search_terms = int(
                 values.get("lsp_max_search_terms")
                 or os.environ.get("LEAN_AGENT_LSP_MAX_SEARCH_TERMS", "3")
@@ -91,7 +122,15 @@ class LspSettings:
             )
             local_max_candidates = int(
                 values.get("lsp_local_max_candidates")
-                or os.environ.get("LEAN_AGENT_LSP_LOCAL_MAX_CANDIDATES", "6")
+                or os.environ.get("LEAN_AGENT_LSP_LOCAL_MAX_CANDIDATES", "4")
+            )
+            local_validation_timeout = int(
+                values.get("lsp_local_validation_timeout_seconds")
+                or os.environ.get("LEAN_AGENT_LSP_LOCAL_VALIDATION_TIMEOUT", "75")
+            )
+            local_total_budget = int(
+                values.get("lsp_local_total_budget_seconds")
+                or os.environ.get("LEAN_AGENT_LSP_LOCAL_TOTAL_BUDGET", "240")
             )
         except (TypeError, ValueError) as exc:
             raise ValueError("LSP timeout and search limits must be integers") from exc
@@ -113,11 +152,21 @@ class LspSettings:
             .lower()
             in {"true", "1", "yes"}
         )
+        local_reasoning_effort = str(
+            values.get("lsp_local_reasoning_effort")
+            or os.environ.get("LEAN_AGENT_LSP_LOCAL_REASONING_EFFORT", "low")
+        ).strip().lower()
         if mode not in LSP_MODES:
             raise ValueError("LSP mode must be off, stdio, or http")
         if not command:
             raise ValueError("LSP command must not be empty")
-        if startup_timeout < 1 or call_timeout < 1:
+        if (
+            startup_timeout < 1
+            or call_timeout < 1
+            or evidence_budget < 1
+            or local_validation_timeout < 1
+            or local_total_budget < 1
+        ):
             raise ValueError("LSP timeouts must be positive")
         if not 1 <= max_search_terms <= 10:
             raise ValueError("LSP max search terms must be between 1 and 10")
@@ -125,6 +174,8 @@ class LspSettings:
             raise ValueError("LSP local repair rounds must be between 1 and 5")
         if not 2 <= local_max_candidates <= 12:
             raise ValueError("LSP local repair candidates must be between 2 and 12")
+        if local_reasoning_effort not in {"low", "medium", "high", "xhigh"}:
+            raise ValueError("LSP local repair reasoning effort is invalid")
         if mode == "http":
             parsed = urlparse(url)
             if parsed.scheme not in {"http", "https"} or not parsed.netloc:
@@ -136,14 +187,19 @@ class LspSettings:
         return cls(
             mode=mode,
             command=command,
+            rg_path=rg_path,
             url=url,
             startup_timeout_seconds=startup_timeout,
             call_timeout_seconds=call_timeout,
+            evidence_budget_seconds=evidence_budget,
             remote_search=remote_search,
             max_search_terms=max_search_terms,
             local_repair=local_repair,
             local_max_rounds=local_max_rounds,
             local_max_candidates=local_max_candidates,
+            local_validation_timeout_seconds=local_validation_timeout,
+            local_total_budget_seconds=local_total_budget,
+            local_reasoning_effort=local_reasoning_effort,
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -167,6 +223,49 @@ def resolve_lsp_command(command: str) -> str:
         f"lean-lsp-mcp command was not found: {command}. Install it with "
         "`uv tool install lean-lsp-mcp`."
     )
+
+
+def resolve_rg_path(configured: str = "") -> str | None:
+    """Find rg for the MCP child without depending on the Dashboard's PATH."""
+    if configured:
+        candidate = Path(configured).expanduser()
+        if candidate.is_file():
+            return str(candidate.resolve())
+        raise FileNotFoundError(f"rg executable was not found: {candidate}")
+    resolved = shutil.which("rg")
+    if resolved:
+        return str(Path(resolved).resolve())
+    candidates = [
+        Path(sys.executable).parent / "rg.exe",
+        Path.home() / "scoop" / "shims" / "rg.exe",
+        Path(os.environ.get("ProgramData", "C:/ProgramData"))
+        / "chocolatey" / "bin" / "rg.exe",
+        Path(os.environ.get("LOCALAPPDATA", ""))
+        / "Microsoft" / "WinGet" / "Links" / "rg.exe",
+    ]
+    local_app_data = os.environ.get("LOCALAPPDATA")
+    if local_app_data:
+        candidates.extend(
+            Path(local_app_data).glob("OpenAI/Codex/bin/*/rg.exe")
+        )
+    for candidate in candidates:
+        if candidate.is_file():
+            return str(candidate.resolve())
+    return None
+
+
+def stage_rg_for_child(project: Path, resolved: str) -> str:
+    """Put rg in an isolated project directory to avoid Windows DLL shadowing."""
+    source = Path(resolved).resolve()
+    destination = project / ".lean-agent" / "tools" / "rg.exe"
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if (
+        not destination.is_file()
+        or destination.stat().st_size != source.stat().st_size
+        or destination.stat().st_mtime_ns < source.stat().st_mtime_ns
+    ):
+        shutil.copy2(source, destination)
+    return str(destination.resolve())
 
 
 def _bounded_json(value: Any, limit: int = MAX_PROMPT_EVIDENCE_CHARS) -> str:
@@ -287,32 +386,103 @@ def _has_open_goal(value: dict[str, Any] | None) -> bool:
     return False
 
 
-def select_local_attempt(value: dict[str, Any]) -> dict[str, Any] | None:
+def _diagnostic_key(value: dict[str, Any], *, include_line: bool) -> tuple[Any, ...]:
+    message = str(value.get("message") or "").strip()
+    # Goal pretty-printing can be very large; the first line identifies the
+    # diagnostic class while line/column distinguish repeated errors.
+    message_head = message.splitlines()[0] if message else ""
+    key: tuple[Any, ...] = (
+        str(value.get("severity") or "").lower(),
+        message_head,
+    )
+    return (*key, value.get("line"), value.get("column")) if include_line else key
+
+
+def select_local_attempt(
+    value: dict[str, Any],
+    *,
+    target_diagnostic: dict[str, Any] | None = None,
+    baseline_diagnostics: list[dict[str, Any]] | None = None,
+) -> dict[str, Any] | None:
+    """Select a locally safe improvement, even when outer proof goals remain."""
     items = _local_attempt_items(value)
-    ranked: list[tuple[int, dict[str, Any]]] = []
-    for index, row in enumerate(items):
+    baseline = [row for row in baseline_diagnostics or [] if isinstance(row, dict)]
+    baseline_counts = Counter(
+        _diagnostic_key(row, include_line=False) for row in baseline
+    )
+    target_class = (
+        _diagnostic_key(target_diagnostic, include_line=False)
+        if isinstance(target_diagnostic, dict)
+        else None
+    )
+    if target_class is not None and baseline_counts[target_class] == 0:
+        baseline_counts[target_class] = 1
+    ranked: list[tuple[int, int, int, dict[str, Any]]] = []
+    for row in items:
         if not isinstance(row, dict) or row.get("timed_out") is True:
             continue
         diagnostics = row.get("diagnostics")
         diagnostics = diagnostics if isinstance(diagnostics, list) else []
-        has_error = any(
-            isinstance(item, dict)
+        errors = [
+            item
+            for item in diagnostics
+            if isinstance(item, dict)
             and str(item.get("severity") or "").lower() == "error"
-            for item in diagnostics
+        ]
+        hard_errors = [
+            item
+            for item in errors
+            if "unsolvedGoals" not in (item.get("lean_tags") or [])
+        ]
+        candidate_counts = Counter(
+            _diagnostic_key(item, include_line=False) for item in hard_errors
         )
-        has_unsolved = any(
-            isinstance(item, dict)
-            and "unsolvedGoals" in (item.get("lean_tags") or [])
-            for item in diagnostics
-        )
-        if has_error or has_unsolved:
+        if (
+            target_class is not None
+            and candidate_counts[target_class] >= baseline_counts[target_class]
+        ):
+            continue
+        if any(count > baseline_counts[key] for key, count in candidate_counts.items()):
             continue
         proof_status = str(row.get("proof_status") or "").lower()
         goals = row.get("goals")
         complete = "completed" in proof_status or goals == []
-        if complete:
-            ranked.append((index, row))
-    return min(ranked, default=(0, None))[1]
+        goal_count = len(goals) if isinstance(goals, list) else 1_000_000
+        ranked.append((0 if complete else 1, len(hard_errors), goal_count, row))
+    return min(ranked, key=lambda item: item[:3], default=(0, 0, 0, None))[3]
+
+
+def classify_local_target(source_line: str) -> str:
+    stripped = source_line.strip()
+    if not stripped or _STRUCTURAL_SOURCE_LINE_RE.match(source_line):
+        return "unsupported"
+    if re.search(r":=\s*by(?:\s|$)", stripped):
+        return "proof_tail"
+    if ":=" in stripped:
+        return "unsupported"
+    return "tactic_line" if _TACTIC_SOURCE_LINE_RE.match(stripped) else "unsupported"
+
+
+def prepare_local_snippets(
+    *, source_line: str, target_kind: str, snippets: list[str]
+) -> list[str]:
+    """Convert model tactics to exact whole-line replacements for MCP testing."""
+    if target_kind == "tactic_line":
+        return list(snippets)
+    if target_kind != "proof_tail":
+        return []
+    match = re.match(r"^(?P<prefix>.*?:=)\s*by(?:\s+.*)?$", source_line.strip())
+    if match is None:
+        return []
+    prefix = match.group("prefix")
+    prepared: list[str] = []
+    for snippet in snippets:
+        normalized = textwrap.dedent(snippet).strip()
+        proof = normalized if normalized.startswith("by") else f"by\n  {normalized}"
+        replacement = f"{prefix} {proof}"
+        if replacement not in prepared:
+            prepared.append(replacement)
+    return prepared
 
 
 def apply_line_local_snippet(
@@ -354,6 +524,8 @@ class LspEvidenceCollector:
         self.available_tools: set[str] = set()
         self.start_error: str | None = None
         self._loogle_cache: dict[str, dict[str, Any]] = {}
+        self.rg_path: str | None = None
+        self.rg_error: str | None = None
 
     @property
     def enabled(self) -> bool:
@@ -369,6 +541,38 @@ class LspEvidenceCollector:
         try:
             if self.settings.mode == "stdio":
                 command = resolve_lsp_command(self.settings.command)
+                try:
+                    self.rg_path = resolve_rg_path(self.settings.rg_path)
+                except FileNotFoundError as exc:
+                    self.rg_error = str(exc)
+                child_env = os.environ.copy()
+                if self.rg_path:
+                    source_dir = Path(self.rg_path).parent.resolve()
+                    path_entries: list[str] = []
+                    for raw_entry in child_env.get("PATH", "").split(os.pathsep):
+                        entry = raw_entry.strip().strip('"')
+                        if not entry:
+                            continue
+                        try:
+                            directory = Path(entry).resolve()
+                            contains_rg = any(
+                                (directory / name).is_file()
+                                for name in ("rg.exe", "rg.EXE", "rg")
+                            )
+                        except OSError:
+                            directory = Path(entry)
+                            contains_rg = False
+                        if directory != source_dir and not contains_rg:
+                            path_entries.append(entry)
+                    try:
+                        self.rg_path = stage_rg_for_child(self.project, self.rg_path)
+                    except OSError as exc:
+                        self.rg_error = f"Could not stage rg.exe: {exc}"
+                        self.rg_path = None
+                    if self.rg_path:
+                        # The isolated directory contains no unrelated DLLs.
+                        path_entries.insert(0, str(Path(self.rg_path).parent))
+                    child_env["PATH"] = os.pathsep.join(path_entries)
                 self.client = StdioMcpClient(
                     command=command,
                     args=[
@@ -383,6 +587,7 @@ class LspEvidenceCollector:
                     startup_timeout_seconds=self.settings.startup_timeout_seconds,
                     call_timeout_seconds=self.settings.call_timeout_seconds,
                     control=self.process_control,
+                    env=child_env,
                 )
             else:
                 self.client = HttpMcpClient(
@@ -426,6 +631,11 @@ class LspEvidenceCollector:
             "server": dict(getattr(client, "server_info", {}) or {}),
             "tools": sorted(self.available_tools),
             "error": self.start_error,
+            "rg": {
+                "status": "ready" if self.rg_path else "unavailable",
+                "path": self.rg_path,
+                "error": self.rg_error,
+            },
         }
 
     def _call(
@@ -569,6 +779,25 @@ class LspEvidenceCollector:
             )
             row: dict[str, Any] = {"query": term, "local": local or {}}
             local_items = (local or {}).get("items")
+            if (
+                "." in term
+                and (not isinstance(local_items, list) or not local_items)
+            ):
+                fallback_query = term.rsplit(".", 1)[-1]
+                fallback = call(
+                    "lean_local_search",
+                    {
+                        "query": fallback_query,
+                        "limit": 8,
+                        "project_root": str(self.project),
+                    },
+                )
+                fallback_items = (fallback or {}).get("items")
+                if isinstance(fallback_items, list) and fallback_items:
+                    local = fallback
+                    local_items = fallback_items
+                    row["local"] = fallback
+                    row["local_fallback_query"] = fallback_query
             should_use_remote = (
                 allow_remote_search
                 and self.settings.remote_search
@@ -599,6 +828,7 @@ class LspEvidenceCollector:
         *,
         file_path: Path,
         source: str,
+        total_timeout_seconds: float | None = None,
     ) -> dict[str, Any]:
         """Return one bounded, line-local repair target without modifying the file."""
         status = self.start()
@@ -613,14 +843,32 @@ class LspEvidenceCollector:
         except ValueError:
             result["reason"] = "file_outside_project"
             return result
+        deadline = (
+            time.monotonic() + total_timeout_seconds
+            if total_timeout_seconds is not None
+            else None
+        )
+
+        def timeout() -> float:
+            if deadline is None:
+                return float(self.settings.call_timeout_seconds)
+            return max(
+                0.1,
+                min(
+                    float(self.settings.call_timeout_seconds),
+                    deadline - time.monotonic(),
+                ),
+            )
+
         diagnostics = self._call(
             result,
             "lean_diagnostic_messages",
             {
                 "file_path": relative,
                 "interactive": False,
-                "timeout_s": float(max(1, self.settings.call_timeout_seconds - 5)),
+                "timeout_s": float(max(1, timeout() - 2)),
             },
+            timeout_seconds=timeout(),
         )
         result["diagnostics"] = diagnostics or {}
         if diagnostics is None:
@@ -659,6 +907,13 @@ class LspEvidenceCollector:
             result["status"] = "unsupported"
             result["reason"] = "diagnostic_is_on_a_structural_line"
             return result
+        target_kind = classify_local_target(lines[line - 1])
+        if target_kind == "unsupported":
+            result["status"] = "unsupported"
+            result["reason"] = "diagnostic_is_not_a_safe_line_local_target"
+            result["line"] = line
+            result["source_line"] = lines[line - 1]
+            return result
         goal = self._call(
             result,
             "lean_goal",
@@ -667,26 +922,32 @@ class LspEvidenceCollector:
                 "line": line,
                 "column": column,
                 "format": "structured",
-                "timeout_s": float(max(1, self.settings.call_timeout_seconds - 5)),
+                "timeout_s": float(max(1, timeout() - 2)),
             },
+            timeout_seconds=timeout(),
         )
         result["goal"] = goal or {}
         if not _has_open_goal(goal):
             result["status"] = "unsupported"
             result["reason"] = "diagnostic_has_no_open_proof_goal"
             return result
-        actions = self._call(
-            result,
-            "lean_code_actions",
-            {"file_path": str(file_path.resolve()), "line": line},
-        )
+        actions = None
+        if deadline is None or deadline - time.monotonic() >= 5:
+            actions = self._call(
+                result,
+                "lean_code_actions",
+                {"file_path": str(file_path.resolve()), "line": line},
+                timeout_seconds=timeout(),
+            )
         result.update(
             {
                 "status": "target",
                 "line": line,
                 "column": column,
                 "source_line": lines[line - 1],
+                "target_kind": target_kind,
                 "diagnostic": first,
+                "baseline_diagnostics": errors,
                 "code_actions": actions or {},
             }
         )
@@ -699,6 +960,7 @@ class LspEvidenceCollector:
         line: int,
         column: int | None = None,
         snippets: list[str],
+        timeout_seconds: float | None = None,
     ) -> dict[str, Any]:
         status = self.start()
         if status["status"] != "ready" or self.client is None:
@@ -711,7 +973,11 @@ class LspEvidenceCollector:
         }
         if column is not None:
             arguments["column"] = column
-        value = self.client.call_tool("lean_multi_attempt", arguments)
+        value = self.client.call_tool(
+            "lean_multi_attempt",
+            arguments,
+            timeout_seconds=timeout_seconds,
+        )
         return value
 
     def close(self) -> None:
